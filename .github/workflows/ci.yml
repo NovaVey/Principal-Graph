@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: devpass
+          POSTGRES_DB: principalgraph
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # Lower bound (package.json engines.node), the previous LTS, and
+        # current — catches a regression against the floor we actually
+        # advertise, not just whatever happens to be newest.
+        node-version: [20, 22, 24]
+    env:
+      DATABASE_URL: postgresql://postgres:devpass@localhost:5432/principalgraph
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - name: Load schema
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f schema/001_core.sql
+      - run: npm test
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run format:check

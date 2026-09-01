@@ -9,7 +9,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "node --import tsx --test --test-concurrency=1 test/**/*.spec.ts",
+    "test": "node --import tsx --test --test-concurrency=1 test/*.spec.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",

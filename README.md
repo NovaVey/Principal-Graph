@@ -36,6 +36,7 @@ src/
   model.ts          shared types every adapter/view imports from
   log.ts             hash-chained append + chain verifier
   upsert.ts          ensurePrincipal / ensureResource — how adapters upsert identity
+  capabilities.ts    TOOL_CAPABILITIES (hand-written) + how resources get classified
   db.ts              Pool construction (reads DATABASE_URL)
   adapters/          feed the core (broker-audit-sink.ts first, mcp-config/github later)
   views/             read from the core

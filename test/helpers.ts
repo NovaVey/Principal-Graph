@@ -6,13 +6,13 @@
  * database, not an in-memory stand-in that can't reproduce a direct UPDATE.
  */
 
-import { createPool } from "../src/db.js";
+import { createPool } from '../src/db.js';
 
 export const pool = createPool();
 
 /** Wipes every core table so each test starts from an empty graph. */
 export async function resetDatabase(): Promise<void> {
   await pool.query(
-    "truncate table event, grant_edge, resource_capability, resource, principal restart identity cascade"
+    'truncate table event, grant_edge, resource_capability, resource, principal restart identity cascade',
   );
 }

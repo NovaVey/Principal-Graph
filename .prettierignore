@@ -1,0 +1,15 @@
+dist
+coverage
+node_modules
+package-lock.json
+
+# Prose formatting (wrapped paragraphs, tables) is deliberate — this
+# project's lint/format tooling is for code style, not prose.
+*.md
+
+# Specified byte-for-byte by the build brief ("write these three exactly as
+# given before starting any task") — kept as given, not reformatted to this
+# repo's quote/width conventions. schema/001_core.sql, the third file, is
+# SQL and outside prettier's glob anyway.
+src/model.ts
+src/log.ts

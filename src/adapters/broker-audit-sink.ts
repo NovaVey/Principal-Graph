@@ -20,12 +20,12 @@
  * right granularity here too.
  */
 
-import { createHash } from "node:crypto";
-import type { Pool } from "pg";
-import type { AuditEvent, AuditSink, PolicyDecision } from "taint-tracked-tool-broker";
-import { appendEvent } from "../log.js";
-import { ensurePrincipal, ensureResource } from "../upsert.js";
-import type { Decision } from "../model.js";
+import { createHash } from 'node:crypto';
+import type { Pool } from 'pg';
+import type { AuditEvent, AuditSink, PolicyDecision } from 'taint-tracked-tool-broker';
+import { appendEvent } from '../log.js';
+import { ensurePrincipal, ensureResource } from '../upsert.js';
+import type { Decision } from '../model.js';
 
 export interface BrokerPrincipalIdentity {
   /** Which adapter/system this identity comes from, e.g. 'mcp-config', 'manual'. */
@@ -69,7 +69,7 @@ export interface PrincipalGraphAuditSink extends AuditSink {
 }
 
 function verdictReason(verdict: PolicyDecision): string | null {
-  return "reason" in verdict ? verdict.reason : null;
+  return 'reason' in verdict ? verdict.reason : null;
 }
 
 /**
@@ -85,7 +85,7 @@ function taintLabelsOf(event: AuditEvent): string[] {
     `sink:${event.taint.sinkClass}`,
     `verdict:${event.verdict.action}`,
   ];
-  if (event.taint.privateDataSeen) labels.push("private-data-seen");
+  if (event.taint.privateDataSeen) labels.push('private-data-seen');
   return labels;
 }
 
@@ -95,13 +95,15 @@ function taintLabelsOf(event: AuditEvent): string[] {
  * NONE-sinkClass call — a read, a source fetch, nothing privileged — is.
  */
 function reversibleOf(event: AuditEvent): boolean {
-  return event.taint.sinkClass === "NONE";
+  return event.taint.sinkClass === 'NONE';
 }
 
 /** sha256 of the call arguments. Never the arguments themselves — see EventInput.requestDigest. */
 function digestOf(args: unknown): string | null {
   try {
-    return createHash("sha256").update(JSON.stringify(args) ?? "null", "utf8").digest("hex");
+    return createHash('sha256')
+      .update(JSON.stringify(args) ?? 'null', 'utf8')
+      .digest('hex');
   } catch {
     // Non-JSON-safe args (a bigint, a circular structure) are vanishingly
     // rare for a tool-call argument object — fail open on the digest alone,
@@ -111,7 +113,7 @@ function digestOf(args: unknown): string | null {
 }
 
 export function createPrincipalGraphAuditSink(
-  opts: BrokerAuditSinkOptions
+  opts: BrokerAuditSinkOptions,
 ): PrincipalGraphAuditSink {
   const { pool } = opts;
   const pending = new Set<Promise<void>>();
@@ -123,13 +125,13 @@ export function createPrincipalGraphAuditSink(
   let onBehalfOfIdPromise: Promise<string | null> | undefined;
 
   function agentId(): Promise<string> {
-    agentIdPromise ??= ensurePrincipal(pool, { kind: "agent", ...opts.agent });
+    agentIdPromise ??= ensurePrincipal(pool, { kind: 'agent', ...opts.agent });
     return agentIdPromise;
   }
 
   function onBehalfOfId(): Promise<string | null> {
     if (!opts.onBehalfOf) return Promise.resolve(null);
-    onBehalfOfIdPromise ??= ensurePrincipal(pool, { kind: "human", ...opts.onBehalfOf });
+    onBehalfOfIdPromise ??= ensurePrincipal(pool, { kind: 'human', ...opts.onBehalfOf });
     return onBehalfOfIdPromise;
   }
 
@@ -138,8 +140,8 @@ export function createPrincipalGraphAuditSink(
       agentId(),
       onBehalfOfId(),
       ensureResource(pool, {
-        kind: "tool",
-        source: opts.resourceSource ?? "taint-tracked-tool-broker",
+        kind: 'tool',
+        source: opts.resourceSource ?? 'taint-tracked-tool-broker',
         externalId: event.call.toolName,
       }),
     ]);
@@ -149,16 +151,16 @@ export function createPrincipalGraphAuditSink(
     // set it true, BLOCK/QUARANTINE_AND_RETRY/a denied REQUIRE_APPROVAL
     // always set it false, so it maps directly onto the two-valued
     // allow/deny this schema tracks without re-deriving that logic here.
-    const decision: Decision = event.executed ? "allow" : "deny";
+    const decision: Decision = event.executed ? 'allow' : 'deny';
 
     await appendEvent(pool, {
       occurredAt: new Date(event.at),
       principalId,
       onBehalfOf,
       resourceId,
-      action: "call",
+      action: 'call',
       decision,
-      denyReason: decision === "deny" ? verdictReason(event.verdict) : null,
+      denyReason: decision === 'deny' ? verdictReason(event.verdict) : null,
       taintLabels: taintLabelsOf(event),
       reversible: reversibleOf(event),
       requestDigest: digestOf(event.call.args),
@@ -171,7 +173,7 @@ export function createPrincipalGraphAuditSink(
       // is logged, never thrown back into the broker: a logging outage must
       // never change what the broker already decided about the call.
       const task = handle(event).catch((err: unknown) => {
-        console.error("principal-graph: failed to record broker audit event", err);
+        console.error('principal-graph: failed to record broker audit event', err);
       });
       pending.add(task);
       void task.finally(() => pending.delete(task));

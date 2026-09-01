@@ -4,9 +4,17 @@
   "description": "One model of who and what can reach your systems, and what they actually did. Humans and agents are the same kind of principal, so one query answers both. Grant graph plus tamper-evident event log, for companies too small to have a security team.",
   "type": "module",
   "main": "dist/index.js",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "build": "tsc",
-    "test": "node --import tsx --test --test-concurrency=1 test/**/*.spec.ts"
+    "test": "node --import tsx --test --test-concurrency=1 test/**/*.spec.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\" \"*.{js,ts,json}\"",
+    "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\" \"*.{js,ts,json}\""
   },
   "repository": {
     "type": "git",
@@ -26,7 +34,11 @@
   "devDependencies": {
     "@types/node": "^26.4.1",
     "@types/pg": "^8.23.1",
+    "eslint": "^10.9.1",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.9.6",
     "tsx": "^4.23.13",
-    "typescript": "^7.0.2"
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.69.0"
   }
 }

@@ -4,10 +4,9 @@
  * `process.env.DATABASE_URL` (or inventing their own default) independently.
  */
 
-import { Pool } from "pg";
+import { Pool } from 'pg';
 
-const DEFAULT_CONNECTION_STRING =
-  "postgresql://postgres:devpass@localhost:5432/principalgraph";
+const DEFAULT_CONNECTION_STRING = 'postgresql://postgres:devpass@localhost:5432/principalgraph';
 
 export function createPool(connectionString = process.env.DATABASE_URL): Pool {
   return new Pool({

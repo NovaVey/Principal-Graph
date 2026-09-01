@@ -12,11 +12,21 @@ docker exec -i pg-principal psql -U postgres -d principalgraph < schema/001_core
 npm install
 npm test          # DATABASE_URL defaults to postgresql://postgres:devpass@localhost:5432/principalgraph
 npm run build
+npm run typecheck
+npm run lint
+npm run format:check
 ```
 
 Set `DATABASE_URL` to point at a different instance. Tests run against a real
 Postgres, not a mock — the tamper-evidence property in `src/log.ts` only means
 something proven against a real database.
+
+CI (`.github/workflows/ci.yml`) runs all of the above on every push/PR, across
+Node 20/22/24, against a `postgres:16` service container. `schema/001_core.sql`,
+`src/model.ts`, and `src/log.ts` are specified byte-for-byte by the build
+brief and are excluded from `format`/`format:check` — see `.prettierignore`
+and `eslint.config.js`'s own comments before "fixing" a lint/format finding
+in either by editing them.
 
 ## Layout
 

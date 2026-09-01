@@ -11,8 +11,8 @@
  * no name leaves whatever is already stored alone.
  */
 
-import type { Pool, PoolClient } from "pg";
-import type { PrincipalKind, ResourceKind } from "./model.js";
+import type { Pool, PoolClient } from 'pg';
+import type { PrincipalKind, ResourceKind } from './model.js';
 
 /** Either a pooled connection or a single checked-out client — both expose `.query()`. */
 export type Queryable = Pool | PoolClient;
@@ -38,10 +38,7 @@ export interface ResourceSighting {
  * `last_seen` so `unused_grant`-style "have we seen this principal lately"
  * questions stay meaningful.
  */
-export async function ensurePrincipal(
-  db: Queryable,
-  sighting: PrincipalSighting
-): Promise<string> {
+export async function ensurePrincipal(db: Queryable, sighting: PrincipalSighting): Promise<string> {
   const { rows } = await db.query<{ id: string }>(
     `insert into principal (kind, source, external_id, display_name)
      values ($1, $2, $3, $4)
@@ -49,12 +46,12 @@ export async function ensurePrincipal(
        set last_seen = now(),
            display_name = coalesce(excluded.display_name, principal.display_name)
      returning id`,
-    [sighting.kind, sighting.source, sighting.externalId, sighting.displayName ?? null]
+    [sighting.kind, sighting.source, sighting.externalId, sighting.displayName ?? null],
   );
   const id = rows[0]?.id;
   if (!id) {
     throw new Error(
-      `ensurePrincipal: upsert of (${sighting.source}, ${sighting.externalId}) returned no row`
+      `ensurePrincipal: upsert of (${sighting.source}, ${sighting.externalId}) returned no row`,
     );
   }
   return id;
@@ -65,22 +62,19 @@ export async function ensurePrincipal(
  * `resource` has no `last_seen` column (see schema/001_core.sql) — a
  * resource's liveness is read from `event`/`grant_edge`, not tracked here.
  */
-export async function ensureResource(
-  db: Queryable,
-  sighting: ResourceSighting
-): Promise<string> {
+export async function ensureResource(db: Queryable, sighting: ResourceSighting): Promise<string> {
   const { rows } = await db.query<{ id: string }>(
     `insert into resource (kind, source, external_id, display_name)
      values ($1, $2, $3, $4)
      on conflict (source, external_id) do update
        set display_name = coalesce(excluded.display_name, resource.display_name)
      returning id`,
-    [sighting.kind, sighting.source, sighting.externalId, sighting.displayName ?? null]
+    [sighting.kind, sighting.source, sighting.externalId, sighting.displayName ?? null],
   );
   const id = rows[0]?.id;
   if (!id) {
     throw new Error(
-      `ensureResource: upsert of (${sighting.source}, ${sighting.externalId}) returned no row`
+      `ensureResource: upsert of (${sighting.source}, ${sighting.externalId}) returned no row`,
     );
   }
   return id;

@@ -25,6 +25,7 @@ import type { Pool } from 'pg';
 import type { AuditEvent, AuditSink, PolicyDecision } from 'taint-tracked-tool-broker';
 import { appendEvent } from '../log.js';
 import { ensurePrincipal, ensureResource } from '../upsert.js';
+import { classifyKnownTool } from '../capabilities.js';
 import type { Decision } from '../model.js';
 
 export interface BrokerPrincipalIdentity {
@@ -145,6 +146,14 @@ export function createPrincipalGraphAuditSink(
         externalId: event.call.toolName,
       }),
     ]);
+
+    // Classified on every sighting, not just the first — cheap (an
+    // idempotent upsert per capability, src/capabilities.ts) and keeps a
+    // tool's capabilities current if TOOL_CAPABILITIES grows a new entry
+    // after this resource already existed, without a separate backfill run.
+    // A no-op for a tool not in that map (see classifyKnownTool's own doc
+    // comment) — never a guess.
+    await classifyKnownTool(pool, resourceId, event.call.toolName);
 
     // AuditEvent.executed is the broker's own documented "did the underlying
     // tool actually run" boolean (types.ts) — ALLOW/ALLOW_WITH_WARNING always

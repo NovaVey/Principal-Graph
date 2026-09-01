@@ -75,6 +75,22 @@ void test('broker calls, gated or not, land in the event log as a verified chain
   const breaks = await verifyChain(pool);
   assert.deepEqual(breaks, []);
 
+  // Task 2: every tool the broker actually called got classified against
+  // TOOL_CAPABILITIES automatically, with no separate classification step.
+  const { rows: capabilityRows } = await pool.query<{
+    external_id: string;
+    capability: string;
+  }>(
+    `select r.external_id, rc.capability
+       from resource r
+       join resource_capability rc on rc.resource_id = r.id
+      order by r.external_id`,
+  );
+  assert.deepEqual(capabilityRows, [
+    { external_id: 'fetch_url', capability: 'ingest_untrusted' },
+    { external_id: 'shell_exec', capability: 'write_irreversible' },
+  ]);
+
   const { rows: allowRows } = await pool.query<{ decision: string; taint_labels: string[] }>(
     `select e.decision, e.taint_labels
        from event e

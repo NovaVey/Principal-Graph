@@ -6,11 +6,12 @@ questions that currently need two different tools and a person to join by
 hand — a grant graph plus a tamper-evident event log, for companies too small
 to have a security team.
 
-**Status: Milestone 1 complete**, plus a GitHub collaborators adapter beyond
-it. The event log, the broker integration that feeds it, capability
-classification, the MCP-config adapter, the GitHub adapter, and the report
-are all implemented and tested. See [Related projects](#related-projects) for
-what feeds this repo and what it doesn't do yet.
+**Status: Milestone 1 complete**, plus a GitHub collaborators adapter and an
+RBA exporter beyond it. The event log, the broker integration that feeds it,
+capability classification, the MCP-config adapter, the GitHub adapter, the
+report, and the export bridge into Relationship-Based-Authorization are all
+implemented and tested. See [Related projects](#related-projects) for what
+feeds this repo, what it feeds, and what it doesn't do yet.
 
 ## Why
 
@@ -25,8 +26,9 @@ person or an agent.
 Two rules that are expensive to undo, and stay true throughout this repo:
 
 - **One `principal` table.** Never separate `agent`/`user` tables — the
-  transitive reachability query this project exists for needs both kinds on
-  one graph.
+  reachability graph this project feeds (directly, and via the RBA exporter
+  below) needs both kinds on one graph, not two graphs a query has to join
+  by hand.
 - **Zero credentials for the agent side.** The MCP-config adapter (Task 3)
   reads files on disk; nothing here talks to a SaaS API. The product has to
   be useful before you ever need a second person (the one who owns the
@@ -48,6 +50,7 @@ Two rules that are expensive to undo, and stay true throughout this repo:
 docker run --name pg-principal -e POSTGRES_PASSWORD=devpass -p 5432:5432 -d postgres:16
 docker exec -it pg-principal psql -U postgres -c "create database principalgraph"
 docker exec -i pg-principal psql -U postgres -d principalgraph < schema/001_core.sql
+docker exec -i pg-principal psql -U postgres -d principalgraph < schema/002_rba_export_state.sql
 
 npm install
 npm test    # DATABASE_URL defaults to postgresql://postgres:devpass@localhost:5432/principalgraph
@@ -157,6 +160,37 @@ Three plain-text sections, one command:
 override the denials section's window (default 30 days) and row cap
 (default 50) — see `src/views/report.ts`.
 
+### 6. Sync grants into RBA for real multi-hop reachability
+
+Principal-Graph's own grant model is deliberately one hop (`principal` →
+`resource`); it doesn't walk chains. For "what can this principal
+*ultimately* reach," that's
+[`Relationship-Based-Authorization`](https://github.com/NovaVey/Relationship-Based-Authorization)'s
+job — a separate, independently soundness-proven ReBAC engine. This
+exporter is the bridge:
+
+```bash
+RBA_API_URL=https://your-rba-instance \
+RBA_API_KEY=...                        \
+  npm run export:rba
+```
+
+Projects each live `grant_edge` row into an RBA relationship tuple
+(`resource.kind` → RBA namespace, `relation` passed straight through,
+`(source, external_id)` → the tuple's object/subject id) via RBA's public
+`POST`/`DELETE /tuples` API — never RBA's own database directly. Requires
+`schema/002_rba_export_state.sql` (above) and, on the RBA side, that
+deployment's namespace schema already published for whatever resource
+kinds you're syncing — this exporter only ever writes tuples, never
+schema.
+
+Incremental, not a full resync: RBA's tuple-write API is capped at 20
+requests/minute with no batch-write endpoint, so `rba_export_state` tracks
+a watermark and each run only pushes what changed since the last one. A
+run that fails partway leaves the watermark untouched — every write/delete
+is idempotent, so the same window safely retries next run rather than
+silently dropping whatever failed.
+
 ## Data model
 
 Five tables (`schema/001_core.sql`):
@@ -175,10 +209,15 @@ Two views built on top, read by the report:
 - `trifecta_exposure` — a principal whose live grants together cover
   `read_private`, `ingest_untrusted`, and `egress`.
 
+A second migration, `schema/002_rba_export_state.sql`, adds one small table
+(`rba_export_state`) holding nothing but the RBA exporter's own sync
+watermark — internal bookkeeping, not part of the grant graph itself.
+
 ## Project layout
 
 ```
 schema/            SQL migrations — 001_core.sql is the shared core
+                     002_rba_export_state.sql adds the RBA exporter's own sync state
 src/
   model.ts          shared types every adapter/view imports from
   log.ts             hash-chained append + chain verifier
@@ -191,16 +230,20 @@ src/
     github-collaborators.ts  feeds grant_edge from a repo's GitHub collaborators
   views/
     report.ts         buildReport()/formatReport() — the three-section report
+  exporters/
+    rba.ts             feeds RBA relationship tuples from grant_edge (the reverse of an adapter)
 scripts/
   run-mcp-config-adapter.ts  npm run adapter:mcp-config
   run-github-adapter.ts      npm run adapter:github
+  run-rba-exporter.ts        npm run export:rba
   report.ts                  npm run report
 test/                one *.spec.ts per module, run against a real Postgres
 ```
 
 Adapters only write; views only read. Nothing in `adapters/` imports from
 `views/` or the reverse — that's what keeps adding the next adapter (AWS,
-Workspace, ...) cheap.
+Workspace, ...) cheap. `exporters/` is the mirror image of `adapters/`: it
+reads Principal-Graph and writes to an external system, never the reverse.
 
 ## Development
 
@@ -224,11 +267,15 @@ comments before "fixing" a lint/format finding in either by editing them.
 - [`Taint-Tracked-Tool-Broker`](https://github.com/NovaVey/Taint-Tracked-Tool-Broker) —
   the runtime enforcement and provenance labeling this repo's event log
   records (see [Usage](#1-wire-your-broker-to-the-event-log)).
-- `Relationship-Based-Authorization` — the graph and reachability queries
-  this project's grant model builds toward.
+- [`Relationship-Based-Authorization`](https://github.com/NovaVey/Relationship-Based-Authorization) —
+  the independently soundness-proven ReBAC engine that answers "what can
+  this principal ultimately reach," fed by this project's grant data via
+  the exporter (see [Usage](#6-sync-grants-into-rba-for-real-multi-hop-reachability)).
+  Principal-Graph deliberately does not reimplement graph-walking
+  reachability itself — that engine already exists, proven, over there.
 
-Not in this milestone: AWS/Workspace connectors, multi-hop reachability
-queries, a web server, a policy DSL, or auth on the report.
+Not in this milestone: AWS/Workspace connectors, a web server, a policy
+DSL, or auth on the report.
 
 ## License
 

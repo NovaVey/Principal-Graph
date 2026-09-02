@@ -13,8 +13,9 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
-    "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\" \"*.{js,ts,json}\"",
-    "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\" \"*.{js,ts,json}\""
+    "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\" \"scripts/**/*.ts\" \"*.{js,ts,json}\"",
+    "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\" \"scripts/**/*.ts\" \"*.{js,ts,json}\"",
+    "adapter:mcp-config": "tsx scripts/run-mcp-config-adapter.ts"
   },
   "repository": {
     "type": "git",

@@ -179,10 +179,21 @@ Projects each live `grant_edge` row into an RBA relationship tuple
 (`resource.kind` → RBA namespace, `relation` passed straight through,
 `(source, external_id)` → the tuple's object/subject id) via RBA's public
 `POST`/`DELETE /tuples` API — never RBA's own database directly. Requires
-`schema/002_rba_export_state.sql` (above) and, on the RBA side, that
-deployment's namespace schema already published for whatever resource
-kinds you're syncing — this exporter only ever writes tuples, never
-schema.
+`schema/002_rba_export_state.sql` (above) and, on the RBA side, this
+project's own namespace schema (`rba/principal-graph.authz`) published
+once against your deployment — this exporter only ever writes tuples,
+never schema:
+
+```bash
+authz schema publish rba/principal-graph.authz   # run against your RBA deployment, once
+```
+
+Then a real reachability question is one command away, on the RBA side —
+not this repo's, since Principal-Graph itself never walks chains:
+
+```bash
+authz check principal:manual:alice any_access repo:github:my-org/my-repo
+```
 
 Incremental, not a full resync: RBA's tuple-write API is capped at 20
 requests/minute with no batch-write endpoint, so `rba_export_state` tracks
@@ -218,6 +229,8 @@ watermark — internal bookkeeping, not part of the grant graph itself.
 ```
 schema/            SQL migrations — 001_core.sql is the shared core
                      002_rba_export_state.sql adds the RBA exporter's own sync state
+rba/
+  principal-graph.authz  RBA's own namespace schema for this project's grant data
 src/
   model.ts          shared types every adapter/view imports from
   log.ts             hash-chained append + chain verifier

@@ -1,0 +1,45 @@
+// The RBA namespace schema for Principal-Graph's own grant data — what
+// src/exporters/rba.ts's own header describes in prose, made real and
+// publishable. Not published automatically by anything in this repo (a
+// deliberate choice — see src/exporters/rba.ts's header and README.md's
+// "Sync grants into RBA" section): publish it yourself, once, against
+// your own RBA deployment, before running `npm run export:rba` for the
+// first time:
+//
+//   authz schema publish rba/principal-graph.authz
+//
+// One namespace per `resource.kind` this repo's adapters actually produce
+// today — never a speculative one for a kind nothing here creates yet
+// (same discipline as src/capabilities.ts's TOOL_CAPABILITIES: a
+// namespace nothing writes to is a guess, not a fact). Adding a new
+// adapter that introduces a new resource kind, or a new relation on an
+// existing one, means extending this file too — the exporter maps
+// whatever `grant_edge.relation` value it finds straight through, so an
+// unpublished relation on an otherwise-known namespace fails the write
+// with `tuple_validation_failed` rather than silently doing nothing.
+//
+// Every namespace also declares `any_access`, a union of everything that
+// namespace grants — the same "what can this thing reach, at all" question
+// this whole project exists to answer, answerable with one check regardless
+// of which relation vocabulary a given resource kind happens to use:
+//   authz check principal:<source>:<id> any_access tool:<source>:<id>
+//   authz check principal:<source>:<id> any_access repo:<source>:<id>
+
+// Produced by src/adapters/mcp-config.ts and src/adapters/broker-audit-sink.ts.
+namespace tool {
+  relation can_call: principal
+
+  permission any_access = can_call
+}
+
+// Produced by src/adapters/github-collaborators.ts. GitHub's five
+// permission levels (pull/triage/push/maintain/admin) are already
+// collapsed onto these three relations before they ever reach RBA — see
+// relationFromPermissions() in src/adapters/github-collaborators.ts.
+namespace repo {
+  relation read: principal
+  relation write: principal
+  relation admin: principal
+
+  permission any_access = read | write | admin
+}

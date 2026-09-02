@@ -40,6 +40,25 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { ensurePrincipal, ensureResource, type Queryable } from '../upsert.js';
 
+/**
+ * A plain, explicit UTF-16-code-unit string comparator for `grantedTools`/
+ * `revokedTools`' ordering — used here, and by this file's own tests, so
+ * both sides of a test assertion sort the same way. The concrete reason
+ * this needs to be explicit rather than left to bare `Array.prototype.sort()`
+ * (whose no-comparator behavior is exactly this): a mixed-case tool name set
+ * like `{'Read', 'create_pull_request'}` also gets compared, in tests,
+ * against rows read back via SQL `ORDER BY` — and Postgres's collation is
+ * locale-dependent (this repo's own dev DB vs. `postgres:16`'s default
+ * `en_US.utf8` in CI order `'Read'` vs `'create_pull_request'` differently,
+ * since locale-aware collation compares letters before case). A test
+ * comparing a DB-ordered result against a JS-sorted literal can't assume the
+ * two agree unless both are explicitly sorted the same way — see
+ * test/mcp-config.spec.ts's own comment at its `liveGrants` query.
+ */
+export function compareToolNames(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 export interface McpConfigAgentIdentity {
   /** Which adapter/system this identity comes from — 'mcp-config' for a fresh discovery. */
   source: string;
@@ -173,7 +192,7 @@ export async function runMcpConfigAdapter(
 
   const grantedTools: string[] = [];
   const resourceIds: string[] = [];
-  for (const toolName of [...tools].sort()) {
+  for (const toolName of [...tools].sort(compareToolNames)) {
     const resourceId = await ensureResource(db, {
       kind: 'tool',
       source: 'mcp-config',
@@ -213,7 +232,7 @@ export async function runMcpConfigAdapter(
   return {
     principalId,
     grantedTools,
-    revokedTools: revokedRows.map((r) => r.external_id).sort(),
+    revokedTools: revokedRows.map((r) => r.external_id).sort(compareToolNames),
     unresolvedEntries: unresolved,
   };
 }

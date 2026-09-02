@@ -15,6 +15,7 @@ import assert from 'node:assert/strict';
 import { createBroker, type ToolExecutor } from 'taint-tracked-tool-broker';
 
 import {
+  compareToolNames,
   parseAllowedTools,
   runMcpConfigAdapter,
   toolNameFromPermissionEntry,
@@ -58,7 +59,7 @@ void test('parseAllowedTools unions allow entries and lets deny win', () => {
       deny: ['mcp__slack__post_message'],
     },
   });
-  assert.deepEqual([...tools].sort(), ['Bash', 'create_pull_request']);
+  assert.deepEqual([...tools].sort(compareToolNames), ['Bash', 'create_pull_request']);
   assert.deepEqual(unresolved, ['mcp__filesystem']);
 });
 
@@ -84,20 +85,27 @@ void test('runMcpConfigAdapter grants from merged config layers and revokes what
       configPaths: [userSettings, projectSettings, localSettings],
     });
 
-    assert.deepEqual(first.grantedTools, ['Read', 'create_pull_request', 'read_file'].sort());
+    assert.deepEqual(
+      first.grantedTools,
+      ['Read', 'create_pull_request', 'read_file'].sort(compareToolNames),
+    );
     assert.deepEqual(first.revokedTools, []);
 
+    // Sorted in JS on both sides, deliberately not `order by` in SQL: Postgres's
+    // collation is locale-dependent (this repo's own dev DB vs. postgres:16's
+    // default en_US.utf8 in CI order 'Read' vs 'create_pull_request'
+    // differently), so an `ORDER BY` result can't be assumed to match a JS
+    // sort's order — see compareToolNames' own doc comment.
     const { rows: liveGrants } = await pool.query<{ external_id: string }>(
       `select r.external_id
          from grant_edge g
          join resource r on r.id = g.resource_id
-        where g.principal_id = $1 and g.revoked_at is null
-        order by r.external_id`,
+        where g.principal_id = $1 and g.revoked_at is null`,
       [first.principalId],
     );
     assert.deepEqual(
-      liveGrants.map((r) => r.external_id),
-      ['Read', 'create_pull_request', 'read_file'].sort(),
+      liveGrants.map((r) => r.external_id).sort(compareToolNames),
+      ['Read', 'create_pull_request', 'read_file'].sort(compareToolNames),
     );
 
     // Second run: local settings no longer grants read_file. That grant

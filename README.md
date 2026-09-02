@@ -6,11 +6,11 @@ questions that currently need two different tools and a person to join by
 hand — a grant graph plus a tamper-evident event log, for companies too small
 to have a security team.
 
-**Status: Milestone 1 complete.** The event log, the broker integration that
-feeds it, capability classification, the MCP-config adapter that populates
-grants, and the report are all implemented and tested. See
-[Related projects](#related-projects) for what feeds this repo and what it
-doesn't do yet.
+**Status: Milestone 1 complete**, plus a GitHub collaborators adapter beyond
+it. The event log, the broker integration that feeds it, capability
+classification, the MCP-config adapter, the GitHub adapter, and the report
+are all implemented and tested. See [Related projects](#related-projects) for
+what feeds this repo and what it doesn't do yet.
 
 ## Why
 
@@ -30,7 +30,10 @@ Two rules that are expensive to undo, and stay true throughout this repo:
 - **Zero credentials for the agent side.** The MCP-config adapter (Task 3)
   reads files on disk; nothing here talks to a SaaS API. The product has to
   be useful before you ever need a second person (the one who owns the
-  Google admin console, say) in the loop.
+  Google admin console, say) in the loop. This is specifically about the
+  agent side — the GitHub adapter (below) is a different kind of grant and
+  does need a token, same as any tool that has to ask GitHub who can push
+  where.
 
 ## Requirements
 
@@ -59,8 +62,8 @@ something proven against a real database.
 ### 1. Wire your broker to the event log
 
 This isn't published as an npm package yet — clone the repo and write your
-integration alongside it (say, `scripts/wire-broker.ts`, next to the two
-scripts already there). If you're already using
+integration alongside it (say, `scripts/wire-broker.ts`, next to the scripts
+already there). If you're already using
 [`taint-tracked-tool-broker`](https://github.com/NovaVey/Taint-Tracked-Tool-Broker),
 point its `auditSink` at Principal-Graph and every gated call — allowed or
 denied — becomes a row in `event`:
@@ -105,7 +108,27 @@ permitted tool. Re-running it revokes (never deletes) a grant whose tool has
 since disappeared from config. `PRINCIPAL_GRAPH_AGENT_ID` overrides the
 agent identity (defaults to `<os user>@<hostname>`).
 
-### 3. Classify what each tool can do
+### 3. Populate grants from GitHub repo collaborators
+
+```bash
+PRINCIPAL_GRAPH_GITHUB_TOKEN=ghp_...                \
+PRINCIPAL_GRAPH_GITHUB_REPOS=owner/repo,owner/repo2 \
+  npm run adapter:github
+```
+
+Reads each listed repo's collaborators (`GET /repos/{owner}/{repo}/collaborators`,
+which already resolves team-based access into one effective permission per
+user) and writes a grant per collaborator — `read`, `write`, or `admin`,
+collapsed from GitHub's five permission levels onto this project's own
+relation vocabulary (`schema/001_core.sql`). Unlike the MCP-config adapter,
+this one does talk to a live API and does need a token — see
+[Why](#why)'s note on the zero-credentials rule. Re-running it revokes a
+collaborator who's gone, *and* the old grant of one whose permission level
+changed (a fresh grant at the new level is written in its place) — never
+deletes either. The repo list is entirely explicit
+(`PRINCIPAL_GRAPH_GITHUB_REPOS`); nothing here discovers repos on its own.
+
+### 4. Classify what each tool can do
 
 `src/capabilities.ts`'s `TOOL_CAPABILITIES` is a small, hand-written map from
 tool name to capability (`read_public` | `read_private` | `ingest_untrusted`
@@ -114,7 +137,7 @@ use. It's applied automatically the moment the broker sink or the report see
 a resource, so there's no separate classification step to remember; a tool
 missing from the map is left unclassified rather than guessed at.
 
-### 4. Run the report
+### 5. Run the report
 
 ```bash
 npm run report                # prints to stdout
@@ -163,19 +186,21 @@ src/
   capabilities.ts    TOOL_CAPABILITIES (hand-written) + how resources get classified
   db.ts              Pool construction (reads DATABASE_URL)
   adapters/
-    broker-audit-sink.ts  feeds event from a live taint-tracked-tool-broker session
-    mcp-config.ts          feeds grant_edge from Claude Code's own settings.json (github later)
+    broker-audit-sink.ts       feeds event from a live taint-tracked-tool-broker session
+    mcp-config.ts              feeds grant_edge from Claude Code's own settings.json
+    github-collaborators.ts  feeds grant_edge from a repo's GitHub collaborators
   views/
     report.ts         buildReport()/formatReport() — the three-section report
 scripts/
-  run-mcp-config-adapter.ts   npm run adapter:mcp-config
-  report.ts                    npm run report
+  run-mcp-config-adapter.ts  npm run adapter:mcp-config
+  run-github-adapter.ts      npm run adapter:github
+  report.ts                  npm run report
 test/                one *.spec.ts per module, run against a real Postgres
 ```
 
 Adapters only write; views only read. Nothing in `adapters/` imports from
-`views/` or the reverse — that's what keeps adding a fourth adapter (GitHub,
-next) cheap.
+`views/` or the reverse — that's what keeps adding the next adapter (AWS,
+Workspace, ...) cheap.
 
 ## Development
 
@@ -202,8 +227,8 @@ comments before "fixing" a lint/format finding in either by editing them.
 - `Relationship-Based-Authorization` — the graph and reachability queries
   this project's grant model builds toward.
 
-Not in this milestone: GitHub/AWS/Workspace connectors, multi-hop
-reachability queries, a web server, a policy DSL, or auth on the report.
+Not in this milestone: AWS/Workspace connectors, multi-hop reachability
+queries, a web server, a policy DSL, or auth on the report.
 
 ## License
 

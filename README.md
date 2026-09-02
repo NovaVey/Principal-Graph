@@ -6,13 +6,13 @@ questions that currently need two different tools and a person to join by
 hand — a grant graph plus a tamper-evident event log, for companies too small
 to have a security team.
 
-**Status: Milestone 1 complete**, plus a GitHub collaborators adapter, an RBA
-exporter, and a report server beyond it. The event log, the broker
-integration that feeds it, capability classification, the MCP-config
-adapter, the GitHub adapter, the report (CLI and HTTP), and the export
-bridge into Relationship-Based-Authorization are all implemented and
-tested. See [Related projects](#related-projects) for what feeds this repo,
-what it feeds, and what it doesn't do yet.
+**Status: Milestone 1 complete**, plus a GitHub collaborators adapter, an AWS
+adapter, an RBA exporter, and a report server beyond it. The event log, the
+broker integration that feeds it, capability classification, the MCP-config
+adapter, the GitHub adapter, the AWS adapter, the report (CLI and HTTP),
+and the export bridge into Relationship-Based-Authorization are all
+implemented and tested. See [Related projects](#related-projects) for what
+feeds this repo, what it feeds, and what it doesn't do yet.
 
 ## Why
 
@@ -132,7 +132,34 @@ changed (a fresh grant at the new level is written in its place) — never
 deletes either. The repo list is entirely explicit
 (`PRINCIPAL_GRAPH_GITHUB_REPOS`); nothing here discovers repos on its own.
 
-### 4. Classify what each tool can do
+### 4. Populate grants from AWS S3 bucket access
+
+```bash
+PRINCIPAL_GRAPH_AWS_BUCKETS=my-bucket,my-other-bucket                                       \
+PRINCIPAL_GRAPH_AWS_PRINCIPAL_ARNS=arn:aws:iam::111:user/alice,arn:aws:iam::111:role/ci-role \
+  npm run adapter:aws
+```
+
+Checks each listed IAM principal against each listed bucket using AWS's
+own IAM Policy Simulator (`iam:SimulatePrincipalPolicy`) — not a
+hand-written policy evaluator, since identity policies, resource
+policies, explicit-deny precedence, and condition blocks are genuinely
+subtle to get right, and AWS's simulator is the authoritative
+implementation of that evaluation. Grants `read`/`write`/`admin` per
+(principal, bucket) pair, same relation vocabulary as the GitHub adapter.
+
+Unlike the other two adapters, **both** the bucket list and the principal
+list are explicit config, not discovered — GitHub's collaborators API is
+a complete inventory for a repo; nothing on the AWS side offers that same
+property without provisioning a whole separate service (IAM Access
+Analyzer). Revocation is scoped tightly to match: re-running it only
+revokes a relation for a (principal, bucket) pair this run actually
+re-checked and found no longer allowed — a smaller `PRINCIPAL_GRAPH_AWS_PRINCIPAL_ARNS`
+list on one run is a smaller check, never a claim that everyone else lost
+access. AWS credentials come from the SDK's own default provider chain
+(same as the AWS CLI); the credential needs only `iam:SimulatePrincipalPolicy`.
+
+### 5. Classify what each tool can do
 
 `src/capabilities.ts`'s `TOOL_CAPABILITIES` is a small, hand-written map from
 tool name to capability (`read_public` | `read_private` | `ingest_untrusted`
@@ -141,7 +168,7 @@ use. It's applied automatically the moment the broker sink or the report see
 a resource, so there's no separate classification step to remember; a tool
 missing from the map is left unclassified rather than guessed at.
 
-### 5. Run the report
+### 6. Run the report
 
 ```bash
 npm run report                # prints to stdout
@@ -161,7 +188,7 @@ Three plain-text sections, one command:
 override the denials section's window (default 30 days) and row cap
 (default 50) — see `src/views/report.ts`.
 
-### 6. Sync grants into RBA for real multi-hop reachability
+### 7. Sync grants into RBA for real multi-hop reachability
 
 Principal-Graph's own grant model is deliberately one hop (`principal` →
 `resource`); it doesn't walk chains. For "what can this principal
@@ -194,6 +221,7 @@ not this repo's, since Principal-Graph itself never walks chains:
 
 ```bash
 authz check principal:manual:alice any_access repo:github:my-org/my-repo
+authz check principal:aws:arn:aws:iam::111:user/alice any_access bucket:aws:my-bucket
 ```
 
 Incremental, not a full resync: RBA's tuple-write API is capped at 20
@@ -203,7 +231,7 @@ run that fails partway leaves the watermark untouched — every write/delete
 is idempotent, so the same window safely retries next run rather than
 silently dropping whatever failed.
 
-### 7. Serve the report over HTTP
+### 8. Serve the report over HTTP
 
 ```bash
 PRINCIPAL_GRAPH_REPORT_API_KEY=...  PORT=8080  npm run serve
@@ -265,6 +293,7 @@ src/
     broker-audit-sink.ts       feeds event from a live taint-tracked-tool-broker session
     mcp-config.ts              feeds grant_edge from Claude Code's own settings.json
     github-collaborators.ts  feeds grant_edge from a repo's GitHub collaborators
+    aws-s3.ts                    feeds grant_edge from IAM Policy Simulator results on S3 buckets
   views/
     report.ts         buildReport()/formatReport() — the three-section report
   exporters/
@@ -272,6 +301,7 @@ src/
 scripts/
   run-mcp-config-adapter.ts  npm run adapter:mcp-config
   run-github-adapter.ts      npm run adapter:github
+  run-aws-adapter.ts         npm run adapter:aws
   run-rba-exporter.ts        npm run export:rba
   run-server.ts               npm run serve
   report.ts                  npm run report
@@ -279,8 +309,8 @@ test/                one *.spec.ts per module, run against a real Postgres
 ```
 
 Adapters only write; views only read. Nothing in `adapters/` imports from
-`views/` or the reverse — that's what keeps adding the next adapter (AWS,
-Workspace, ...) cheap. `exporters/` is the mirror image of `adapters/`: it
+`views/` or the reverse — that's what keeps adding the next adapter
+(Workspace, ...) cheap. `exporters/` is the mirror image of `adapters/`: it
 reads Principal-Graph and writes to an external system, never the reverse.
 
 ## Development
@@ -308,11 +338,11 @@ comments before "fixing" a lint/format finding in either by editing them.
 - [`Relationship-Based-Authorization`](https://github.com/NovaVey/Relationship-Based-Authorization) —
   the independently soundness-proven ReBAC engine that answers "what can
   this principal ultimately reach," fed by this project's grant data via
-  the exporter (see [Usage](#6-sync-grants-into-rba-for-real-multi-hop-reachability)).
+  the exporter (see [Usage](#7-sync-grants-into-rba-for-real-multi-hop-reachability)).
   Principal-Graph deliberately does not reimplement graph-walking
   reachability itself — that engine already exists, proven, over there.
 
-Not in this milestone: AWS/Workspace connectors or a policy DSL.
+Not in this milestone: a Workspace connector or a policy DSL.
 
 ## License
 

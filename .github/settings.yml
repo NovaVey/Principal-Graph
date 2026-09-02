@@ -1,0 +1,62 @@
+# .github/settings.yml
+#
+# Applied automatically by the "Settings" GitHub App
+# (https://github.com/apps/settings) if it's installed on this repo —
+# inert otherwise; nothing in this repo's own tooling reads this file.
+# Configures only what was actually asked for: main's branch protection,
+# and the merge strategy consistent with this repo's own history (every
+# merge so far has been a squash merge). Not a general repo-settings
+# dump — deliberately doesn't touch anything else (issues, wiki, topics,
+# ...) that wasn't asked about.
+#
+# Until/unless the Settings App is installed, apply the same protection
+# directly instead:
+#
+#   cat <<'JSON' | gh api --method PUT /repos/NovaVey/Principal-Graph/branches/main/protection --input -
+#   {
+#     "required_status_checks": {
+#       "strict": true,
+#       "contexts": ["lint", "test (20)", "test (22)", "test (24)"]
+#     },
+#     "enforce_admins": true,
+#     "required_pull_request_reviews": null,
+#     "restrictions": null,
+#     "required_linear_history": false,
+#     "allow_force_pushes": false,
+#     "allow_deletions": false,
+#     "required_conversation_resolution": false
+#   }
+#   JSON
+
+repository:
+  allow_squash_merge: true
+  allow_merge_commit: false
+  allow_rebase_merge: false
+  delete_branch_on_merge: true
+
+branches:
+  - name: main
+    protection:
+      # Every PR must pass the full CI matrix (.github/workflows/ci.yml)
+      # before it can merge, and must be up to date with main when it
+      # does (strict: true) — no merging a green PR whose branch predates
+      # a base-branch change CI never actually ran against.
+      required_status_checks:
+        strict: true
+        contexts:
+          - lint
+          - test (20)
+          - test (22)
+          - test (24)
+      # No admin bypass: protection that the repo owner can just skip
+      # isn't protection.
+      enforce_admins: true
+      # Not required: every merge in this repo's history has gone
+      # straight from green CI to squash-merge, with no separate human
+      # review step — requiring approvals would block that established
+      # workflow. Revisit if that changes.
+      required_pull_request_reviews: null
+      restrictions: null
+      required_linear_history: false
+      allow_force_pushes: false
+      allow_deletions: false

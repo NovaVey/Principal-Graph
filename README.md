@@ -1,20 +1,21 @@
 # Principal-Graph
 
+[![CI](https://github.com/NovaVey/Principal-Graph/actions/workflows/ci.yml/badge.svg)](https://github.com/NovaVey/Principal-Graph/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/NovaVey/Principal-Graph)](https://github.com/NovaVey/Principal-Graph/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+
 One model of who and what can reach your systems, and what they actually did.
 Humans and agents are the same kind of principal, so one query answers
 questions that currently need two different tools and a person to join by
 hand — a grant graph plus a tamper-evident event log, for companies too small
 to have a security team.
 
-**Status: Milestone 1 complete**, plus a GitHub collaborators adapter, an AWS
-adapter, a Workspace adapter, an RBA exporter, a report server, and a
-policy engine beyond it. The event log, the broker integration that feeds
-it, capability classification, the MCP-config adapter, the GitHub
-adapter, the AWS adapter, the Workspace adapter, the report (CLI and
-HTTP), the export bridge into Relationship-Based-Authorization, and
-policy checks are all implemented and tested. See
-[Related projects](#related-projects) for what feeds this repo, what it
-feeds, and what it doesn't do yet.
+**v1.0.0.** The event log, the broker integration that feeds it, capability
+classification, four grant-source adapters (MCP config, GitHub, AWS,
+Google Workspace), the report (CLI and HTTP) with policy checks, and the
+export bridge into Relationship-Based-Authorization are all implemented
+and tested. See [Related projects](#related-projects) for what feeds this
+repo, what it feeds, and what it doesn't do yet.
 
 ## Contents
 
@@ -183,6 +184,12 @@ list on one run is a smaller check, never a claim that everyone else lost
 access. AWS credentials come from the SDK's own default provider chain
 (same as the AWS CLI); the credential needs only `iam:SimulatePrincipalPolicy`.
 
+> **Not yet live-verified.** This adapter's actual `iam:SimulatePrincipalPolicy`
+> call has never been exercised against a real AWS account (none was
+> available while building it) — verified as far as possible without one
+> (the request shape matches the AWS SDK's own TypeScript types exactly),
+> but not proven against production traffic yet.
+
 ### 5. Populate grants from Google Workspace group membership
 
 ```bash
@@ -219,6 +226,13 @@ old grant of one whose role changed — same relation-pair-aware revoke
 logic as the GitHub adapter. The group list is entirely explicit
 (`PRINCIPAL_GRAPH_WORKSPACE_GROUPS`); nothing here discovers groups on
 its own.
+
+> **Not yet live-verified.** This adapter's actual Directory API call has
+> never been exercised against a real Workspace domain (none was
+> available while building it). The hand-rolled JWT signing itself was
+> verified directly — a real generated RSA keypair proves the resulting
+> token is spec-correct and its RS256 signature verifies — but the live
+> API call has not been proven against production traffic yet.
 
 ### 6. Classify what each tool can do
 

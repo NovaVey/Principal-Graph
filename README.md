@@ -6,12 +6,13 @@ questions that currently need two different tools and a person to join by
 hand — a grant graph plus a tamper-evident event log, for companies too small
 to have a security team.
 
-**Status: Milestone 1 complete**, plus a GitHub collaborators adapter and an
-RBA exporter beyond it. The event log, the broker integration that feeds it,
-capability classification, the MCP-config adapter, the GitHub adapter, the
-report, and the export bridge into Relationship-Based-Authorization are all
-implemented and tested. See [Related projects](#related-projects) for what
-feeds this repo, what it feeds, and what it doesn't do yet.
+**Status: Milestone 1 complete**, plus a GitHub collaborators adapter, an RBA
+exporter, and a report server beyond it. The event log, the broker
+integration that feeds it, capability classification, the MCP-config
+adapter, the GitHub adapter, the report (CLI and HTTP), and the export
+bridge into Relationship-Based-Authorization are all implemented and
+tested. See [Related projects](#related-projects) for what feeds this repo,
+what it feeds, and what it doesn't do yet.
 
 ## Why
 
@@ -202,6 +203,28 @@ run that fails partway leaves the watermark untouched — every write/delete
 is idempotent, so the same window safely retries next run rather than
 silently dropping whatever failed.
 
+### 7. Serve the report over HTTP
+
+```bash
+PRINCIPAL_GRAPH_REPORT_API_KEY=...  PORT=8080  npm run serve
+
+curl http://localhost:8080/health
+curl -H "Authorization: Bearer $PRINCIPAL_GRAPH_REPORT_API_KEY" http://localhost:8080/report
+curl -H "Authorization: Bearer $PRINCIPAL_GRAPH_REPORT_API_KEY" http://localhost:8080/report.json
+```
+
+For whoever's watching the report regularly rather than running it by
+hand. Built on `node:http` directly — no framework, matching this repo's
+own minimal-dependency habit elsewhere. `GET /health` is unauthenticated
+(it reveals nothing but liveness and real DB connectivity, same choice
+RBA's own live deployment makes); `GET /report` (plain text, same output
+as `npm run report`) and `GET /report.json` (the structured data behind
+it) both require `Authorization: Bearer <PRINCIPAL_GRAPH_REPORT_API_KEY>`.
+The server refuses to start at all without that key configured — this
+project's report says exactly who can reach what, so serving it wide open
+by way of a forgotten env var is the one failure mode worth refusing
+outright rather than defaulting around.
+
 ## Data model
 
 Five tables (`schema/001_core.sql`):
@@ -237,6 +260,7 @@ src/
   upsert.ts          ensurePrincipal / ensureResource — how adapters upsert identity
   capabilities.ts    TOOL_CAPABILITIES (hand-written) + how resources get classified
   db.ts              Pool construction (reads DATABASE_URL)
+  server.ts          GET /report, /report.json, /health — node:http, no framework
   adapters/
     broker-audit-sink.ts       feeds event from a live taint-tracked-tool-broker session
     mcp-config.ts              feeds grant_edge from Claude Code's own settings.json
@@ -249,6 +273,7 @@ scripts/
   run-mcp-config-adapter.ts  npm run adapter:mcp-config
   run-github-adapter.ts      npm run adapter:github
   run-rba-exporter.ts        npm run export:rba
+  run-server.ts               npm run serve
   report.ts                  npm run report
 test/                one *.spec.ts per module, run against a real Postgres
 ```
@@ -287,8 +312,7 @@ comments before "fixing" a lint/format finding in either by editing them.
   Principal-Graph deliberately does not reimplement graph-walking
   reachability itself — that engine already exists, proven, over there.
 
-Not in this milestone: AWS/Workspace connectors, a web server, a policy
-DSL, or auth on the report.
+Not in this milestone: AWS/Workspace connectors or a policy DSL.
 
 ## License
 

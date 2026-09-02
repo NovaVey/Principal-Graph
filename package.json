@@ -18,7 +18,8 @@
     "adapter:mcp-config": "tsx scripts/run-mcp-config-adapter.ts",
     "adapter:github": "tsx scripts/run-github-adapter.ts",
     "export:rba": "tsx scripts/run-rba-exporter.ts",
-    "report": "tsx scripts/report.ts"
+    "report": "tsx scripts/report.ts",
+    "serve": "tsx scripts/run-server.ts"
   },
   "repository": {
     "type": "git",

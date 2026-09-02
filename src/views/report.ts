@@ -22,8 +22,9 @@ export type Queryable = Pool | PoolClient;
 
 export interface UnusedGrantRow {
   principalKind: string;
-  principal: string | null;
-  resource: string | null;
+  /** display_name if set, else external_id — a reader always gets a real identifier, never a placeholder. */
+  principal: string;
+  resource: string;
   relation: string;
   source: string;
   observedAt: Date;
@@ -34,15 +35,17 @@ export interface UnusedGrantRow {
 export interface TrifectaRow {
   principalId: string;
   kind: string;
-  displayName: string | null;
+  /** display_name if set, else external_id. */
+  displayName: string;
   capabilities: Capability[];
 }
 
 export interface DenialRow {
   occurredAt: Date;
   principalKind: string;
-  principal: string | null;
-  resource: string | null;
+  /** display_name if set, else external_id. */
+  principal: string;
+  resource: string;
   action: string;
   denyReason: string | null;
   taintLabels: string[];
@@ -85,6 +88,11 @@ function dangerRankOf(capabilities: readonly Capability[] | null): number {
   return best;
 }
 
+/** A reader always gets a real identifier, never a placeholder: display_name when an adapter set one, else the external_id every row is upserted by. */
+function resolveName(displayName: string | null, externalId: string): string {
+  return displayName ?? externalId;
+}
+
 const DEFAULT_DENIAL_WINDOW_DAYS = 30;
 const DEFAULT_DENIAL_LIMIT = 50;
 
@@ -103,40 +111,57 @@ export async function buildReport(db: Queryable, opts: BuildReportOptions = {}):
     db.query<{
       principal_kind: string;
       principal: string | null;
+      principal_external_id: string;
       resource: string | null;
+      resource_external_id: string;
       relation: string;
       source: string;
       observed_at: Date;
       capabilities: Capability[] | null;
     }>(
-      // capabilities::text[] — the view's own `capabilities` column is
-      // `capability[]` (a custom enum array); `pg` only auto-parses
-      // well-known builtin array types like text[] into a real JS array,
-      // so an uncast `capability[]` comes back as the raw Postgres array
-      // literal string ("{write_irreversible}") instead. Cast it here
-      // rather than touching the view (schema/001_core.sql, exactly as
-      // given by the build brief).
-      'select principal_kind, principal, resource, relation, source, observed_at, capabilities::text[] as capabilities from unused_grant',
+      // Joined back through grant_edge (the view's own grant_id) to
+      // principal/resource for external_id, so a null display_name has a
+      // real identifier to fall back to instead of a placeholder — see
+      // resolveName() below. capabilities::text[]: the view's own
+      // `capabilities` column is `capability[]` (a custom enum array);
+      // `pg` only auto-parses well-known builtin array types like text[]
+      // into a real JS array, so an uncast `capability[]` comes back as
+      // the raw Postgres array literal string ("{write_irreversible}")
+      // instead. Both casts/joins are done here rather than touching the
+      // view (schema/001_core.sql, exactly as given by the build brief).
+      `select u.principal_kind, u.principal, p.external_id as principal_external_id,
+              u.resource, r.external_id as resource_external_id,
+              u.relation, u.source, u.observed_at, u.capabilities::text[] as capabilities
+         from unused_grant u
+         join grant_edge g on g.id = u.grant_id
+         join principal  p on p.id = g.principal_id
+         join resource   r on r.id = g.resource_id`,
     ),
     db.query<{
       id: string;
       kind: string;
       display_name: string | null;
+      external_id: string;
       capabilities: Capability[];
     }>(
-      'select id, kind, display_name, capabilities::text[] as capabilities from trifecta_exposure',
+      `select t.id, t.kind, t.display_name, p.external_id, t.capabilities::text[] as capabilities
+         from trifecta_exposure t
+         join principal p on p.id = t.id`,
     ),
     db.query<{
       occurred_at: Date;
       principal_kind: string;
       principal: string | null;
+      principal_external_id: string;
       resource: string | null;
+      resource_external_id: string;
       action: string;
       deny_reason: string | null;
       taint_labels: string[];
     }>(
       `select e.occurred_at, p.kind as principal_kind, p.display_name as principal,
-              r.display_name as resource, e.action, e.deny_reason, e.taint_labels
+              p.external_id as principal_external_id, r.display_name as resource,
+              r.external_id as resource_external_id, e.action, e.deny_reason, e.taint_labels
          from event e
          join principal p on p.id = e.principal_id
          join resource  r on r.id = e.resource_id
@@ -151,8 +176,8 @@ export async function buildReport(db: Queryable, opts: BuildReportOptions = {}):
   const unusedGrants: UnusedGrantRow[] = unusedGrantRows.rows
     .map((r) => ({
       principalKind: r.principal_kind,
-      principal: r.principal,
-      resource: r.resource,
+      principal: resolveName(r.principal, r.principal_external_id),
+      resource: resolveName(r.resource, r.resource_external_id),
       relation: r.relation,
       source: r.source,
       observedAt: r.observed_at,
@@ -169,17 +194,17 @@ export async function buildReport(db: Queryable, opts: BuildReportOptions = {}):
     .map((r) => ({
       principalId: r.id,
       kind: r.kind,
-      displayName: r.display_name,
+      displayName: resolveName(r.display_name, r.external_id),
       capabilities: r.capabilities,
     }))
-    .sort((a, b) => (a.displayName ?? '').localeCompare(b.displayName ?? ''));
+    .sort((a, b) => a.displayName.localeCompare(b.displayName));
 
   const denialsTruncated = denialRows.rows.length > denialLimit;
   const denials: DenialRow[] = denialRows.rows.slice(0, denialLimit).map((r) => ({
     occurredAt: r.occurred_at,
     principalKind: r.principal_kind,
-    principal: r.principal,
-    resource: r.resource,
+    principal: resolveName(r.principal, r.principal_external_id),
+    resource: resolveName(r.resource, r.resource_external_id),
     action: r.action,
     denyReason: r.deny_reason,
     taintLabels: r.taint_labels,
@@ -210,22 +235,17 @@ function formatUnusedGrant(row: UnusedGrantRow): string {
     row.capabilities && row.capabilities.length > 0
       ? row.capabilities.join(', ')
       : 'not yet classified';
-  const who = row.principal ?? '(unnamed principal)';
-  const what = row.resource ?? '(unnamed resource)';
-  return `  [${tags}] ${what} — granted to "${who}" (${row.principalKind}) via ${row.source}, unused since ${formatTimestamp(row.observedAt)}`;
+  return `  [${tags}] ${row.resource} — granted to "${row.principal}" (${row.principalKind}) via ${row.source}, unused since ${formatTimestamp(row.observedAt)}`;
 }
 
 function formatTrifectaRow(row: TrifectaRow): string {
-  const who = row.displayName ?? '(unnamed principal)';
-  return `  - ${who} (${row.kind}): ${row.capabilities.join(', ')}`;
+  return `  - ${row.displayName} (${row.kind}): ${row.capabilities.join(', ')}`;
 }
 
 function formatDenial(row: DenialRow): string {
-  const who = row.principal ?? '(unnamed principal)';
-  const what = row.resource ?? '(unnamed resource)';
   const reason = row.denyReason ? ` — ${row.denyReason}` : '';
   const tags = row.taintLabels.length > 0 ? ` [${row.taintLabels.join(', ')}]` : '';
-  return `  ${formatTimestamp(row.occurredAt)} — "${who}" (${row.principalKind}) blocked on ${what} (${row.action})${reason}${tags}`;
+  return `  ${formatTimestamp(row.occurredAt)} — "${row.principal}" (${row.principalKind}) blocked on ${row.resource} (${row.action})${reason}${tags}`;
 }
 
 /** Plain text. No HTML, no tables, no scores — just what a reader needs to decide what to delete. */

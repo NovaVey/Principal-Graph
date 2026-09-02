@@ -227,6 +227,70 @@ void test("buildReport's denials respect the day window and the row limit", asyn
   assert.equal(wideReport.denialsTruncated, true);
 });
 
+void test('buildReport falls back to external_id when display_name is null, in every section', async () => {
+  // Neither ensurePrincipal nor ensureResource is given a displayName here —
+  // this is exactly what a bare adapter call (e.g. broker-audit-sink.ts's
+  // ensureResource for a tool it's never seen before) produces. The report
+  // must surface the external_id, not a "(unnamed ...)" placeholder.
+  const agent = await ensurePrincipal(pool, {
+    kind: 'agent',
+    source: 'manual',
+    externalId: 'no-name-agent',
+  });
+  const tool = await ensureResource(pool, {
+    kind: 'tool',
+    source: 'manual',
+    externalId: 'no_name_tool',
+  });
+  await setResourceCapabilities(pool, tool, ['write_irreversible', 'read_private']);
+  const ingestTool = await ensureResource(pool, {
+    kind: 'tool',
+    source: 'manual',
+    externalId: 'no_name_ingest_tool',
+  });
+  await setResourceCapabilities(pool, ingestTool, ['ingest_untrusted']);
+  const egressTool = await ensureResource(pool, {
+    kind: 'tool',
+    source: 'manual',
+    externalId: 'no_name_egress_tool',
+  });
+  await setResourceCapabilities(pool, egressTool, ['egress']);
+
+  await grant(agent, tool);
+  await grant(agent, ingestTool);
+  await grant(agent, egressTool);
+  await appendEvent(pool, {
+    occurredAt: new Date(),
+    principalId: agent,
+    onBehalfOf: null,
+    resourceId: tool,
+    action: 'call',
+    decision: 'deny',
+    denyReason: 'blocked by policy',
+    taintLabels: [],
+    reversible: false,
+    requestDigest: null,
+  });
+
+  const report = await buildReport(pool);
+
+  const unusedRow = report.unusedGrants.find((g) => g.resource === 'no_name_tool');
+  assert.ok(unusedRow, 'unused grant should surface the resource external_id, not a placeholder');
+  assert.equal(unusedRow?.principal, 'no-name-agent');
+
+  assert.equal(report.trifectaExposure.length, 1);
+  assert.equal(report.trifectaExposure[0]?.displayName, 'no-name-agent');
+
+  assert.equal(report.denials.length, 1);
+  assert.equal(report.denials[0]?.principal, 'no-name-agent');
+  assert.equal(report.denials[0]?.resource, 'no_name_tool');
+
+  const text = formatReport(report);
+  assert.ok(text.includes('no-name-agent'));
+  assert.ok(text.includes('no_name_tool'));
+  assert.ok(!text.includes('(unnamed'));
+});
+
 void test('formatReport reads as plain text with friendly empty states and no raw jargon', async () => {
   const emptyReport = await buildReport(pool);
   const emptyText = formatReport(emptyReport);

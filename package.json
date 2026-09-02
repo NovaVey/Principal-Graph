@@ -16,6 +16,7 @@
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\" \"scripts/**/*.ts\" \"*.{js,ts,json}\"",
     "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\" \"scripts/**/*.ts\" \"*.{js,ts,json}\"",
     "adapter:mcp-config": "tsx scripts/run-mcp-config-adapter.ts",
+    "adapter:github": "tsx scripts/run-github-adapter.ts",
     "report": "tsx scripts/report.ts"
   },
   "repository": {

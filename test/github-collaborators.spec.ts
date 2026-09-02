@@ -1,0 +1,167 @@
+/**
+ * The GitHub adapter: pure permission/kind mapping (relationFromPermissions,
+ * principalKindFromGithubType) plus an end-to-end run with an injected fake
+ * FetchCollaborators — no real network call, same principle as
+ * test/mcp-config.spec.ts using real temp files instead of a live MCP
+ * session.
+ */
+
+import { before, beforeEach, after, test } from 'node:test';
+import assert from 'node:assert/strict';
+
+import {
+  principalKindFromGithubType,
+  relationFromPermissions,
+  runGithubAdapter,
+  type GithubCollaborator,
+  type FetchCollaborators,
+} from '../src/adapters/github-collaborators.js';
+import { pool, resetDatabase } from './helpers.js';
+
+before(resetDatabase);
+beforeEach(resetDatabase);
+after(async () => {
+  await pool.end();
+});
+
+void test("relationFromPermissions collapses GitHub's five levels onto read/write/admin", () => {
+  assert.equal(
+    relationFromPermissions({ admin: true, maintain: true, push: true, triage: true, pull: true }),
+    'admin',
+  );
+  assert.equal(
+    relationFromPermissions({ maintain: true, push: true, triage: true, pull: true }),
+    'write',
+  );
+  assert.equal(relationFromPermissions({ push: true, triage: true, pull: true }), 'write');
+  assert.equal(relationFromPermissions({ triage: true, pull: true }), 'read');
+  assert.equal(relationFromPermissions({ pull: true }), 'read');
+  // Defensive fallback if GitHub ever omits `permissions` entirely.
+  assert.equal(relationFromPermissions(undefined), 'read');
+});
+
+void test('principalKindFromGithubType maps Bot to service, everything else to human', () => {
+  assert.equal(principalKindFromGithubType('Bot'), 'service');
+  assert.equal(principalKindFromGithubType('User'), 'human');
+  assert.equal(principalKindFromGithubType('Organization'), 'human');
+  assert.equal(principalKindFromGithubType(undefined), 'human');
+});
+
+/** Builds a FetchCollaborators that returns a fixed per-repo collaborator list — no network call. */
+function fakeFetcher(byRepo: Record<string, GithubCollaborator[]>): FetchCollaborators {
+  return async (repo) => byRepo[repo] ?? [];
+}
+
+void test('runGithubAdapter grants from collaborator permissions and revokes what disappears or downgrades', async () => {
+  const repo = 'novavey/example';
+  const first = await runGithubAdapter(pool, {
+    repos: [repo],
+    token: 'unused-with-a-fake-fetcher',
+    fetchCollaborators: fakeFetcher({
+      [repo]: [
+        { login: 'alice', type: 'User', permissions: { admin: true, pull: true } },
+        { login: 'bob', type: 'User', permissions: { push: true, pull: true } },
+        { login: 'dependabot[bot]', type: 'Bot', permissions: { pull: true } },
+      ],
+    }),
+  });
+
+  assert.equal(first.length, 1);
+  assert.deepEqual(first[0]?.grants, { alice: 'admin', bob: 'write', 'dependabot[bot]': 'read' });
+  assert.deepEqual(first[0]?.revoked, []);
+
+  const { rows: liveGrants } = await pool.query<{ external_id: string; relation: string }>(
+    `select p.external_id, g.relation
+       from grant_edge g
+       join principal p on p.id = g.principal_id
+      where g.resource_id = $1 and g.revoked_at is null`,
+    [first[0]?.resourceId],
+  );
+  assert.deepEqual(
+    new Map(liveGrants.map((r) => [r.external_id, r.relation])),
+    new Map([
+      ['alice', 'admin'],
+      ['bob', 'write'],
+      ['dependabot[bot]', 'read'],
+    ]),
+  );
+
+  // Bot principal kind actually landed as 'service', not guessed at query time.
+  const { rows: botRows } = await pool.query<{ kind: string }>(
+    `select kind from principal where source = 'github' and external_id = 'dependabot[bot]'`,
+  );
+  assert.equal(botRows[0]?.kind, 'service');
+
+  // Second run: bob is removed entirely, alice is downgraded from admin to
+  // write, and carol is added fresh. All three must be reflected correctly:
+  // bob's grant revoked, alice's OLD 'admin' row revoked with a fresh 'write'
+  // row live, carol granted.
+  const second = await runGithubAdapter(pool, {
+    repos: [repo],
+    token: 'unused-with-a-fake-fetcher',
+    fetchCollaborators: fakeFetcher({
+      [repo]: [
+        { login: 'alice', type: 'User', permissions: { push: true, pull: true } },
+        { login: 'carol', type: 'User', permissions: { pull: true } },
+        { login: 'dependabot[bot]', type: 'Bot', permissions: { pull: true } },
+      ],
+    }),
+  });
+
+  assert.deepEqual(second[0]?.grants, { alice: 'write', carol: 'read', 'dependabot[bot]': 'read' });
+  assert.deepEqual(
+    [...(second[0]?.revoked ?? [])].sort(),
+    ['alice (was: admin)', 'bob (was: write)'].sort(),
+  );
+
+  const { rows: afterSecondRun } = await pool.query<{
+    external_id: string;
+    relation: string;
+    revoked_at: Date | null;
+  }>(
+    `select p.external_id, g.relation, g.revoked_at
+       from grant_edge g
+       join principal p on p.id = g.principal_id
+      where g.resource_id = $1
+      order by p.external_id, g.relation`,
+    [first[0]?.resourceId],
+  );
+
+  const live = afterSecondRun.filter((r) => r.revoked_at === null);
+  assert.deepEqual(
+    new Map(live.map((r) => [r.external_id, r.relation])),
+    new Map([
+      ['alice', 'write'],
+      ['carol', 'read'],
+      ['dependabot[bot]', 'read'],
+    ]),
+  );
+
+  const alicesOldAdminRow = afterSecondRun.find(
+    (r) => r.external_id === 'alice' && r.relation === 'admin',
+  );
+  assert.ok(alicesOldAdminRow?.revoked_at, "alice's old admin-level grant should now be revoked");
+
+  const bobsRow = afterSecondRun.find((r) => r.external_id === 'bob');
+  assert.ok(bobsRow?.revoked_at, "bob's grant should now be revoked — no longer a collaborator");
+});
+
+void test('runGithubAdapter with no collaborators revokes every prior grant on that repo', async () => {
+  const repo = 'novavey/example-empty';
+  await runGithubAdapter(pool, {
+    repos: [repo],
+    token: 'unused-with-a-fake-fetcher',
+    fetchCollaborators: fakeFetcher({
+      [repo]: [{ login: 'alice', type: 'User', permissions: { admin: true, pull: true } }],
+    }),
+  });
+
+  const second = await runGithubAdapter(pool, {
+    repos: [repo],
+    token: 'unused-with-a-fake-fetcher',
+    fetchCollaborators: fakeFetcher({ [repo]: [] }),
+  });
+
+  assert.deepEqual(second[0]?.grants, {});
+  assert.deepEqual(second[0]?.revoked, ['alice (was: admin)']);
+});

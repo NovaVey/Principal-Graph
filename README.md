@@ -7,12 +7,34 @@ hand — a grant graph plus a tamper-evident event log, for companies too small
 to have a security team.
 
 **Status: Milestone 1 complete**, plus a GitHub collaborators adapter, an AWS
-adapter, an RBA exporter, and a report server beyond it. The event log, the
-broker integration that feeds it, capability classification, the MCP-config
-adapter, the GitHub adapter, the AWS adapter, the report (CLI and HTTP),
-and the export bridge into Relationship-Based-Authorization are all
-implemented and tested. See [Related projects](#related-projects) for what
-feeds this repo, what it feeds, and what it doesn't do yet.
+adapter, an RBA exporter, a report server, and a policy engine beyond it.
+The event log, the broker integration that feeds it, capability
+classification, the MCP-config adapter, the GitHub adapter, the AWS
+adapter, the report (CLI and HTTP), the export bridge into
+Relationship-Based-Authorization, and policy checks are all implemented
+and tested. See [Related projects](#related-projects) for what feeds this
+repo, what it feeds, and what it doesn't do yet.
+
+## Contents
+
+- [Why](#why)
+- [Requirements](#requirements)
+- [Quick start](#quick-start)
+- [Usage](#usage)
+  - [1. Wire your broker to the event log](#1-wire-your-broker-to-the-event-log)
+  - [2. Populate grants from your agent's config](#2-populate-grants-from-your-agents-config)
+  - [3. Populate grants from GitHub repo collaborators](#3-populate-grants-from-github-repo-collaborators)
+  - [4. Populate grants from AWS S3 bucket access](#4-populate-grants-from-aws-s3-bucket-access)
+  - [5. Classify what each tool can do](#5-classify-what-each-tool-can-do)
+  - [6. Run the report](#6-run-the-report)
+  - [7. Sync grants into RBA for real multi-hop reachability](#7-sync-grants-into-rba-for-real-multi-hop-reachability)
+  - [8. Serve the report over HTTP](#8-serve-the-report-over-http)
+  - [9. Check policy violations](#9-check-policy-violations)
+- [Data model](#data-model)
+- [Project layout](#project-layout)
+- [Development](#development)
+- [Related projects](#related-projects)
+- [License](#license)
 
 ## Why
 
@@ -253,6 +275,36 @@ project's report says exactly who can reach what, so serving it wide open
 by way of a forgotten env var is the one failure mode worth refusing
 outright rather than defaulting around.
 
+### 9. Check policy violations
+
+```bash
+npm run policy-check
+```
+
+The report (above) stays neutral and descriptive on purpose — no severity
+scores, no "this is wrong." This is the prescriptive counterpart: a small,
+hand-written set of "should never happen" rules
+(`src/policies.ts`'s `POLICIES`), evaluated against live data, exiting
+nonzero if any fail — built for CI/cron ("did access, right now, obey the
+rules we've stated"), not for a human reading a summary.
+
+Two rules ship by default:
+
+- **`no-trifecta`** — no principal should hold `read_private` +
+  `ingest_untrusted` + `egress` at once (reuses `trifecta_exposure`
+  directly).
+- **`stale-grant`** — no `admin`/`write` grant should sit unused past 30
+  days (its own parameterized query — tighter and configurable, unlike
+  `unused_grant`'s fixed 90-day window).
+
+Same shape as `TOOL_CAPABILITIES` — a plain, hand-written TypeScript
+array, not a parsed text format. `Relationship-Based-Authorization`
+already owns real DSL territory (a grammar, a compiler, a whole project's
+worth of soundness proof); a second, thinner text language here would be
+a weaker echo of that, not a complement to it. Add a rule by adding a
+`PolicyRule` variant and a matching case in `evaluatePolicies()`'s switch
+— TypeScript won't let you add the variant without also handling it.
+
 ## Data model
 
 Five tables (`schema/001_core.sql`):
@@ -287,6 +339,7 @@ src/
   log.ts             hash-chained append + chain verifier
   upsert.ts          ensurePrincipal / ensureResource — how adapters upsert identity
   capabilities.ts    TOOL_CAPABILITIES (hand-written) + how resources get classified
+  policies.ts         POLICIES (hand-written) + evaluatePolicies() — "should never happen" rules
   db.ts              Pool construction (reads DATABASE_URL)
   server.ts          GET /report, /report.json, /health — node:http, no framework
   adapters/
@@ -304,6 +357,7 @@ scripts/
   run-aws-adapter.ts         npm run adapter:aws
   run-rba-exporter.ts        npm run export:rba
   run-server.ts               npm run serve
+  run-policy-check.ts          npm run policy-check
   report.ts                  npm run report
 test/                one *.spec.ts per module, run against a real Postgres
 ```
@@ -342,7 +396,7 @@ comments before "fixing" a lint/format finding in either by editing them.
   Principal-Graph deliberately does not reimplement graph-walking
   reachability itself — that engine already exists, proven, over there.
 
-Not in this milestone: a Workspace connector or a policy DSL.
+Not in this milestone: a Workspace connector.
 
 ## License
 

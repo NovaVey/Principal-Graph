@@ -18,6 +18,7 @@
     "adapter:mcp-config": "tsx scripts/run-mcp-config-adapter.ts",
     "adapter:github": "tsx scripts/run-github-adapter.ts",
     "adapter:aws": "tsx scripts/run-aws-adapter.ts",
+    "adapter:workspace": "tsx scripts/run-workspace-adapter.ts",
     "export:rba": "tsx scripts/run-rba-exporter.ts",
     "report": "tsx scripts/report.ts",
     "serve": "tsx scripts/run-server.ts",

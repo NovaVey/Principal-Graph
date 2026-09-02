@@ -1,6 +1,20 @@
 # Principal-Graph
 One model of who and what can reach your systems, and what they actually did. Humans and agents are the same kind of principal, so one query answers both. Grant graph plus tamper-evident event log, for companies too small to have a security team.
 
+## The report
+
+```bash
+npm run report                # prints to stdout
+npm run report > report.txt   # or save it
+```
+
+Three sections, plain text, one command: permissions nobody's used in 90 days
+(riskiest first), which principals can read private data *and* ingest
+untrusted content *and* reach the network at once, and what the broker has
+actually blocked recently. `PRINCIPAL_GRAPH_REPORT_DENIAL_DAYS` /
+`PRINCIPAL_GRAPH_REPORT_DENIAL_LIMIT` override the denials section's window
+(default 30 days) and row cap (default 50) — see `src/views/report.ts`.
+
 ## Development
 
 ```bash
@@ -46,7 +60,9 @@ src/
   adapters/
     broker-audit-sink.ts  feeds event from a live taint-tracked-tool-broker session
     mcp-config.ts          feeds grant_edge from Claude Code's own settings.json (github later)
-  views/             read from the core
+  views/
+    report.ts         buildReport()/formatReport() — the three-section report
 scripts/
   run-mcp-config-adapter.ts   npm run adapter:mcp-config
+  report.ts                    npm run report
 ```

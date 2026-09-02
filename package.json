@@ -17,6 +17,7 @@
     "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\" \"scripts/**/*.ts\" \"*.{js,ts,json}\"",
     "adapter:mcp-config": "tsx scripts/run-mcp-config-adapter.ts",
     "adapter:github": "tsx scripts/run-github-adapter.ts",
+    "adapter:aws": "tsx scripts/run-aws-adapter.ts",
     "export:rba": "tsx scripts/run-rba-exporter.ts",
     "report": "tsx scripts/report.ts",
     "serve": "tsx scripts/run-server.ts"
@@ -33,6 +34,7 @@
   },
   "homepage": "https://github.com/NovaVey/Principal-Graph#readme",
   "dependencies": {
+    "@aws-sdk/client-iam": "^3.1124.0",
     "pg": "^8.23.0",
     "taint-tracked-tool-broker": "^1.2.0"
   },

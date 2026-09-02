@@ -24,6 +24,7 @@
 // of which relation vocabulary a given resource kind happens to use:
 //   authz check principal:<source>:<id> any_access tool:<source>:<id>
 //   authz check principal:<source>:<id> any_access repo:<source>:<id>
+//   authz check principal:<source>:<id> any_access bucket:<source>:<id>
 
 // Produced by src/adapters/mcp-config.ts and src/adapters/broker-audit-sink.ts.
 namespace tool {
@@ -37,6 +38,17 @@ namespace tool {
 // collapsed onto these three relations before they ever reach RBA — see
 // relationFromPermissions() in src/adapters/github-collaborators.ts.
 namespace repo {
+  relation read: principal
+  relation write: principal
+  relation admin: principal
+
+  permission any_access = read | write | admin
+}
+
+// Produced by src/adapters/aws-s3.ts. AWS's own IAM Policy Simulator
+// result is already collapsed onto these three relations before it ever
+// reaches RBA — see RELATION_CHECKS in src/adapters/aws-s3.ts.
+namespace bucket {
   relation read: principal
   relation write: principal
   relation admin: principal

@@ -7,13 +7,14 @@ hand — a grant graph plus a tamper-evident event log, for companies too small
 to have a security team.
 
 **Status: Milestone 1 complete**, plus a GitHub collaborators adapter, an AWS
-adapter, an RBA exporter, a report server, and a policy engine beyond it.
-The event log, the broker integration that feeds it, capability
-classification, the MCP-config adapter, the GitHub adapter, the AWS
-adapter, the report (CLI and HTTP), the export bridge into
-Relationship-Based-Authorization, and policy checks are all implemented
-and tested. See [Related projects](#related-projects) for what feeds this
-repo, what it feeds, and what it doesn't do yet.
+adapter, a Workspace adapter, an RBA exporter, a report server, and a
+policy engine beyond it. The event log, the broker integration that feeds
+it, capability classification, the MCP-config adapter, the GitHub
+adapter, the AWS adapter, the Workspace adapter, the report (CLI and
+HTTP), the export bridge into Relationship-Based-Authorization, and
+policy checks are all implemented and tested. See
+[Related projects](#related-projects) for what feeds this repo, what it
+feeds, and what it doesn't do yet.
 
 ## Contents
 
@@ -25,11 +26,12 @@ repo, what it feeds, and what it doesn't do yet.
   - [2. Populate grants from your agent's config](#2-populate-grants-from-your-agents-config)
   - [3. Populate grants from GitHub repo collaborators](#3-populate-grants-from-github-repo-collaborators)
   - [4. Populate grants from AWS S3 bucket access](#4-populate-grants-from-aws-s3-bucket-access)
-  - [5. Classify what each tool can do](#5-classify-what-each-tool-can-do)
-  - [6. Run the report](#6-run-the-report)
-  - [7. Sync grants into RBA for real multi-hop reachability](#7-sync-grants-into-rba-for-real-multi-hop-reachability)
-  - [8. Serve the report over HTTP](#8-serve-the-report-over-http)
-  - [9. Check policy violations](#9-check-policy-violations)
+  - [5. Populate grants from Google Workspace group membership](#5-populate-grants-from-google-workspace-group-membership)
+  - [6. Classify what each tool can do](#6-classify-what-each-tool-can-do)
+  - [7. Run the report](#7-run-the-report)
+  - [8. Sync grants into RBA for real multi-hop reachability](#8-sync-grants-into-rba-for-real-multi-hop-reachability)
+  - [9. Serve the report over HTTP](#9-serve-the-report-over-http)
+  - [10. Check policy violations](#10-check-policy-violations)
 - [Data model](#data-model)
 - [Project layout](#project-layout)
 - [Development](#development)
@@ -181,7 +183,44 @@ list on one run is a smaller check, never a claim that everyone else lost
 access. AWS credentials come from the SDK's own default provider chain
 (same as the AWS CLI); the credential needs only `iam:SimulatePrincipalPolicy`.
 
-### 5. Classify what each tool can do
+### 5. Populate grants from Google Workspace group membership
+
+```bash
+PRINCIPAL_GRAPH_WORKSPACE_GROUPS=eng@example.com,security@example.com \
+PRINCIPAL_GRAPH_WORKSPACE_ADMIN_EMAIL=admin@example.com               \
+GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json      \
+  npm run adapter:workspace
+```
+
+Reads each listed Google Group's membership (Admin SDK Directory API's
+`members.list?includeDerivedMembership=true`, which already resolves
+nested-group membership into a flat list of real members — the same
+"already resolved" property that makes GitHub's collaborators API the
+right shape to build on) and writes a grant per member — `owner`,
+`manager`, or `member`, Google's own three roles, lowercased. Only
+`type: 'USER'` entries become principals; a nested group that's itself a
+direct member is skipped (Principal-Graph has no "group as principal"
+concept — RBA's own DSL already owns that; see
+[Usage 8](#8-sync-grants-into-rba-for-real-multi-hop-reachability)).
+
+`GOOGLE_APPLICATION_CREDENTIALS` is Google's own standard env var — a
+path to a service-account key JSON file. That service account needs
+[domain-wide delegation](https://support.google.com/a/answer/162106)
+configured in the Workspace Admin console, scoped to
+`admin.directory.group.member.readonly`;
+`PRINCIPAL_GRAPH_WORKSPACE_ADMIN_EMAIL` names the real admin user it
+impersonates to make any call at all — this adapter hand-rolls the
+RS256-signed JWT bearer flow (RFC 7523) with `node:crypto` + `fetch`
+rather than pulling in the official `googleapis` package, the same
+no-new-dependency habit as the GitHub adapter and the RBA exporter (the
+AWS adapter's SDK is the one deliberate exception — see its own section
+above). Re-running it revokes a member who's left the group, *and* the
+old grant of one whose role changed — same relation-pair-aware revoke
+logic as the GitHub adapter. The group list is entirely explicit
+(`PRINCIPAL_GRAPH_WORKSPACE_GROUPS`); nothing here discovers groups on
+its own.
+
+### 6. Classify what each tool can do
 
 `src/capabilities.ts`'s `TOOL_CAPABILITIES` is a small, hand-written map from
 tool name to capability (`read_public` | `read_private` | `ingest_untrusted`
@@ -190,7 +229,7 @@ use. It's applied automatically the moment the broker sink or the report see
 a resource, so there's no separate classification step to remember; a tool
 missing from the map is left unclassified rather than guessed at.
 
-### 6. Run the report
+### 7. Run the report
 
 ```bash
 npm run report                # prints to stdout
@@ -210,7 +249,7 @@ Three plain-text sections, one command:
 override the denials section's window (default 30 days) and row cap
 (default 50) — see `src/views/report.ts`.
 
-### 7. Sync grants into RBA for real multi-hop reachability
+### 8. Sync grants into RBA for real multi-hop reachability
 
 Principal-Graph's own grant model is deliberately one hop (`principal` →
 `resource`); it doesn't walk chains. For "what can this principal
@@ -253,7 +292,7 @@ run that fails partway leaves the watermark untouched — every write/delete
 is idempotent, so the same window safely retries next run rather than
 silently dropping whatever failed.
 
-### 8. Serve the report over HTTP
+### 9. Serve the report over HTTP
 
 ```bash
 PRINCIPAL_GRAPH_REPORT_API_KEY=...  PORT=8080  npm run serve
@@ -275,7 +314,7 @@ project's report says exactly who can reach what, so serving it wide open
 by way of a forgotten env var is the one failure mode worth refusing
 outright rather than defaulting around.
 
-### 9. Check policy violations
+### 10. Check policy violations
 
 ```bash
 npm run policy-check
@@ -347,6 +386,7 @@ src/
     mcp-config.ts              feeds grant_edge from Claude Code's own settings.json
     github-collaborators.ts  feeds grant_edge from a repo's GitHub collaborators
     aws-s3.ts                    feeds grant_edge from IAM Policy Simulator results on S3 buckets
+    workspace-groups.ts           feeds grant_edge from a Google Group's resolved membership
   views/
     report.ts         buildReport()/formatReport() — the three-section report
   exporters/
@@ -355,6 +395,7 @@ scripts/
   run-mcp-config-adapter.ts  npm run adapter:mcp-config
   run-github-adapter.ts      npm run adapter:github
   run-aws-adapter.ts         npm run adapter:aws
+  run-workspace-adapter.ts    npm run adapter:workspace
   run-rba-exporter.ts        npm run export:rba
   run-server.ts               npm run serve
   run-policy-check.ts          npm run policy-check
@@ -363,8 +404,8 @@ test/                one *.spec.ts per module, run against a real Postgres
 ```
 
 Adapters only write; views only read. Nothing in `adapters/` imports from
-`views/` or the reverse — that's what keeps adding the next adapter
-(Workspace, ...) cheap. `exporters/` is the mirror image of `adapters/`: it
+`views/` or the reverse — that's what keeps adding the next adapter cheap.
+`exporters/` is the mirror image of `adapters/`: it
 reads Principal-Graph and writes to an external system, never the reverse.
 
 ## Development
@@ -392,11 +433,9 @@ comments before "fixing" a lint/format finding in either by editing them.
 - [`Relationship-Based-Authorization`](https://github.com/NovaVey/Relationship-Based-Authorization) —
   the independently soundness-proven ReBAC engine that answers "what can
   this principal ultimately reach," fed by this project's grant data via
-  the exporter (see [Usage](#7-sync-grants-into-rba-for-real-multi-hop-reachability)).
+  the exporter (see [Usage](#8-sync-grants-into-rba-for-real-multi-hop-reachability)).
   Principal-Graph deliberately does not reimplement graph-walking
   reachability itself — that engine already exists, proven, over there.
-
-Not in this milestone: a Workspace connector.
 
 ## License
 

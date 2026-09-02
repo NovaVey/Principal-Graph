@@ -88,8 +88,8 @@ function dangerRankOf(capabilities: readonly Capability[] | null): number {
   return best;
 }
 
-/** A reader always gets a real identifier, never a placeholder: display_name when an adapter set one, else the external_id every row is upserted by. */
-function resolveName(displayName: string | null, externalId: string): string {
+/** A reader always gets a real identifier, never a placeholder: display_name when an adapter set one, else the external_id every row is upserted by. Exported for src/policies.ts, which needs the exact same fallback in its own violation descriptions. */
+export function resolveName(displayName: string | null, externalId: string): string {
   return displayName ?? externalId;
 }
 

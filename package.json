@@ -20,7 +20,8 @@
     "adapter:aws": "tsx scripts/run-aws-adapter.ts",
     "export:rba": "tsx scripts/run-rba-exporter.ts",
     "report": "tsx scripts/report.ts",
-    "serve": "tsx scripts/run-server.ts"
+    "serve": "tsx scripts/run-server.ts",
+    "policy-check": "tsx scripts/run-policy-check.ts"
   },
   "repository": {
     "type": "git",

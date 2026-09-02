@@ -41,7 +41,9 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
       - name: Load schema
-        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f schema/001_core.sql
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f schema/001_core.sql
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f schema/002_rba_export_state.sql
       - run: npm test
 
   lint:

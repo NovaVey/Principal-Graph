@@ -14,6 +14,26 @@ and the export bridge into Relationship-Based-Authorization are all
 implemented and tested. See [Related projects](#related-projects) for what
 feeds this repo, what it feeds, and what it doesn't do yet.
 
+## Contents
+
+- [Why](#why)
+- [Requirements](#requirements)
+- [Quick start](#quick-start)
+- [Usage](#usage)
+  - [1. Wire your broker to the event log](#1-wire-your-broker-to-the-event-log)
+  - [2. Populate grants from your agent's config](#2-populate-grants-from-your-agents-config)
+  - [3. Populate grants from GitHub repo collaborators](#3-populate-grants-from-github-repo-collaborators)
+  - [4. Populate grants from AWS S3 bucket access](#4-populate-grants-from-aws-s3-bucket-access)
+  - [5. Classify what each tool can do](#5-classify-what-each-tool-can-do)
+  - [6. Run the report](#6-run-the-report)
+  - [7. Sync grants into RBA for real multi-hop reachability](#7-sync-grants-into-rba-for-real-multi-hop-reachability)
+  - [8. Serve the report over HTTP](#8-serve-the-report-over-http)
+- [Data model](#data-model)
+- [Project layout](#project-layout)
+- [Development](#development)
+- [Related projects](#related-projects)
+- [License](#license)
+
 ## Why
 
 A contractor with a GitHub token and an agent with an MCP config both

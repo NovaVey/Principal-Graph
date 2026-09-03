@@ -151,11 +151,21 @@ export async function runAwsAdapter(
         externalId: principalArn,
       });
 
+      // The three relation checks below are independent reads against the
+      // same principal+bucket (see RELATION_CHECKS's own doc comment on why
+      // there's exactly one per tier) — run them concurrently rather than
+      // one round-trip at a time, same as ensurePrincipal/ensureResource
+      // above already do for their own independent lookups.
       const allowedRelations: Relation[] = [];
       const notAllowedRelations: Relation[] = [];
-      for (const relation of CHECKED_RELATIONS) {
-        const { action, objectLevel } = RELATION_CHECKS[relation];
-        const allowed = await simulate(principalArn, action, resourceArnFor(bucket, objectLevel));
+      const checks = await Promise.all(
+        CHECKED_RELATIONS.map(async (relation) => {
+          const { action, objectLevel } = RELATION_CHECKS[relation];
+          const allowed = await simulate(principalArn, action, resourceArnFor(bucket, objectLevel));
+          return { relation, allowed };
+        }),
+      );
+      for (const { relation, allowed } of checks) {
         (allowed ? allowedRelations : notAllowedRelations).push(relation);
       }
 

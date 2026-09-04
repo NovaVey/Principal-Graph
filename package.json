@@ -10,11 +10,13 @@
   "scripts": {
     "build": "tsc",
     "test": "node --import tsx --test --test-concurrency=1 test/*.spec.ts",
+    "test:coverage": "node --import tsx --test --experimental-test-coverage --test-concurrency=1 test/*.spec.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\" \"scripts/**/*.ts\" \"*.{js,ts,json}\"",
     "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\" \"scripts/**/*.ts\" \"*.{js,ts,json}\"",
+    "verify": "npm run typecheck && npm run build && npm test && npm run lint && npm run format:check",
     "adapter:mcp-config": "tsx scripts/run-mcp-config-adapter.ts",
     "adapter:github": "tsx scripts/run-github-adapter.ts",
     "adapter:aws": "tsx scripts/run-aws-adapter.ts",

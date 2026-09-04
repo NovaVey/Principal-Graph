@@ -77,6 +77,7 @@ docker run --name pg-principal -e POSTGRES_PASSWORD=devpass -p 5432:5432 -d post
 docker exec -it pg-principal psql -U postgres -c "create database principalgraph"
 docker exec -i pg-principal psql -U postgres -d principalgraph < schema/001_core.sql
 docker exec -i pg-principal psql -U postgres -d principalgraph < schema/002_rba_export_state.sql
+docker exec -i pg-principal psql -U postgres -d principalgraph < schema/003_performance_indexes.sql
 
 npm install
 npm test    # DATABASE_URL defaults to postgresql://postgres:devpass@localhost:5432/principalgraph
@@ -378,13 +379,17 @@ Two views built on top, read by the report:
 
 A second migration, `schema/002_rba_export_state.sql`, adds one small table
 (`rba_export_state`) holding nothing but the RBA exporter's own sync
-watermark — internal bookkeeping, not part of the grant graph itself.
+watermark — internal bookkeeping, not part of the grant graph itself. A
+third, `schema/003_performance_indexes.sql`, adds one composite index
+serving `unused_grant` and `checkStaleGrant`'s shared query shape — no new
+tables, nothing that changes what any query returns.
 
 ## Project layout
 
 ```
 schema/            SQL migrations — 001_core.sql is the shared core
                      002_rba_export_state.sql adds the RBA exporter's own sync state
+                     003_performance_indexes.sql adds indexes only, no schema change
 rba/
   principal-graph.authz  RBA's own namespace schema for this project's grant data
 src/
@@ -425,6 +430,12 @@ reads Principal-Graph and writes to an external system, never the reverse.
 ## Development
 
 ```bash
+npm run verify   # typecheck, build, test, lint, format:check — same order CI runs
+```
+
+or individually:
+
+```bash
 npm run typecheck
 npm run build
 npm test
@@ -432,12 +443,18 @@ npm run lint
 npm run format:check
 ```
 
-CI (`.github/workflows/ci.yml`) runs all of the above on every push/PR,
-across Node 20/22/24, against a `postgres:16` service container.
-`schema/001_core.sql`, `src/model.ts`, and `src/log.ts` are specified
-byte-for-byte by this project's build brief and are excluded from
-`format`/`format:check` — see `.prettierignore` and `eslint.config.js`'s own
-comments before "fixing" a lint/format finding in either by editing them.
+`npm run test:coverage` runs the same suite under Node's own
+`--experimental-test-coverage` (no new dependency) for a coverage report.
+
+CI (`.github/workflows/ci.yml`) runs the `verify` sequence on every push/PR,
+across Node 20/22/24, against a `postgres:16` service container, plus a
+`gitleaks` secret-scan job. `schema/001_core.sql`, `src/model.ts`, and
+`src/log.ts` are specified byte-for-byte by this project's build brief and
+are excluded from `format`/`format:check` — see `.prettierignore` and
+`eslint.config.js`'s own comments before "fixing" a lint/format finding in
+either by editing them. See [CONTRIBUTING.md](CONTRIBUTING.md) for the
+full set of conventions (adapter shape, revocation-model choice,
+dependency discipline) before opening a PR.
 
 ## Related projects
 

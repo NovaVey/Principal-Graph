@@ -15,6 +15,11 @@
  * admin.directory.group.member.readonly, and
  * PRINCIPAL_GRAPH_WORKSPACE_ADMIN_EMAIL names the real admin user it
  * impersonates to make any Directory API call at all.
+ *
+ * Pass --dry-run to preview what this run would grant/revoke without
+ * writing to grant_edge at all — see WorkspaceAdapterOptions.dryRun in
+ * src/adapters/workspace-groups.ts for exactly what that does and doesn't
+ * skip.
  */
 
 import { readFileSync } from 'node:fs';
@@ -52,9 +57,11 @@ async function main(): Promise<void> {
   }
   const credentials = JSON.parse(readFileSync(keyPath, 'utf8')) as ServiceAccountCredentials;
 
+  const dryRun = process.argv.includes('--dry-run');
   const pool = createPool();
   try {
-    const results = await runWorkspaceAdapter(pool, { groups, credentials, adminEmail });
+    const results = await runWorkspaceAdapter(pool, { groups, credentials, adminEmail, dryRun });
+    if (dryRun) console.log('DRY RUN — nothing below was actually written to grant_edge\n');
     for (const result of results) {
       const emails = Object.keys(result.grants);
       console.log(`${result.group}: ${emails.length} member(s)`);
@@ -62,7 +69,9 @@ async function main(): Promise<void> {
         console.log(`  ${email}: ${result.grants[email]}`);
       }
       if (result.revoked.length > 0) {
-        console.log(`  revoked this run: ${result.revoked.join(', ')}`);
+        console.log(
+          `  ${dryRun ? 'would revoke' : 'revoked this run'}: ${result.revoked.join(', ')}`,
+        );
       }
     }
   } finally {

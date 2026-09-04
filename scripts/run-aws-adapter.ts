@@ -13,6 +13,11 @@
  * ~/.aws/credentials, an instance/task role, ...) — same as the AWS CLI.
  * The credential this runs under needs `iam:SimulatePrincipalPolicy`,
  * nothing more.
+ *
+ * Pass --dry-run to preview what this run would grant/revoke without
+ * writing to grant_edge at all (the simulator calls themselves still run —
+ * they're read-only against AWS) — see AwsAdapterOptions.dryRun in
+ * src/adapters/aws-s3.ts for exactly what that does and doesn't skip.
  */
 
 import { createPool } from '../src/db.js';
@@ -39,13 +44,16 @@ async function main(): Promise<void> {
     );
   }
 
+  const dryRun = process.argv.includes('--dry-run');
   const pool = createPool();
   try {
     const results = await runAwsAdapter(pool, {
       buckets,
       principalArns,
       region: process.env.AWS_REGION,
+      dryRun,
     });
+    if (dryRun) console.log('DRY RUN — nothing below was actually written to grant_edge\n');
     for (const result of results) {
       const arns = Object.keys(result.grants);
       console.log(`${result.bucket}: ${arns.length} principal(s) with access`);
@@ -53,7 +61,9 @@ async function main(): Promise<void> {
         console.log(`  ${arn}: ${result.grants[arn]?.join(', ')}`);
       }
       if (result.revoked.length > 0) {
-        console.log(`  revoked this run: ${result.revoked.join(', ')}`);
+        console.log(
+          `  ${dryRun ? 'would revoke' : 'revoked this run'}: ${result.revoked.join(', ')}`,
+        );
       }
     }
   } finally {

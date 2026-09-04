@@ -138,6 +138,18 @@ permitted tool. Re-running it revokes (never deletes) a grant whose tool has
 since disappeared from config. `PRINCIPAL_GRAPH_AGENT_ID` overrides the
 agent identity (defaults to `<os user>@<hostname>`).
 
+Every adapter (this one and the three below) accepts `--dry-run`: it runs
+the exact same computation — reads the same source, resolves the same
+relations — but never writes to `grant_edge`. What it prints is what a
+real run *would* grant/revoke; `principal`/`resource` identity rows still
+get upserted normally (that's bookkeeping, not a permission change, and
+it's what lets the preview compare against real current state), but the
+actual insert/update/revoke never executes. Worth reaching for before the
+first real run against a config you're not fully sure of — a misconfigured
+repo list, an expired token, or a truncated API response would otherwise
+have every adapter's revoke step (deliberately full-inventory for this one
+— see below) read as "everyone else lost access."
+
 ### 3. Populate grants from GitHub repo collaborators
 
 ```bash
@@ -157,6 +169,7 @@ collaborator who's gone, *and* the old grant of one whose permission level
 changed (a fresh grant at the new level is written in its place) — never
 deletes either. The repo list is entirely explicit
 (`PRINCIPAL_GRAPH_GITHUB_REPOS`); nothing here discovers repos on its own.
+Accepts `--dry-run` — see [Usage 2](#2-populate-grants-from-your-agents-config)'s note on it.
 
 ### 4. Populate grants from AWS S3 bucket access
 
@@ -184,6 +197,9 @@ re-checked and found no longer allowed — a smaller `PRINCIPAL_GRAPH_AWS_PRINCI
 list on one run is a smaller check, never a claim that everyone else lost
 access. AWS credentials come from the SDK's own default provider chain
 (same as the AWS CLI); the credential needs only `iam:SimulatePrincipalPolicy`.
+Accepts `--dry-run` — see [Usage 2](#2-populate-grants-from-your-agents-config)'s
+note on it (the simulator calls themselves still run in dry-run mode; only the
+`grant_edge` write is skipped).
 
 > **Not yet live-verified.** This adapter's actual `iam:SimulatePrincipalPolicy`
 > call has never been exercised against a real AWS account (none was
@@ -226,7 +242,7 @@ above). Re-running it revokes a member who's left the group, *and* the
 old grant of one whose role changed — same relation-pair-aware revoke
 logic as the GitHub adapter. The group list is entirely explicit
 (`PRINCIPAL_GRAPH_WORKSPACE_GROUPS`); nothing here discovers groups on
-its own.
+its own. Accepts `--dry-run` — see [Usage 2](#2-populate-grants-from-your-agents-config)'s note on it.
 
 > **Not yet live-verified.** This adapter's actual Directory API call has
 > never been exercised against a real Workspace domain (none was

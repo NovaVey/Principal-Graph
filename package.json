@@ -23,6 +23,7 @@
     "adapter:workspace": "tsx scripts/run-workspace-adapter.ts",
     "export:rba": "tsx scripts/run-rba-exporter.ts",
     "migrate": "tsx scripts/run-migrations.ts",
+    "adapter-status": "tsx scripts/run-adapter-status.ts",
     "report": "tsx scripts/report.ts",
     "serve": "tsx scripts/run-server.ts",
     "policy-check": "tsx scripts/run-policy-check.ts"

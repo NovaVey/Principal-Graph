@@ -33,6 +33,7 @@ repo, what it feeds, and what it doesn't do yet.
   - [8. Sync grants into RBA for real multi-hop reachability](#8-sync-grants-into-rba-for-real-multi-hop-reachability)
   - [9. Serve the report over HTTP](#9-serve-the-report-over-http)
   - [10. Check policy violations](#10-check-policy-violations)
+  - [11. Check on scheduled adapter runs](#11-check-on-scheduled-adapter-runs)
 - [Data model](#data-model)
 - [Project layout](#project-layout)
 - [Development](#development)
@@ -383,6 +384,25 @@ a weaker echo of that, not a complement to it. Add a rule by adding a
 `PolicyRule` variant and a matching case in `evaluatePolicies()`'s switch
 — TypeScript won't let you add the variant without also handling it.
 
+### 11. Check on scheduled adapter runs
+
+```bash
+npm run adapter-status
+```
+
+Every adapter script above, plus `export:rba`, records each run (success
+or failure, dry-run or real) in `adapter_run`
+(`schema/004_adapter_runs.sql`) — `startRun()`/`finishRun()` in
+`src/run-history.ts` wrap each script's own `main()`. This closes a real
+gap: without it, a cron/CI-scheduled adapter that silently stopped
+running, or started failing every time, was only noticeable by grepping
+logs after the fact. `npm run adapter-status` prints the most recent
+recorded run per adapter — when it ran, whether it succeeded, and a short
+detail line (or the error, on a failure). An adapter that's never run at
+all simply doesn't appear, rather than reading as a false "never ran."
+
+Requires `schema/004_adapter_runs.sql` applied (`npm run migrate`).
+
 ## Data model
 
 Five tables (`schema/001_core.sql`):
@@ -406,7 +426,10 @@ A second migration, `schema/002_rba_export_state.sql`, adds one small table
 watermark — internal bookkeeping, not part of the grant graph itself. A
 third, `schema/003_performance_indexes.sql`, adds one composite index
 serving `unused_grant` and `checkStaleGrant`'s shared query shape — no new
-tables, nothing that changes what any query returns.
+tables, nothing that changes what any query returns. A fourth,
+`schema/004_adapter_runs.sql`, adds `adapter_run` — run-history for the
+scheduled write side (see [Usage 11](#11-check-on-scheduled-adapter-runs)) —
+also internal bookkeeping, not part of the grant graph.
 
 ## Project layout
 
@@ -414,6 +437,7 @@ tables, nothing that changes what any query returns.
 schema/            SQL migrations — 001_core.sql is the shared core
                      002_rba_export_state.sql adds the RBA exporter's own sync state
                      003_performance_indexes.sql adds indexes only, no schema change
+                     004_adapter_runs.sql adds adapter_run, scheduled-run history
 rba/
   principal-graph.authz  RBA's own namespace schema for this project's grant data
 src/
@@ -421,6 +445,7 @@ src/
   log.ts             hash-chained append + chain verifier
   upsert.ts          ensurePrincipal / ensureResource — how adapters upsert identity
   migrate.ts          discoverMigrations / runMigrations — schema/*.sql tracking + apply
+  run-history.ts      startRun / finishRun / latestRuns — adapter_run bookkeeping
   capabilities.ts    TOOL_CAPABILITIES (hand-written) + how resources get classified
   policies.ts         POLICIES (hand-written) + evaluatePolicies() — "should never happen" rules
   db.ts              Pool construction (reads DATABASE_URL)
@@ -442,6 +467,7 @@ scripts/
   run-workspace-adapter.ts    npm run adapter:workspace
   run-rba-exporter.ts        npm run export:rba
   run-migrations.ts          npm run migrate
+  run-adapter-status.ts       npm run adapter-status
   run-server.ts               npm run serve
   run-policy-check.ts          npm run policy-check
   report.ts                  npm run report

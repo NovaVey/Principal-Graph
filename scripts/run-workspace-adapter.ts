@@ -20,6 +20,10 @@
  * writing to grant_edge at all — see WorkspaceAdapterOptions.dryRun in
  * src/adapters/workspace-groups.ts for exactly what that does and doesn't
  * skip.
+ *
+ * Records every run (success or failure) in adapter_run — requires
+ * schema/004_adapter_runs.sql applied (npm run migrate). See
+ * src/run-history.ts and scripts/run-adapter-status.ts.
  */
 
 import { readFileSync } from 'node:fs';
@@ -28,6 +32,7 @@ import {
   runWorkspaceAdapter,
   type ServiceAccountCredentials,
 } from '../src/adapters/workspace-groups.js';
+import { startRun, finishRun } from '../src/run-history.js';
 
 function parseList(raw: string | undefined): string[] {
   return (raw ?? '')
@@ -60,19 +65,36 @@ async function main(): Promise<void> {
   const dryRun = process.argv.includes('--dry-run');
   const pool = createPool();
   try {
-    const results = await runWorkspaceAdapter(pool, { groups, credentials, adminEmail, dryRun });
-    if (dryRun) console.log('DRY RUN — nothing below was actually written to grant_edge\n');
-    for (const result of results) {
-      const emails = Object.keys(result.grants);
-      console.log(`${result.group}: ${emails.length} member(s)`);
-      for (const email of emails) {
-        console.log(`  ${email}: ${result.grants[email]}`);
+    const runId = await startRun(pool, 'workspace', { dryRun });
+    try {
+      const results = await runWorkspaceAdapter(pool, { groups, credentials, adminEmail, dryRun });
+      if (dryRun) console.log('DRY RUN — nothing below was actually written to grant_edge\n');
+      let totalGrants = 0;
+      let totalRevoked = 0;
+      for (const result of results) {
+        const emails = Object.keys(result.grants);
+        totalGrants += emails.length;
+        totalRevoked += result.revoked.length;
+        console.log(`${result.group}: ${emails.length} member(s)`);
+        for (const email of emails) {
+          console.log(`  ${email}: ${result.grants[email]}`);
+        }
+        if (result.revoked.length > 0) {
+          console.log(
+            `  ${dryRun ? 'would revoke' : 'revoked this run'}: ${result.revoked.join(', ')}`,
+          );
+        }
       }
-      if (result.revoked.length > 0) {
-        console.log(
-          `  ${dryRun ? 'would revoke' : 'revoked this run'}: ${result.revoked.join(', ')}`,
-        );
-      }
+      await finishRun(pool, runId, {
+        status: 'success',
+        detail: `${results.length} group(s), ${totalGrants} member(s), ${totalRevoked} revoked`,
+      });
+    } catch (err) {
+      await finishRun(pool, runId, {
+        status: 'failure',
+        error: err instanceof Error ? err.message : String(err),
+      });
+      throw err;
     }
   } finally {
     await pool.end();

@@ -87,6 +87,14 @@ Set `DATABASE_URL` to point at a different instance. Tests run against a real
 Postgres, not a mock — the tamper-evidence property in `src/log.ts` only means
 something proven against a real database.
 
+The three `docker exec`/`psql -f` lines above are the fastest path for one
+fresh database, but stop scaling once you're keeping multiple environments
+(a shared dev DB, staging, a teammate's laptop) current across 3+ migration
+files — `npm run migrate` (`scripts/run-migrations.ts`) tracks which have
+already been applied and only runs what's missing, safe to run repeatedly.
+CI uses it too. See that script's own header for how to adopt it on a
+database that already has some migrations applied the old way.
+
 ## Usage
 
 ### 1. Wire your broker to the event log
@@ -412,6 +420,7 @@ src/
   model.ts          shared types every adapter/view imports from
   log.ts             hash-chained append + chain verifier
   upsert.ts          ensurePrincipal / ensureResource — how adapters upsert identity
+  migrate.ts          discoverMigrations / runMigrations — schema/*.sql tracking + apply
   capabilities.ts    TOOL_CAPABILITIES (hand-written) + how resources get classified
   policies.ts         POLICIES (hand-written) + evaluatePolicies() — "should never happen" rules
   db.ts              Pool construction (reads DATABASE_URL)
@@ -432,6 +441,7 @@ scripts/
   run-aws-adapter.ts         npm run adapter:aws
   run-workspace-adapter.ts    npm run adapter:workspace
   run-rba-exporter.ts        npm run export:rba
+  run-migrations.ts          npm run migrate
   run-server.ts               npm run serve
   run-policy-check.ts          npm run policy-check
   report.ts                  npm run report

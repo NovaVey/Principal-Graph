@@ -44,6 +44,7 @@ jobs:
         run: |
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f schema/001_core.sql
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f schema/002_rba_export_state.sql
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f schema/003_performance_indexes.sql
       - run: npm test
 
   lint:
@@ -57,3 +58,17 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - run: npm run format:check
+
+  secrets:
+    # Adapters routinely handle a GitHub PAT, AWS credentials, and a Google
+    # service-account key read straight off disk (see README's Usage
+    # sections) — scan every push/PR for one of those accidentally landing
+    # in the repo itself.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

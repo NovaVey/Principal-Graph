@@ -21,6 +21,7 @@
     "adapter:github": "tsx scripts/run-github-adapter.ts",
     "adapter:aws": "tsx scripts/run-aws-adapter.ts",
     "adapter:workspace": "tsx scripts/run-workspace-adapter.ts",
+    "adapter:postgres": "tsx scripts/run-postgres-adapter.ts",
     "export:rba": "tsx scripts/run-rba-exporter.ts",
     "migrate": "tsx scripts/run-migrations.ts",
     "adapter-status": "tsx scripts/run-adapter-status.ts",

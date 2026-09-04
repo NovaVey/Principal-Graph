@@ -11,11 +11,12 @@ hand — a grant graph plus a tamper-evident event log, for companies too small
 to have a security team.
 
 **v1.0.0.** The event log, the broker integration that feeds it, capability
-classification, four grant-source adapters (MCP config, GitHub, AWS,
-Google Workspace), the report (CLI and HTTP) with policy checks, and the
-export bridge into Relationship-Based-Authorization are all implemented
-and tested. See [Related projects](#related-projects) for what feeds this
-repo, what it feeds, and what it doesn't do yet.
+classification, five grant-source adapters (MCP config, GitHub, AWS,
+Google Workspace, Postgres), the report (CLI and HTTP) with policy
+checks, migration tracking, adapter run-history, and the export bridge
+into Relationship-Based-Authorization are all implemented and tested. See
+[Related projects](#related-projects) for what feeds this repo, what it
+feeds, and what it doesn't do yet.
 
 ## Contents
 
@@ -34,6 +35,7 @@ repo, what it feeds, and what it doesn't do yet.
   - [9. Serve the report over HTTP](#9-serve-the-report-over-http)
   - [10. Check policy violations](#10-check-policy-violations)
   - [11. Check on scheduled adapter runs](#11-check-on-scheduled-adapter-runs)
+  - [12. Populate grants from Postgres role membership](#12-populate-grants-from-postgres-role-membership)
 - [Data model](#data-model)
 - [Project layout](#project-layout)
 - [Development](#development)
@@ -403,6 +405,53 @@ all simply doesn't appear, rather than reading as a false "never ran."
 
 Requires `schema/004_adapter_runs.sql` applied (`npm run migrate`).
 
+### 12. Populate grants from Postgres role membership
+
+```bash
+PRINCIPAL_GRAPH_PG_TARGETS='[{"label":"prod","connectionString":"postgresql://readonly_audit@prod-host/app"}]' \
+PRINCIPAL_GRAPH_PG_READ_ROLE=app_read                                                                         \
+PRINCIPAL_GRAPH_PG_WRITE_ROLE=app_write                                                                       \
+PRINCIPAL_GRAPH_PG_ADMIN_ROLE=app_admin                                                                       \
+  npm run adapter:postgres
+```
+
+The fifth grant-source adapter, and the one that finally populates
+`'db'` — `model.ts`'s `ResourceKind` has listed it since day one,
+alongside `'tool' | 'repo' | 'bucket'`, with nothing writing it until now.
+Checks each target's own role catalog with Postgres's own `pg_has_role()`
+— the authoritative, recursion- and inheritance-aware membership
+function, not a hand-rolled walk of `pg_auth_members` — for membership in
+three tier roles you name (`PRINCIPAL_GRAPH_PG_READ_ROLE`/`_WRITE_ROLE`/
+`_ADMIN_ROLE`; no default, since Postgres role-naming has no universal
+convention the way AWS's fixed S3 action names do). Only `rolcanlogin`
+roles become principals (a role that can't log in is a pure group
+abstraction, not a real actor — same distinction as the Workspace
+adapter skipping `type: 'GROUP'`), and superuser rows are excluded
+outright: Postgres documents `pg_has_role()` as always true for a
+superuser regardless of real membership, so without that filter every
+superuser would falsely show up as a member of every tier.
+
+Unlike AWS, there's no explicit principal list — a target's own role
+catalog IS a complete, authoritative membership list for its tier roles,
+the same "the source already resolves this" property that makes GitHub's
+collaborators endpoint and Workspace's resolved group membership the
+right shape to build on, so revocation here is full-inventory too (a
+role losing tier membership, or changing tiers, is revoked the same
+relation-pair-aware way as those two). `label` (never the connection
+string, which carries a password) is what identifies a target everywhere
+in Principal-Graph; the credential each `connectionString` carries only
+needs read access to `pg_roles`/`pg_auth_members` — never a superuser.
+Accepts `--dry-run` — see [Usage 2](#2-populate-grants-from-your-agents-config)'s note on it.
+
+> **Live-verified**, unlike the AWS and Workspace adapters above (no
+> credentials were ever available for those in this project's build
+> environment): this one was run for real — a genuine non-superuser
+> read-only credential, real Postgres roles, a real grant and a real
+> revoke, checked with `npm run adapter-status` afterward. The
+> `not rolsuper` filter above exists because this real run caught it: the
+> first version of this adapter reported its own connecting credential as
+> a member of every tier, before that fix.
+
 ## Data model
 
 Five tables (`schema/001_core.sql`):
@@ -456,6 +505,7 @@ src/
     github-collaborators.ts  feeds grant_edge from a repo's GitHub collaborators
     aws-s3.ts                    feeds grant_edge from IAM Policy Simulator results on S3 buckets
     workspace-groups.ts           feeds grant_edge from a Google Group's resolved membership
+    postgres-roles.ts               feeds grant_edge from a target database's own tier-role membership
   views/
     report.ts         buildReport()/formatReport() — the three-section report
   exporters/
@@ -468,6 +518,7 @@ scripts/
   run-rba-exporter.ts        npm run export:rba
   run-migrations.ts          npm run migrate
   run-adapter-status.ts       npm run adapter-status
+  run-postgres-adapter.ts     npm run adapter:postgres
   run-server.ts               npm run serve
   run-policy-check.ts          npm run policy-check
   report.ts                  npm run report

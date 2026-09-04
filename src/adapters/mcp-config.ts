@@ -163,6 +163,17 @@ export interface McpConfigAdapterOptions {
   agent: McpConfigAgentIdentity;
   /** Defaults to defaultClaudeCodeConfigPaths(). */
   configPaths?: string[];
+  /**
+   * Preview only — never writes to `grant_edge`. `grantedTools`/
+   * `revokedTools` report exactly what a real run would do (same
+   * computation, same queries' WHERE clauses), but the actual
+   * insert/update never executes. `ensurePrincipal`/`ensureResource` still
+   * run normally — that's identity bookkeeping ("have we seen this
+   * principal/resource before"), not a permission change, and it's what
+   * lets a dry run compare against real current state. See
+   * scripts/run-mcp-config-adapter.ts's `--dry-run` flag.
+   */
+  dryRun?: boolean;
 }
 
 export interface McpConfigAdapterResult {
@@ -198,13 +209,15 @@ export async function runMcpConfigAdapter(
       source: 'mcp-config',
       externalId: toolName,
     });
-    await db.query(
-      `insert into grant_edge (principal_id, resource_id, relation, source)
-       values ($1, $2, 'can_call', 'mcp-config')
-       on conflict (principal_id, resource_id, relation, source) do update
-         set observed_at = now(), revoked_at = null`,
-      [principalId, resourceId],
-    );
+    if (!opts.dryRun) {
+      await db.query(
+        `insert into grant_edge (principal_id, resource_id, relation, source)
+         values ($1, $2, 'can_call', 'mcp-config')
+         on conflict (principal_id, resource_id, relation, source) do update
+           set observed_at = now(), revoked_at = null`,
+        [principalId, resourceId],
+      );
+    }
     grantedTools.push(toolName);
     resourceIds.push(resourceId);
   }
@@ -215,19 +228,33 @@ export async function runMcpConfigAdapter(
   // Also correctly revokes everything when the current config grants
   // nothing at all: `= any('{}'::uuid[])` is always false, so `not (...)`
   // is always true, with no empty-array special case needed.
-  const { rows: revokedRows } = await db.query<{ external_id: string }>(
-    `update grant_edge g
-        set revoked_at = now()
-       from resource r
-      where g.resource_id = r.id
-        and g.principal_id = $1
-        and g.source = 'mcp-config'
-        and g.relation = 'can_call'
-        and g.revoked_at is null
-        and not (g.resource_id = any($2::uuid[]))
-      returning r.external_id`,
-    [principalId, resourceIds],
-  );
+  //
+  // In dry-run mode this is the exact same WHERE clause as a plain SELECT
+  // instead of an UPDATE — reports precisely what would be revoked without
+  // ever setting revoked_at. See McpConfigAdapterOptions.dryRun.
+  const revokeQuery = opts.dryRun
+    ? `select r.external_id
+         from grant_edge g
+         join resource r on r.id = g.resource_id
+        where g.principal_id = $1
+          and g.source = 'mcp-config'
+          and g.relation = 'can_call'
+          and g.revoked_at is null
+          and not (g.resource_id = any($2::uuid[]))`
+    : `update grant_edge g
+          set revoked_at = now()
+         from resource r
+        where g.resource_id = r.id
+          and g.principal_id = $1
+          and g.source = 'mcp-config'
+          and g.relation = 'can_call'
+          and g.revoked_at is null
+          and not (g.resource_id = any($2::uuid[]))
+        returning r.external_id`;
+  const { rows: revokedRows } = await db.query<{ external_id: string }>(revokeQuery, [
+    principalId,
+    resourceIds,
+  ]);
 
   return {
     principalId,

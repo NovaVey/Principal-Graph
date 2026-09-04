@@ -33,6 +33,7 @@ repo, what it feeds, and what it doesn't do yet.
   - [8. Sync grants into RBA for real multi-hop reachability](#8-sync-grants-into-rba-for-real-multi-hop-reachability)
   - [9. Serve the report over HTTP](#9-serve-the-report-over-http)
   - [10. Check policy violations](#10-check-policy-violations)
+  - [11. Check on scheduled adapter runs](#11-check-on-scheduled-adapter-runs)
 - [Data model](#data-model)
 - [Project layout](#project-layout)
 - [Development](#development)
@@ -87,6 +88,14 @@ Set `DATABASE_URL` to point at a different instance. Tests run against a real
 Postgres, not a mock — the tamper-evidence property in `src/log.ts` only means
 something proven against a real database.
 
+The three `docker exec`/`psql -f` lines above are the fastest path for one
+fresh database, but stop scaling once you're keeping multiple environments
+(a shared dev DB, staging, a teammate's laptop) current across 3+ migration
+files — `npm run migrate` (`scripts/run-migrations.ts`) tracks which have
+already been applied and only runs what's missing, safe to run repeatedly.
+CI uses it too. See that script's own header for how to adopt it on a
+database that already has some migrations applied the old way.
+
 ## Usage
 
 ### 1. Wire your broker to the event log
@@ -138,6 +147,18 @@ permitted tool. Re-running it revokes (never deletes) a grant whose tool has
 since disappeared from config. `PRINCIPAL_GRAPH_AGENT_ID` overrides the
 agent identity (defaults to `<os user>@<hostname>`).
 
+Every adapter (this one and the three below) accepts `--dry-run`: it runs
+the exact same computation — reads the same source, resolves the same
+relations — but never writes to `grant_edge`. What it prints is what a
+real run *would* grant/revoke; `principal`/`resource` identity rows still
+get upserted normally (that's bookkeeping, not a permission change, and
+it's what lets the preview compare against real current state), but the
+actual insert/update/revoke never executes. Worth reaching for before the
+first real run against a config you're not fully sure of — a misconfigured
+repo list, an expired token, or a truncated API response would otherwise
+have every adapter's revoke step (deliberately full-inventory for this one
+— see below) read as "everyone else lost access."
+
 ### 3. Populate grants from GitHub repo collaborators
 
 ```bash
@@ -157,6 +178,7 @@ collaborator who's gone, *and* the old grant of one whose permission level
 changed (a fresh grant at the new level is written in its place) — never
 deletes either. The repo list is entirely explicit
 (`PRINCIPAL_GRAPH_GITHUB_REPOS`); nothing here discovers repos on its own.
+Accepts `--dry-run` — see [Usage 2](#2-populate-grants-from-your-agents-config)'s note on it.
 
 ### 4. Populate grants from AWS S3 bucket access
 
@@ -184,6 +206,9 @@ re-checked and found no longer allowed — a smaller `PRINCIPAL_GRAPH_AWS_PRINCI
 list on one run is a smaller check, never a claim that everyone else lost
 access. AWS credentials come from the SDK's own default provider chain
 (same as the AWS CLI); the credential needs only `iam:SimulatePrincipalPolicy`.
+Accepts `--dry-run` — see [Usage 2](#2-populate-grants-from-your-agents-config)'s
+note on it (the simulator calls themselves still run in dry-run mode; only the
+`grant_edge` write is skipped).
 
 > **Not yet live-verified.** This adapter's actual `iam:SimulatePrincipalPolicy`
 > call has never been exercised against a real AWS account (none was
@@ -226,7 +251,7 @@ above). Re-running it revokes a member who's left the group, *and* the
 old grant of one whose role changed — same relation-pair-aware revoke
 logic as the GitHub adapter. The group list is entirely explicit
 (`PRINCIPAL_GRAPH_WORKSPACE_GROUPS`); nothing here discovers groups on
-its own.
+its own. Accepts `--dry-run` — see [Usage 2](#2-populate-grants-from-your-agents-config)'s note on it.
 
 > **Not yet live-verified.** This adapter's actual Directory API call has
 > never been exercised against a real Workspace domain (none was
@@ -359,6 +384,25 @@ a weaker echo of that, not a complement to it. Add a rule by adding a
 `PolicyRule` variant and a matching case in `evaluatePolicies()`'s switch
 — TypeScript won't let you add the variant without also handling it.
 
+### 11. Check on scheduled adapter runs
+
+```bash
+npm run adapter-status
+```
+
+Every adapter script above, plus `export:rba`, records each run (success
+or failure, dry-run or real) in `adapter_run`
+(`schema/004_adapter_runs.sql`) — `startRun()`/`finishRun()` in
+`src/run-history.ts` wrap each script's own `main()`. This closes a real
+gap: without it, a cron/CI-scheduled adapter that silently stopped
+running, or started failing every time, was only noticeable by grepping
+logs after the fact. `npm run adapter-status` prints the most recent
+recorded run per adapter — when it ran, whether it succeeded, and a short
+detail line (or the error, on a failure). An adapter that's never run at
+all simply doesn't appear, rather than reading as a false "never ran."
+
+Requires `schema/004_adapter_runs.sql` applied (`npm run migrate`).
+
 ## Data model
 
 Five tables (`schema/001_core.sql`):
@@ -382,7 +426,10 @@ A second migration, `schema/002_rba_export_state.sql`, adds one small table
 watermark — internal bookkeeping, not part of the grant graph itself. A
 third, `schema/003_performance_indexes.sql`, adds one composite index
 serving `unused_grant` and `checkStaleGrant`'s shared query shape — no new
-tables, nothing that changes what any query returns.
+tables, nothing that changes what any query returns. A fourth,
+`schema/004_adapter_runs.sql`, adds `adapter_run` — run-history for the
+scheduled write side (see [Usage 11](#11-check-on-scheduled-adapter-runs)) —
+also internal bookkeeping, not part of the grant graph.
 
 ## Project layout
 
@@ -390,12 +437,15 @@ tables, nothing that changes what any query returns.
 schema/            SQL migrations — 001_core.sql is the shared core
                      002_rba_export_state.sql adds the RBA exporter's own sync state
                      003_performance_indexes.sql adds indexes only, no schema change
+                     004_adapter_runs.sql adds adapter_run, scheduled-run history
 rba/
   principal-graph.authz  RBA's own namespace schema for this project's grant data
 src/
   model.ts          shared types every adapter/view imports from
   log.ts             hash-chained append + chain verifier
   upsert.ts          ensurePrincipal / ensureResource — how adapters upsert identity
+  migrate.ts          discoverMigrations / runMigrations — schema/*.sql tracking + apply
+  run-history.ts      startRun / finishRun / latestRuns — adapter_run bookkeeping
   capabilities.ts    TOOL_CAPABILITIES (hand-written) + how resources get classified
   policies.ts         POLICIES (hand-written) + evaluatePolicies() — "should never happen" rules
   db.ts              Pool construction (reads DATABASE_URL)
@@ -416,6 +466,8 @@ scripts/
   run-aws-adapter.ts         npm run adapter:aws
   run-workspace-adapter.ts    npm run adapter:workspace
   run-rba-exporter.ts        npm run export:rba
+  run-migrations.ts          npm run migrate
+  run-adapter-status.ts       npm run adapter-status
   run-server.ts               npm run serve
   run-policy-check.ts          npm run policy-check
   report.ts                  npm run report

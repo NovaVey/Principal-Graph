@@ -117,6 +117,45 @@ void test('a second run revokes a departed member and a role change, keeps the u
   );
 });
 
+void test('dryRun previews grants and revokes accurately without writing to grant_edge', async () => {
+  const group = 'dry-run@example.com';
+  const fetcher = fakeFetcher({
+    [group]: [{ email: 'alice@example.com', type: 'USER', role: 'OWNER' }],
+  });
+
+  const dry = await runWorkspaceAdapter(pool, {
+    groups: [group],
+    fetchMembers: fetcher,
+    dryRun: true,
+  });
+  assert.deepEqual(dry[0]?.grants, { 'alice@example.com': 'owner' });
+  assert.deepEqual(dry[0]?.revoked, []);
+
+  const { rows: afterDryRun } = await pool.query<{ count: string }>(
+    `select count(*)::text from grant_edge`,
+  );
+  assert.equal(afterDryRun[0]?.count, '0');
+
+  // A real run afterward proves the dry run left no residue.
+  const real = await runWorkspaceAdapter(pool, { groups: [group], fetchMembers: fetcher });
+  assert.deepEqual(real[0]?.grants, { 'alice@example.com': 'owner' });
+
+  // Now preview a revoke: alice is gone. dryRun must report it without
+  // actually touching the live row.
+  const dryRevoke = await runWorkspaceAdapter(pool, {
+    groups: [group],
+    fetchMembers: fakeFetcher({ [group]: [] }),
+    dryRun: true,
+  });
+  assert.deepEqual(dryRevoke[0]?.revoked, ['alice@example.com (was: owner)']);
+
+  const { rows: stillLive } = await pool.query<{ revoked_at: Date | null }>(
+    `select revoked_at from grant_edge where resource_id = $1`,
+    [real[0]?.resourceId],
+  );
+  assert.equal(stillLive[0]?.revoked_at, null, 'the previewed revoke must not actually apply');
+});
+
 void test('an empty membership list revokes every prior grant on that group', async () => {
   const group = 'eng@example.com';
   await runWorkspaceAdapter(pool, {

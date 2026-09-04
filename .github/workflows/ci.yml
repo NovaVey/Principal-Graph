@@ -40,11 +40,11 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run build
+      # Also exercises scripts/run-migrations.ts itself against a genuinely
+      # fresh database on every run — real coverage of the bootstrap path,
+      # not just a convenience over the three `psql -f` calls this replaced.
       - name: Load schema
-        run: |
-          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f schema/001_core.sql
-          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f schema/002_rba_export_state.sql
-          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f schema/003_performance_indexes.sql
+        run: npm run migrate
       - run: npm test
 
   lint:

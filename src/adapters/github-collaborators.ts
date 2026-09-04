@@ -106,6 +106,15 @@ export interface GithubAdapterOptions {
   token: string;
   /** Overridable for testing; defaults to a real call against api.github.com. */
   fetchCollaborators?: FetchCollaborators;
+  /**
+   * Preview only — never writes to `grant_edge`. `grants`/`revoked` report
+   * exactly what a real run would do, but the actual insert/update never
+   * executes. `ensurePrincipal`/`ensureResource` still run normally —
+   * identity bookkeeping, not a permission change, and what lets a dry run
+   * compare against real current state. See
+   * scripts/run-github-adapter.ts's `--dry-run` flag.
+   */
+  dryRun?: boolean;
 }
 
 export interface GithubRepoGrantResult {
@@ -156,13 +165,15 @@ export async function runGithubAdapter(
         source: 'github',
         externalId: collaborator.login,
       });
-      await db.query(
-        `insert into grant_edge (principal_id, resource_id, relation, source)
-         values ($1, $2, $3, 'github')
-         on conflict (principal_id, resource_id, relation, source) do update
-           set observed_at = now(), revoked_at = null`,
-        [principalId, resourceId, relation],
-      );
+      if (!opts.dryRun) {
+        await db.query(
+          `insert into grant_edge (principal_id, resource_id, relation, source)
+           values ($1, $2, $3, 'github')
+           on conflict (principal_id, resource_id, relation, source) do update
+             set observed_at = now(), revoked_at = null`,
+          [principalId, resourceId, relation],
+        );
+      }
       principalIds.push(principalId);
       relations.push(relation);
       grants[collaborator.login] = relation;
@@ -179,19 +190,34 @@ export async function runGithubAdapter(
     // arrays (no collaborators this run) matches nothing, so `not exists`
     // is always true and everything is correctly revoked — same empty-case
     // behavior as mcp-config.ts's own revoke query.
+    //
+    // In dry-run mode this is the exact same WHERE clause as a plain
+    // SELECT instead of an UPDATE — see GithubAdapterOptions.dryRun.
+    const revokeQuery = opts.dryRun
+      ? `select p.external_id, g.relation
+           from grant_edge g
+           join principal p on p.id = g.principal_id
+          where g.resource_id = $1
+            and g.source = 'github'
+            and g.revoked_at is null
+            and not exists (
+              select 1 from unnest($2::uuid[], $3::text[]) as cur(principal_id, relation)
+               where cur.principal_id = g.principal_id and cur.relation = g.relation
+            )`
+      : `update grant_edge g
+            set revoked_at = now()
+           from principal p
+          where g.principal_id = p.id
+            and g.resource_id = $1
+            and g.source = 'github'
+            and g.revoked_at is null
+            and not exists (
+              select 1 from unnest($2::uuid[], $3::text[]) as cur(principal_id, relation)
+               where cur.principal_id = g.principal_id and cur.relation = g.relation
+            )
+          returning p.external_id, g.relation`;
     const { rows: revokedRows } = await db.query<{ external_id: string; relation: string }>(
-      `update grant_edge g
-          set revoked_at = now()
-         from principal p
-        where g.principal_id = p.id
-          and g.resource_id = $1
-          and g.source = 'github'
-          and g.revoked_at is null
-          and not exists (
-            select 1 from unnest($2::uuid[], $3::text[]) as cur(principal_id, relation)
-             where cur.principal_id = g.principal_id and cur.relation = g.relation
-          )
-        returning p.external_id, g.relation`,
+      revokeQuery,
       [resourceId, principalIds, relations],
     );
 

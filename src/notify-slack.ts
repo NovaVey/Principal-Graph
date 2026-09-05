@@ -61,14 +61,42 @@ export const postSlackMessageViaWebhook: PostSlackMessage = async (webhookUrl, t
  * is already a plain, jargon-free sentence (src/policies.ts's own bar),
  * so this only adds a header and bullets, never restructures the text
  * itself.
+ *
+ * Slack's Incoming Webhook `text` field has a documented 40,000-character
+ * limit. Without a cap, a mass-revocation incident (hundreds of stale-grant
+ * or blast-radius violations at once) builds a message past that limit,
+ * Slack rejects the POST, and postSlackMessageViaWebhook's own "fail loudly"
+ * design means the whole alert is lost — silently, from the operator's
+ * point of view, at exactly the moment a real incident needs to be seen.
+ * `TRAILER_RESERVE` leaves enough headroom that the "N more not shown"
+ * line itself never pushes the message back over the limit.
  */
+const MAX_SLACK_MESSAGE_LENGTH = 40_000;
+const TRAILER_RESERVE = 200;
+
 export function formatViolationsForSlack(violations: readonly PolicyViolation[]): string {
   const header =
     violations.length === 1
       ? '*Principal-Graph: 1 policy violation found*'
       : `*Principal-Graph: ${violations.length} policy violations found*`;
-  const lines = violations.map((v) => `• ${v.description}`);
-  return [header, ...lines].join('\n');
+
+  const budget = MAX_SLACK_MESSAGE_LENGTH - TRAILER_RESERVE;
+  const lines: string[] = [header];
+  let length = header.length;
+  let shown = 0;
+  for (const violation of violations) {
+    const bullet = `• ${violation.description}`;
+    if (length + 1 + bullet.length > budget) break; // +1 for the joining '\n'
+    lines.push(bullet);
+    length += 1 + bullet.length;
+    shown += 1;
+  }
+  if (shown < violations.length) {
+    lines.push(
+      `… ${violations.length - shown} more violation(s) not shown — the full list exceeded Slack's message size limit.`,
+    );
+  }
+  return lines.join('\n');
 }
 
 /** No-op on an empty violation list — see this file's own header on why this is an alert, not a heartbeat. */

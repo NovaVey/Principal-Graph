@@ -64,6 +64,84 @@ void test('parseAllowedTools unions allow entries and lets deny win', () => {
   assert.deepEqual(unresolved, ['mcp__filesystem']);
 });
 
+void test('parseAllowedTools: a scopeless deny cancels a scoped allow of the same tool', () => {
+  const { tools, unresolved } = parseAllowedTools({
+    permissions: { allow: ['Bash(npm run *)'], deny: ['Bash'] },
+  });
+  assert.deepEqual([...tools], []);
+  assert.deepEqual(unresolved, []);
+});
+
+void test('parseAllowedTools: a scoped deny does not cancel a broader allow of the same tool — unresolved, not silently granted or silently denied', () => {
+  const { tools, unresolved } = parseAllowedTools({
+    permissions: { allow: ['Bash'], deny: ['Bash(curl:*)'] },
+  });
+  // Previously this silently fell through to a full, unqualified 'Bash'
+  // grant — exactly the bug this fix closes.
+  assert.deepEqual([...tools], []);
+  assert.deepEqual(unresolved, ['Bash']);
+});
+
+void test('parseAllowedTools: two different scopes on both sides for the same tool are also unresolved, not guessed', () => {
+  const { tools, unresolved } = parseAllowedTools({
+    permissions: { allow: ['Bash(npm run *)'], deny: ['Bash(curl:*)'] },
+  });
+  assert.deepEqual([...tools], []);
+  assert.deepEqual(unresolved, ['Bash(npm run *)']);
+});
+
+void test('parseAllowedTools: an identical allow/deny pair still cancels cleanly (unaffected by the scope fix)', () => {
+  const { tools, unresolved } = parseAllowedTools({
+    permissions: { allow: ['Bash(npm run *)'], deny: ['Bash(npm run *)'] },
+  });
+  assert.deepEqual([...tools], []);
+  assert.deepEqual(unresolved, []);
+});
+
+void test('parseAllowedTools: permissions.ask is surfaced separately, never as a grant', () => {
+  const { tools, askTools } = parseAllowedTools({
+    permissions: {
+      allow: ['Read'],
+      ask: ['Bash(rm:*)', 'mcp__github__delete_file', 'mcp__filesystem'],
+    },
+  });
+  assert.deepEqual([...tools], ['Read']);
+  // 'Bash' resolved from the scoped ask entry; the whole-server wildcard
+  // ask entry is silently skipped — see ParsedGrants.askTools's own comment.
+  assert.deepEqual([...askTools].sort(compareToolNames), ['Bash', 'delete_file']);
+});
+
+void test('runMcpConfigAdapter surfaces askTools on its result without writing a grant for them', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'principal-graph-test-'));
+  const settings = join(dir, 'settings.json');
+  try {
+    writeFileSync(
+      settings,
+      JSON.stringify({ permissions: { allow: ['Read'], ask: ['Bash(rm:*)'] } }),
+    );
+    const result = await runMcpConfigAdapter(pool, {
+      agent: { source: 'manual', externalId: 'ask-test-agent' },
+      configPaths: [settings],
+    });
+    assert.deepEqual(result.grantedTools, ['Read']);
+    assert.deepEqual(result.askTools, ['Bash']);
+
+    const { rows } = await pool.query<{ external_id: string }>(
+      `select r.external_id
+         from grant_edge g
+         join resource r on r.id = g.resource_id
+        where g.principal_id = $1 and g.revoked_at is null`,
+      [result.principalId],
+    );
+    assert.deepEqual(
+      rows.map((r) => r.external_id),
+      ['Read'],
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 void test('runMcpConfigAdapter grants from merged config layers and revokes what disappears', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'principal-graph-test-'));
   const userSettings = join(dir, 'user-settings.json');

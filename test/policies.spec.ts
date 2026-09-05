@@ -471,11 +471,13 @@ void test('adapter-freshness: a violation for the most recent real run having fa
   assert.ok(violations[0]?.description.includes('failed: boom'));
 });
 
-void test('adapter-freshness: no violation when nothing has ever run for that adapter', async () => {
+void test('adapter-freshness: a violation when nothing has ever run for that adapter', async () => {
   const violations = await evaluatePolicies(pool, [
     { kind: 'adapter-freshness', adapter: 'postgres', maxAgeHours: 24 },
   ]);
-  assert.deepEqual(violations, []);
+  assert.equal(violations.length, 1);
+  assert.ok(violations[0]?.description.includes('postgres'));
+  assert.ok(violations[0]?.description.includes('never had a real run'));
 });
 
 void test('adapter-freshness: a dry run alone does not count as evidence of freshness', async () => {
@@ -485,7 +487,10 @@ void test('adapter-freshness: a dry run alone does not count as evidence of fres
   const violations = await evaluatePolicies(pool, [
     { kind: 'adapter-freshness', adapter: 'mcp-config', maxAgeHours: 24 },
   ]);
-  // Same "nothing to report yet" stance as "never run at all" — a
-  // dry-run-only history isn't a freshness violation to guess at.
-  assert.deepEqual(violations, []);
+  // A dry run is filtered out by the same `dry_run = false` clause as
+  // "never ran at all" — from this rule's own perspective they're the same
+  // case (nothing real to measure freshness against), so this is now a
+  // violation too, same as the test above.
+  assert.equal(violations.length, 1);
+  assert.ok(violations[0]?.description.includes('mcp-config'));
 });

@@ -52,7 +52,12 @@ async function main(): Promise<void> {
       }
       if (result.unresolvedEntries.length > 0) {
         console.log(
-          `unresolved (whole-server wildcards, not expanded — see src/adapters/mcp-config.ts): ${result.unresolvedEntries.join(', ')}`,
+          `unresolved (whole-server wildcard, or a scope-mismatched deny — see src/adapters/mcp-config.ts): ${result.unresolvedEntries.join(', ')}`,
+        );
+      }
+      if (result.askTools.length > 0) {
+        console.log(
+          `requires interactive confirmation on every use, per permissions.ask (not written as a grant): ${result.askTools.join(', ')}`,
         );
       }
       await finishRun(pool, runId, {

@@ -17,9 +17,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { before, beforeEach, after, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 
 import { discoverMigrations, runMigrations } from '../src/migrate.js';
 import { pool } from './helpers.js';
+
+function sha256Hex(content: string): string {
+  return createHash('sha256').update(content, 'utf8').digest('hex');
+}
 
 // Distinct from the real schema/*.sql version numbers so this suite can
 // never collide with (or accidentally re-trigger) them.
@@ -120,6 +125,98 @@ void test('runMigrations applies missing migrations in order and records them, t
       second.map((o) => o.status),
       ['already-applied', 'already-applied'],
     );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+void test('runMigrations records a checksum on apply, and re-running with unchanged content is still a clean no-op', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'principal-graph-migrate-test-'));
+  try {
+    const sql = `create table migrate_spec_widget (id serial primary key);`;
+    writeFileSync(join(dir, `${V1}_create_widget.sql`), sql);
+
+    await runMigrations(pool, dir);
+
+    const { rows } = await pool.query<{ checksum: string | null }>(
+      `select checksum from schema_migrations where version = $1`,
+      [V1],
+    );
+    assert.equal(rows[0]?.checksum, sha256Hex(sql));
+
+    // Re-run against the exact same content: still a no-op, not a false
+    // tamper alarm.
+    const second = await runMigrations(pool, dir);
+    assert.deepEqual(
+      second.map((o) => o.status),
+      ['already-applied'],
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+void test('runMigrations throws if an already-applied migration file was edited afterward', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'principal-graph-migrate-test-'));
+  try {
+    const file = join(dir, `${V1}_create_widget.sql`);
+    writeFileSync(file, `create table migrate_spec_widget (id serial primary key);`);
+    await runMigrations(pool, dir);
+
+    // Someone edits an already-applied migration's file in place — exactly
+    // what this checksum exists to catch (see src/migrate.ts's own header).
+    writeFileSync(file, `create table migrate_spec_widget (id serial primary key, sneaky text);`);
+
+    await assert.rejects(() => runMigrations(pool, dir), /content on disk no longer matches/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+void test('runMigrations tolerates a hand-seeded row with no checksum — "never computed" isn\'t treated as a mismatch', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'principal-graph-migrate-test-'));
+  try {
+    writeFileSync(
+      join(dir, `${V1}_create_widget.sql`),
+      `create table migrate_spec_widget (id serial primary key);`,
+    );
+    await pool.query(`create table migrate_spec_widget (id serial primary key)`);
+    // No checksum column supplied — the exact shape of the adoption-path
+    // seed scripts/run-migrations.ts's own header documents.
+    await pool.query(`insert into schema_migrations (version, file) values ($1, $2)`, [
+      V1,
+      `${V1}_create_widget.sql`,
+    ]);
+
+    const outcomes = await runMigrations(pool, dir);
+    assert.deepEqual(outcomes, [
+      { version: V1, file: `${V1}_create_widget.sql`, status: 'already-applied' },
+    ]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+void test('runMigrations holds the advisory lock for the whole pass, so a concurrent run serializes instead of double-applying', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'principal-graph-migrate-test-'));
+  try {
+    writeFileSync(
+      join(dir, `${V1}_create_widget.sql`),
+      // A migration slow enough that a truly concurrent second call would
+      // very likely observe V1 as still missing if the lock didn't
+      // serialize the two runs — a real, if indirect, proof the lock is
+      // actually held for the discover+apply pass, not just around one
+      // query.
+      `select pg_sleep(0.3); create table migrate_spec_widget (id serial primary key);`,
+    );
+
+    const [first, second] = await Promise.all([runMigrations(pool, dir), runMigrations(pool, dir)]);
+    const statuses = [...first, ...second].map((o) => o.status).sort();
+    // Exactly one of the two calls actually applied it; the other, once
+    // the lock released, saw it already recorded. Two 'applied' would mean
+    // the table-create ran twice (it can't — Postgres would throw), so the
+    // only way both calls succeed at all is if the lock did its job.
+    assert.deepEqual(statuses, ['already-applied', 'applied']);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

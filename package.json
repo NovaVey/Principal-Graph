@@ -22,12 +22,14 @@
     "adapter:aws": "tsx scripts/run-aws-adapter.ts",
     "adapter:workspace": "tsx scripts/run-workspace-adapter.ts",
     "adapter:postgres": "tsx scripts/run-postgres-adapter.ts",
+    "adapter:postgres-usage": "tsx scripts/run-postgres-usage-adapter.ts",
     "export:rba": "tsx scripts/run-rba-exporter.ts",
     "migrate": "tsx scripts/run-migrations.ts",
     "adapter-status": "tsx scripts/run-adapter-status.ts",
     "report": "tsx scripts/report.ts",
     "serve": "tsx scripts/run-server.ts",
-    "policy-check": "tsx scripts/run-policy-check.ts"
+    "policy-check": "tsx scripts/run-policy-check.ts",
+    "verify-chain": "tsx scripts/run-verify-chain.ts"
   },
   "repository": {
     "type": "git",

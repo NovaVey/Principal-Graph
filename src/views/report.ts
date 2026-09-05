@@ -1,11 +1,18 @@
 /**
  * The one report this milestone exists to produce. It only reads (views/
- * read from the core, adapters write) — three sections, each pulled
- * straight from a query already proven in Tasks 1-3:
+ * read from the core, adapters write) — four sections:
  *
- *   1. Unused grants   — the `unused_grant` view (schema/001_core.sql).
+ *   1. Unused grants   — the `unused_grant_by_relation` view
+ *      (schema/005_unused_grant_relation_fix.sql) — the corrected
+ *      successor to `unused_grant` (schema/001_core.sql), which is
+ *      frozen and keeps the bug that view's own comment describes.
  *   2. Trifecta exposure — the `trifecta_exposure` view (same file).
- *   3. Denials          — recent `event` rows where decision = 'deny'.
+ *   3. Acting on behalf of — which human each agent's `event.on_behalf_of`
+ *      activity is actually attributed to. Purely descriptive, like every
+ *      other section here — the prescriptive counterpart (an agent acting
+ *      for a human who holds no grant on the resource at all) is the
+ *      `on-behalf-of-escalation` policy (src/policies.ts).
+ *   4. Denials          — recent `event` rows where decision = 'deny'.
  *
  * The bar (build brief, Task 4): a competent generalist engineer reads this
  * in two minutes and knows what to delete. No capability-model vocabulary
@@ -40,6 +47,17 @@ export interface TrifectaRow {
   capabilities: Capability[];
 }
 
+export interface OnBehalfOfRow {
+  agentKind: string;
+  /** display_name if set, else external_id. */
+  agent: string;
+  /** display_name if set, else external_id. */
+  human: string;
+  resource: string;
+  /** The most recent allow event recorded for this (agent, human, resource) triple. */
+  lastOccurredAt: Date;
+}
+
 export interface DenialRow {
   occurredAt: Date;
   principalKind: string;
@@ -53,10 +71,11 @@ export interface DenialRow {
 
 export interface Report {
   generatedAt: Date;
-  /** Matches unused_grant's own hardcoded window (schema/001_core.sql) — not configurable here, since the view isn't. */
+  /** Matches unused_grant_by_relation's own hardcoded window (schema/005_unused_grant_relation_fix.sql) — not configurable here, since the view isn't. */
   unusedGrantWindowDays: 90;
   unusedGrants: UnusedGrantRow[];
   trifectaExposure: TrifectaRow[];
+  actingOnBehalfOf: OnBehalfOfRow[];
   /** How far back the denials section looked. */
   denialWindowDays: number;
   /** True if there were more denials in the window than denialLimit returned. */
@@ -107,7 +126,7 @@ export async function buildReport(db: Queryable, opts: BuildReportOptions = {}):
   const denialWindowDays = opts.denialWindowDays ?? DEFAULT_DENIAL_WINDOW_DAYS;
   const denialLimit = opts.denialLimit ?? DEFAULT_DENIAL_LIMIT;
 
-  const [unusedGrantRows, trifectaRows, denialRows] = await Promise.all([
+  const [unusedGrantRows, trifectaRows, onBehalfOfRows, denialRows] = await Promise.all([
     db.query<{
       principal_kind: string;
       principal: string | null;
@@ -128,11 +147,20 @@ export async function buildReport(db: Queryable, opts: BuildReportOptions = {}):
       // into a real JS array, so an uncast `capability[]` comes back as
       // the raw Postgres array literal string ("{write_irreversible}")
       // instead. Both casts/joins are done here rather than touching the
-      // view (schema/001_core.sql, exactly as given by the build brief).
+      // view (schema/005_unused_grant_relation_fix.sql — additive, so
+      // editing it directly would be fine, but keeping the same shape as
+      // every other query here is simpler than a one-off exception).
+      // unused_grant_by_relation, not 001_core.sql's own unused_grant —
+      // see schema/005_unused_grant_relation_fix.sql's own header for why:
+      // that view matches an allow event to a grant by (principal,
+      // resource) alone, so one allow event masks every relation a
+      // principal holds on the same resource; this one matches by
+      // relation too, the same fix src/policies.ts's checkStaleGrant
+      // already has.
       `select u.principal_kind, u.principal, p.external_id as principal_external_id,
               u.resource, r.external_id as resource_external_id,
               u.relation, u.source, u.observed_at, u.capabilities::text[] as capabilities
-         from unused_grant u
+         from unused_grant_by_relation u
          join grant_edge g on g.id = u.grant_id
          join principal  p on p.id = g.principal_id
          join resource   r on r.id = g.resource_id`,
@@ -147,6 +175,37 @@ export async function buildReport(db: Queryable, opts: BuildReportOptions = {}):
       `select t.id, t.kind, t.display_name, p.external_id, t.capabilities::text[] as capabilities
          from trifecta_exposure t
          join principal p on p.id = t.id`,
+    ),
+    db.query<{
+      agent_kind: string;
+      agent: string | null;
+      agent_external_id: string;
+      human: string | null;
+      human_external_id: string;
+      resource: string | null;
+      resource_external_id: string;
+      last_occurred_at: Date;
+    }>(
+      // One row per (agent, human, resource) triple ever seen — not per
+      // event — with the most recent allow event's timestamp. Purely
+      // descriptive (no "should this be allowed" judgment; that's
+      // src/policies.ts's on-behalf-of-escalation rule's job), so this
+      // reads every acting-on-behalf-of relationship there is, not just
+      // a recent window — same "state, not a lookback period" choice
+      // that rule makes, for the same reason.
+      `select ap.kind as agent_kind, ap.display_name as agent, ap.external_id as agent_external_id,
+              hp.display_name as human, hp.external_id as human_external_id,
+              r.display_name as resource, r.external_id as resource_external_id,
+              max(e.occurred_at) as last_occurred_at
+         from event e
+         join principal ap on ap.id = e.principal_id
+         join principal hp on hp.id = e.on_behalf_of
+         join resource  r  on r.id = e.resource_id
+        where e.decision = 'allow'
+          and e.on_behalf_of is not null
+        group by ap.kind, ap.display_name, ap.external_id,
+                 hp.display_name, hp.external_id, r.display_name, r.external_id
+        order by last_occurred_at desc`,
     ),
     db.query<{
       occurred_at: Date;
@@ -199,6 +258,14 @@ export async function buildReport(db: Queryable, opts: BuildReportOptions = {}):
     }))
     .sort((a, b) => a.displayName.localeCompare(b.displayName));
 
+  const actingOnBehalfOf: OnBehalfOfRow[] = onBehalfOfRows.rows.map((r) => ({
+    agentKind: r.agent_kind,
+    agent: resolveName(r.agent, r.agent_external_id),
+    human: resolveName(r.human, r.human_external_id),
+    resource: resolveName(r.resource, r.resource_external_id),
+    lastOccurredAt: r.last_occurred_at,
+  }));
+
   const denialsTruncated = denialRows.rows.length > denialLimit;
   const denials: DenialRow[] = denialRows.rows.slice(0, denialLimit).map((r) => ({
     occurredAt: r.occurred_at,
@@ -215,6 +282,7 @@ export async function buildReport(db: Queryable, opts: BuildReportOptions = {}):
     unusedGrantWindowDays: 90,
     unusedGrants,
     trifectaExposure,
+    actingOnBehalfOf,
     denialWindowDays,
     denialsTruncated,
     denials,
@@ -240,6 +308,10 @@ function formatUnusedGrant(row: UnusedGrantRow): string {
 
 function formatTrifectaRow(row: TrifectaRow): string {
   return `  - ${row.displayName} (${row.kind}): ${row.capabilities.join(', ')}`;
+}
+
+function formatOnBehalfOfRow(row: OnBehalfOfRow): string {
+  return `  "${row.agent}" (${row.agentKind}) acted for "${row.human}" on ${row.resource}, most recently at ${formatTimestamp(row.lastOccurredAt)}`;
 }
 
 function formatDenial(row: DenialRow): string {
@@ -279,6 +351,20 @@ export function formatReport(report: Report): string {
     lines.push('  None — no principal currently holds all three at once.');
   } else {
     for (const row of report.trifectaExposure) lines.push(formatTrifectaRow(row));
+  }
+  lines.push('');
+
+  lines.push(RULE);
+  lines.push('ACTING ON BEHALF OF');
+  lines.push(RULE);
+  lines.push(
+    "Which human each agent's activity is actually attributed to — this project's whole point is knowing who is behind an agent, not just which agent it is. Purely descriptive; an agent acting for a human who holds no grant here at all is the on-behalf-of-escalation policy's job, not this report's.",
+  );
+  lines.push('');
+  if (report.actingOnBehalfOf.length === 0) {
+    lines.push('  None — no event has ever recorded who a human behind an agent was.');
+  } else {
+    for (const row of report.actingOnBehalfOf) lines.push(formatOnBehalfOfRow(row));
   }
   lines.push('');
 

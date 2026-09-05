@@ -59,6 +59,7 @@ async function main(): Promise<void> {
         principalArns,
         region: process.env.AWS_REGION,
         dryRun,
+        runId,
       });
       if (dryRun) console.log('DRY RUN — nothing below was actually written to grant_edge\n');
       let totalGrants = 0;

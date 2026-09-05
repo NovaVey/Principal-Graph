@@ -26,6 +26,9 @@
 
 import { ensurePrincipal, ensureResource, type Queryable } from '../upsert.js';
 import type { PrincipalKind, Relation } from '../model.js';
+import { checkBlastRadius, type RevocationGuardOptions } from '../revocation-guard.js';
+import { recordGrantCreated, recordGrantRevoked } from '../grant-run-history.js';
+import { recordResourceSeen } from '../resource-liveness.js';
 
 const GITHUB_API_BASE = 'https://api.github.com';
 const COLLABORATORS_PAGE_SIZE = 100;
@@ -99,7 +102,7 @@ async function fetchCollaboratorsFromApi(
   return all;
 }
 
-export interface GithubAdapterOptions {
+export interface GithubAdapterOptions extends RevocationGuardOptions {
   /** Explicit "owner/repo" strings — the whole config surface; nothing here discovers repos on its own. See this file's header. */
   repos: string[];
   /** A PAT (or GitHub App installation token) with at least read access to each repo's collaborator list. */
@@ -115,6 +118,8 @@ export interface GithubAdapterOptions {
    * scripts/run-github-adapter.ts's `--dry-run` flag.
    */
   dryRun?: boolean;
+  /** The adapter_run id this invocation is running under — see McpConfigAdapterOptions.runId's own doc comment. */
+  runId?: string;
 }
 
 export interface GithubRepoGrantResult {
@@ -146,6 +151,20 @@ export async function runGithubAdapter(
       source: 'github',
       externalId: repo,
     });
+    // fetchCollaborators() above already succeeded — the repo is
+    // confirmed to still exist and be reachable this run. See
+    // src/resource-liveness.ts's own header on why this matters.
+    await recordResourceSeen(db, resourceId, opts.runId);
+
+    // Captured BEFORE this run writes anything — see postgres-roles.ts's
+    // own comment on the same line for why (the blast-radius check needs
+    // the count as it stood prior to this run, not inflated by grants
+    // this same run is about to (re)create).
+    const { rows: priorRows } = await db.query<{ count: string }>(
+      `select count(*)::text from grant_edge where resource_id = $1 and source = 'github' and revoked_at is null`,
+      [resourceId],
+    );
+    const priorLiveCount = Number(priorRows[0]?.count ?? '0');
 
     // (principal_id, relation) pairs live as of this run — a collaborator
     // can appear only once per repo, so these stay parallel and duplicate-free.
@@ -166,13 +185,15 @@ export async function runGithubAdapter(
         externalId: collaborator.login,
       });
       if (!opts.dryRun) {
-        await db.query(
+        const { rows } = await db.query<{ id: string }>(
           `insert into grant_edge (principal_id, resource_id, relation, source)
            values ($1, $2, $3, 'github')
            on conflict (principal_id, resource_id, relation, source) do update
-             set observed_at = now(), revoked_at = null`,
+             set observed_at = now(), revoked_at = null
+           returning id`,
           [principalId, resourceId, relation],
         );
+        if (rows[0]) await recordGrantCreated(db, rows[0].id, opts.runId);
       }
       principalIds.push(principalId);
       relations.push(relation);
@@ -191,20 +212,30 @@ export async function runGithubAdapter(
     // is always true and everything is correctly revoked — same empty-case
     // behavior as mcp-config.ts's own revoke query.
     //
-    // In dry-run mode this is the exact same WHERE clause as a plain
-    // SELECT instead of an UPDATE — see GithubAdapterOptions.dryRun.
-    const revokeQuery = opts.dryRun
-      ? `select p.external_id, g.relation
-           from grant_edge g
-           join principal p on p.id = g.principal_id
-          where g.resource_id = $1
-            and g.source = 'github'
-            and g.revoked_at is null
-            and not exists (
-              select 1 from unnest($2::uuid[], $3::text[]) as cur(principal_id, relation)
-               where cur.principal_id = g.principal_id and cur.relation = g.relation
-            )`
-      : `update grant_edge g
+    // Always run as a SELECT first — even on a real run — so the
+    // blast-radius guard below (src/revocation-guard.ts) sees the
+    // candidate count before anything is actually revoked: a truncated
+    // collaborators response reads exactly like "everyone lost access."
+    const { rows: candidateRows } = await db.query<{ external_id: string; relation: string }>(
+      `select p.external_id, g.relation
+         from grant_edge g
+         join principal p on p.id = g.principal_id
+        where g.resource_id = $1
+          and g.source = 'github'
+          and g.revoked_at is null
+          and not exists (
+            select 1 from unnest($2::uuid[], $3::text[]) as cur(principal_id, relation)
+             where cur.principal_id = g.principal_id and cur.relation = g.relation
+          )`,
+      [resourceId, principalIds, relations],
+    );
+
+    let revokedRows = candidateRows;
+    if (!opts.dryRun) {
+      checkBlastRadius(repo, priorLiveCount, candidateRows.length, opts);
+
+      const { rows } = await db.query<{ id: string; external_id: string; relation: string }>(
+        `update grant_edge g
             set revoked_at = now()
            from principal p
           where g.principal_id = p.id
@@ -215,11 +246,12 @@ export async function runGithubAdapter(
               select 1 from unnest($2::uuid[], $3::text[]) as cur(principal_id, relation)
                where cur.principal_id = g.principal_id and cur.relation = g.relation
             )
-          returning p.external_id, g.relation`;
-    const { rows: revokedRows } = await db.query<{ external_id: string; relation: string }>(
-      revokeQuery,
-      [resourceId, principalIds, relations],
-    );
+          returning g.id, p.external_id, g.relation`,
+        [resourceId, principalIds, relations],
+      );
+      for (const row of rows) await recordGrantRevoked(db, row.id, opts.runId);
+      revokedRows = rows;
+    }
 
     results.push({
       repo,

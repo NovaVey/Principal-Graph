@@ -18,6 +18,7 @@ import {
   type QueryTargetRoles,
   type RoleMembers,
 } from '../src/adapters/postgres-roles.js';
+import { BlastRadiusExceededError } from '../src/revocation-guard.js';
 import { pool, resetDatabase } from './helpers.js';
 
 const ROLE_TIERS = { read: 'app_read', write: 'app_write', admin: 'app_admin' };
@@ -114,6 +115,47 @@ void test('runPostgresAdapter with no members revokes every prior grant on that 
 
   assert.deepEqual(second[0]?.grants, {});
   assert.deepEqual(second[0]?.revoked, ['alice (was: admin)']);
+});
+
+void test('runPostgresAdapter refuses to revoke most of a target at real scale, unless forced', async () => {
+  const target = { label: 'big-db', connectionString: 'unused-with-a-fake-query' };
+  const roles = ['alice', 'bob', 'carol', 'dave', 'erin', 'frank'];
+  await runPostgresAdapter(pool, {
+    targets: [target],
+    roleTiers: ROLE_TIERS,
+    queryTargetRoles: fakeQuery({ read: roles, write: [], admin: [] }),
+  });
+
+  // A target that comes back nearly empty (a query failure mid-run, a
+  // stale connection): only 2 of 6 remain — 4 of 6 (67%) would be
+  // revoked, past the default 50% cap at a real (>=5) prior population.
+  const truncated = fakeQuery({ read: ['alice', 'bob'], write: [], admin: [] });
+
+  await assert.rejects(
+    () =>
+      runPostgresAdapter(pool, {
+        targets: [target],
+        roleTiers: ROLE_TIERS,
+        queryTargetRoles: truncated,
+      }),
+    BlastRadiusExceededError,
+  );
+
+  const { rows: stillLive } = await pool.query<{ count: string }>(
+    `select count(*)::text from grant_edge where source = 'postgres' and revoked_at is null`,
+  );
+  assert.equal(stillLive[0]?.count, '6', 'the blocked run must not have revoked anything');
+
+  const forced = await runPostgresAdapter(pool, {
+    targets: [target],
+    roleTiers: ROLE_TIERS,
+    queryTargetRoles: truncated,
+    force: true,
+  });
+  assert.deepEqual(
+    [...(forced[0]?.revoked ?? [])].sort(),
+    ['carol (was: read)', 'dave (was: read)', 'erin (was: read)', 'frank (was: read)'].sort(),
+  );
 });
 
 void test('dryRun previews grants and revokes accurately without writing to grant_edge', async () => {

@@ -31,6 +31,7 @@ async function main(): Promise<void> {
     const runId = await startRun(pool, 'mcp-config', { dryRun });
     try {
       const result = await runMcpConfigAdapter(pool, {
+        runId,
         agent: {
           source: 'mcp-config',
           externalId: agentExternalId,

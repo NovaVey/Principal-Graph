@@ -71,24 +71,34 @@ async function main(): Promise<void> {
     write: requireRole('PRINCIPAL_GRAPH_PG_WRITE_ROLE'),
     admin: requireRole('PRINCIPAL_GRAPH_PG_ADMIN_ROLE'),
   };
+  // Optional — see src/adapters/postgres-usage.ts's own DEFAULT_DEDUPE_WINDOW_MINUTES for the default and why.
+  const dedupeWindowMinutes = process.env.PRINCIPAL_GRAPH_PG_USAGE_DEDUPE_MINUTES
+    ? Number(process.env.PRINCIPAL_GRAPH_PG_USAGE_DEDUPE_MINUTES)
+    : undefined;
 
   const pool = createPool();
   try {
     const runId = await startRun(pool, 'postgres-usage');
     try {
-      const results = await runPostgresUsageAdapter(pool, { targets, roleTiers });
+      const results = await runPostgresUsageAdapter(pool, {
+        targets,
+        roleTiers,
+        dedupeWindowMinutes,
+      });
       let totalActive = 0;
+      let totalLogged = 0;
       for (const result of results) {
         totalActive += result.active.length;
+        totalLogged += result.active.length - result.deduped.length;
         console.log(
           `${result.target}: ${result.active.length} role(s) active right now${
             result.active.length ? ` (${result.active.join(', ')})` : ''
-          }`,
+          }${result.deduped.length ? ` — ${result.deduped.length} deduped, already logged recently` : ''}`,
         );
       }
       await finishRun(pool, runId, {
         status: 'success',
-        detail: `${results.length} target(s), ${totalActive} active-role event(s) recorded`,
+        detail: `${results.length} target(s), ${totalActive} active role(s), ${totalLogged} new event(s) recorded`,
       });
     } catch (err) {
       await finishRun(pool, runId, {

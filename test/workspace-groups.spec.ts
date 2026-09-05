@@ -16,6 +16,7 @@ import {
   type FetchGroupMembers,
   type WorkspaceMember,
 } from '../src/adapters/workspace-groups.js';
+import { BlastRadiusExceededError } from '../src/revocation-guard.js';
 import { pool, resetDatabase } from './helpers.js';
 
 before(resetDatabase);
@@ -172,6 +173,51 @@ void test('an empty membership list revokes every prior grant on that group', as
 
   assert.deepEqual(second[0]?.grants, {});
   assert.deepEqual(second[0]?.revoked, ['alice@example.com (was: owner)']);
+});
+
+void test('runWorkspaceAdapter refuses to revoke most of a group at real scale, unless forced', async () => {
+  const group = 'eng@example.com';
+  const emails = ['alice', 'bob', 'carol', 'dave', 'erin', 'frank'].map((n) => `${n}@example.com`);
+  await runWorkspaceAdapter(pool, {
+    groups: [group],
+    fetchMembers: fakeFetcher({
+      [group]: emails.map((email) => ({ email, type: 'USER', role: 'MEMBER' })),
+    }),
+  });
+
+  // A truncated response: only 2 of 6 remain — 4 of 6 (67%) would be
+  // revoked, past the default 50% cap at a real (>=5) prior population.
+  const truncated = fakeFetcher({
+    [group]: [
+      { email: 'alice@example.com', type: 'USER', role: 'MEMBER' },
+      { email: 'bob@example.com', type: 'USER', role: 'MEMBER' },
+    ],
+  });
+
+  await assert.rejects(
+    () => runWorkspaceAdapter(pool, { groups: [group], fetchMembers: truncated }),
+    BlastRadiusExceededError,
+  );
+
+  const { rows: stillLive } = await pool.query<{ count: string }>(
+    `select count(*)::text from grant_edge where source = 'workspace' and revoked_at is null`,
+  );
+  assert.equal(stillLive[0]?.count, '6', 'the blocked run must not have revoked anything');
+
+  const forced = await runWorkspaceAdapter(pool, {
+    groups: [group],
+    fetchMembers: truncated,
+    force: true,
+  });
+  assert.deepEqual(
+    [...(forced[0]?.revoked ?? [])].sort(),
+    [
+      'carol@example.com (was: member)',
+      'dave@example.com (was: member)',
+      'erin@example.com (was: member)',
+      'frank@example.com (was: member)',
+    ].sort(),
+  );
 });
 
 void test('runWorkspaceAdapter requires either fetchMembers or credentials + adminEmail', async () => {

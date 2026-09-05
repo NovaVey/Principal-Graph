@@ -120,6 +120,98 @@ void test('buildReport sorts unused grants by danger, excludes recently-used one
   assert.deepEqual(deleteRecordsRow?.capabilities, ['write_irreversible']);
 });
 
+void test('buildReport tags each unused grant by whether its source has any usage feed at all', async () => {
+  const agent = await ensurePrincipal(pool, { kind: 'agent', source: 'manual', externalId: 'a1' });
+
+  // 'postgres' has a usage feed (src/adapters/postgres-usage.ts) — this
+  // grant is genuinely, verifiably unused.
+  const dbResource = await ensureResource(pool, {
+    kind: 'db',
+    source: 'postgres',
+    externalId: 'verified-db',
+  });
+  await pool.query(
+    `insert into grant_edge (principal_id, resource_id, relation, source) values ($1, $2, 'read', 'postgres')`,
+    [agent, dbResource],
+  );
+
+  // 'github' has no usage feed at all — "unused" here only ever means
+  // "nothing ever looked," not "verified unused."
+  const repoResource = await ensureResource(pool, {
+    kind: 'repo',
+    source: 'github',
+    externalId: 'never-checked-repo',
+  });
+  await pool.query(
+    `insert into grant_edge (principal_id, resource_id, relation, source) values ($1, $2, 'read', 'github')`,
+    [agent, repoResource],
+  );
+
+  const report = await buildReport(pool);
+
+  const verified = report.unusedGrants.find((g) => g.resource === 'verified-db');
+  const unchecked = report.unusedGrants.find((g) => g.resource === 'never-checked-repo');
+  assert.equal(verified?.hasUsageFeed, true);
+  assert.equal(unchecked?.hasUsageFeed, false);
+
+  const text = formatReport(report);
+  const lines = text.split('\n');
+  const verifiedLine = lines.find((l) => l.includes('verified-db'));
+  const uncheckedLine = lines.find((l) => l.includes('never-checked-repo'));
+  assert.ok(
+    verifiedLine && !verifiedLine.includes('no usage feed'),
+    'a source with a usage feed gets no caveat',
+  );
+  assert.ok(
+    uncheckedLine?.includes("'github' has no usage feed"),
+    'a source with no usage feed gets the caveat, naming the source',
+  );
+});
+
+void test("buildReport surfaces a resource's last-confirmed-present timestamp when one's been recorded", async () => {
+  const agent = await ensurePrincipal(pool, { kind: 'agent', source: 'manual', externalId: 'a1' });
+
+  const trackedResource = await ensureResource(pool, {
+    kind: 'repo',
+    source: 'github',
+    externalId: 'tracked-repo',
+  });
+  await pool.query(
+    `insert into grant_edge (principal_id, resource_id, relation, source) values ($1, $2, 'read', 'github')`,
+    [agent, trackedResource],
+  );
+  await pool.query(
+    `insert into resource_last_seen (resource_id, last_seen_at) values ($1, '2024-06-01T00:00:00Z')`,
+    [trackedResource],
+  );
+
+  const untrackedResource = await ensureResource(pool, {
+    kind: 'tool',
+    source: 'mcp-config',
+    externalId: 'untracked-tool',
+  });
+  await pool.query(
+    `insert into grant_edge (principal_id, resource_id, relation, source) values ($1, $2, 'can_call', 'mcp-config')`,
+    [agent, untrackedResource],
+  );
+
+  const report = await buildReport(pool);
+
+  const tracked = report.unusedGrants.find((g) => g.resource === 'tracked-repo');
+  const untracked = report.unusedGrants.find((g) => g.resource === 'untracked-tool');
+  assert.equal(tracked?.resourceLastSeenAt?.toISOString(), '2024-06-01T00:00:00.000Z');
+  assert.equal(untracked?.resourceLastSeenAt, null);
+
+  const text = formatReport(report);
+  const lines = text.split('\n');
+  assert.ok(
+    lines
+      .find((l) => l.includes('tracked-repo'))
+      ?.includes('resource last confirmed present: 2024-06-01'),
+  );
+  assert.ok(!lines.find((l) => l.includes('untracked-tool'))?.includes('resource last confirmed'));
+});
+
 void test('buildReport surfaces trifecta exposure', async () => {
   const readTool = await ensureResource(pool, {
     kind: 'tool',

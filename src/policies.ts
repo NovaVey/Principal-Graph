@@ -56,11 +56,6 @@ export interface PolicyViolation {
  *     choice) — see checkStaleGrant's own comment for the fix itself, and
  *     test/policies.spec.ts / test/report.spec.ts for the test keeping
  *     the two behaviorally in sync.
- *   - `chain-intact` calls src/log.ts's own verifyChain() — that function
- *     existed, and was tested, with nothing ever actually calling it on a
- *     schedule (see scripts/run-verify-chain.ts, the other thing that
- *     does now). Parameterless, like `no-trifecta` — there's no
- *     configuration a broken hash chain could possibly need.
  *   - `on-behalf-of-escalation` is the one rule genuinely unique to this
  *     project's own thesis (one `principal` table, `event.on_behalf_of`
  *     tracking which human an agent is acting for): an agent's `allow`
@@ -75,11 +70,25 @@ export interface PolicyViolation {
  *     project's adapters already refuse to make (see e.g.
  *     PostgresAdapterOptions.roleTiers's own "no default" reasoning).
  *     Configure one instance per adapter you actually schedule.
+ *   - `chain-intact` is ALSO deliberately not in the default set, for a
+ *     different reason: it calls src/log.ts's own verifyChain(), which
+ *     pulls the ENTIRE event table into memory on every call (frozen —
+ *     see its own doc comment; no bounded/incremental variant exists to
+ *     call instead without duplicating its hash algorithm outside its
+ *     one source of truth, a risk not worth taking for what this
+ *     property exists to guarantee). In the default set, a routine
+ *     `policy-check` cron would get slower forever as the log grows —
+ *     confirmed with EXPLAIN ANALYZE at 100k rows before this comment was
+ *     written. `npm run verify-chain` (scripts/run-verify-chain.ts) is
+ *     the right way to run this: on its own periodic cadence (a full
+ *     audit, not a per-run check), separate from `policy-check`. Still
+ *     fully usable from `evaluatePolicies()` too — pass
+ *     `[...POLICIES, { kind: 'chain-intact' }]` explicitly if you want it
+ *     folded into one report anyway.
  */
 export const POLICIES: readonly PolicyRule[] = [
   { kind: 'no-trifecta' },
   { kind: 'stale-grant', relations: ['admin', 'write'], maxUnusedDays: 30 },
-  { kind: 'chain-intact' },
   { kind: 'on-behalf-of-escalation' },
 ];
 

@@ -27,6 +27,32 @@ import type { Capability } from '../model.js';
 
 export type Queryable = Pool | PoolClient;
 
+/**
+ * Which `grant_edge.source` values have ANY usage feed at all — i.e. some
+ * adapter in this repo can write an `allow` event against a resource from
+ * that source, so "unused" there can mean "verified unused." A source
+ * absent from this set can never show up as used no matter what actually
+ * happened, because nothing ever looks — "unused" there only ever means
+ * "we never checked." A reader can't tell those two apart from the
+ * `unused_grant_by_relation` row alone, and the section's own prose used
+ * to claim both are "the safest to delete," which is only true for the
+ * first kind.
+ *
+ * Hand-written, not introspected — same shape and reasoning as
+ * src/capabilities.ts's own `TOOL_CAPABILITIES`: this is a fact about
+ * which adapters this repo ships a usage feed for, not something
+ * derivable from data, and guessing wrong here is worse than a short
+ * manual list.
+ *
+ *   - 'mcp-config': via src/adapters/broker-audit-sink.ts, when its
+ *     `resourceSource` is pointed at 'mcp-config' — see that file's own
+ *     header and BrokerAuditSinkOptions.resourceSource's doc comment.
+ *   - 'postgres': via src/adapters/postgres-usage.ts.
+ *   - 'github' / 'aws' / 'workspace' have no usage feed at all yet — see
+ *     README's own note on this being the next structural gap to close.
+ */
+export const SOURCES_WITH_USAGE_FEED: ReadonlySet<string> = new Set(['mcp-config', 'postgres']);
+
 export interface UnusedGrantRow {
   principalKind: string;
   /** display_name if set, else external_id — a reader always gets a real identifier, never a placeholder. */
@@ -37,6 +63,10 @@ export interface UnusedGrantRow {
   observedAt: Date;
   /** null when nothing has classified this resource yet (src/capabilities.ts). */
   capabilities: Capability[] | null;
+  /** True if `source` has any usage feed at all — see SOURCES_WITH_USAGE_FEED. False means "unused" here only ever means "we never checked," not "verified unused." */
+  hasUsageFeed: boolean;
+  /** When this resource was last confirmed to still exist (schema/008_resource_last_seen.sql, src/resource-liveness.ts) — null if it's never been checked by a liveness-tracking adapter (mcp-config/aws resources, or a resource seen only before this migration existed). */
+  resourceLastSeenAt: Date | null;
 }
 
 export interface TrifectaRow {
@@ -137,6 +167,7 @@ export async function buildReport(db: Queryable, opts: BuildReportOptions = {}):
       source: string;
       observed_at: Date;
       capabilities: Capability[] | null;
+      resource_last_seen_at: Date | null;
     }>(
       // Joined back through grant_edge (the view's own grant_id) to
       // principal/resource for external_id, so a null display_name has a
@@ -157,13 +188,19 @@ export async function buildReport(db: Queryable, opts: BuildReportOptions = {}):
       // principal holds on the same resource; this one matches by
       // relation too, the same fix src/policies.ts's checkStaleGrant
       // already has.
+      // Left-joined: resource_last_seen (schema/008) only has a row for
+      // resources a liveness-tracking adapter has actually checked
+      // (src/resource-liveness.ts) — most rows won't have one yet, and
+      // that's the honest "never checked" state, not an error.
       `select u.principal_kind, u.principal, p.external_id as principal_external_id,
               u.resource, r.external_id as resource_external_id,
-              u.relation, u.source, u.observed_at, u.capabilities::text[] as capabilities
+              u.relation, u.source, u.observed_at, u.capabilities::text[] as capabilities,
+              rls.last_seen_at as resource_last_seen_at
          from unused_grant_by_relation u
          join grant_edge g on g.id = u.grant_id
          join principal  p on p.id = g.principal_id
-         join resource   r on r.id = g.resource_id`,
+         join resource   r on r.id = g.resource_id
+         left join resource_last_seen rls on rls.resource_id = r.id`,
     ),
     db.query<{
       id: string;
@@ -241,6 +278,8 @@ export async function buildReport(db: Queryable, opts: BuildReportOptions = {}):
       source: r.source,
       observedAt: r.observed_at,
       capabilities: r.capabilities,
+      hasUsageFeed: SOURCES_WITH_USAGE_FEED.has(r.source),
+      resourceLastSeenAt: r.resource_last_seen_at,
     }))
     .sort((a, b) => {
       const byDanger = dangerRankOf(a.capabilities) - dangerRankOf(b.capabilities);
@@ -303,7 +342,19 @@ function formatUnusedGrant(row: UnusedGrantRow): string {
     row.capabilities && row.capabilities.length > 0
       ? row.capabilities.join(', ')
       : 'not yet classified';
-  return `  [${tags}] ${row.resource} — granted to "${row.principal}" (${row.principalKind}) via ${row.source}, unused since ${formatTimestamp(row.observedAt)}`;
+  // hasUsageFeed distinguishes "verified unused" from "never looked" — see
+  // SOURCES_WITH_USAGE_FEED's own doc comment for why this matters.
+  const status = row.hasUsageFeed
+    ? `unused since ${formatTimestamp(row.observedAt)}`
+    : `unused since ${formatTimestamp(row.observedAt)} — but '${row.source}' has no usage feed, so this only means "never checked," not "verified unused"`;
+  // resourceLastSeenAt: only populated for a resource a liveness-tracking
+  // adapter has actually checked (src/resource-liveness.ts) — null for
+  // most rows, which is the honest "not tracked for this source" state,
+  // not worth a caveat of its own the way hasUsageFeed's is.
+  const liveness = row.resourceLastSeenAt
+    ? ` (resource last confirmed present: ${formatTimestamp(row.resourceLastSeenAt)})`
+    : '';
+  return `  [${tags}] ${row.resource} — granted to "${row.principal}" (${row.principalKind}) via ${row.source}, ${status}${liveness}`;
 }
 
 function formatTrifectaRow(row: TrifectaRow): string {
@@ -330,7 +381,7 @@ export function formatReport(report: Report): string {
   lines.push('UNUSED GRANTS');
   lines.push(RULE);
   lines.push(
-    `Permissions that are still live but haven't been exercised in the last ${report.unusedGrantWindowDays} days. Sorted with the riskiest ones first — these are the safest to delete, because nothing has used them recently.`,
+    `Permissions that are still live but haven't been exercised in the last ${report.unusedGrantWindowDays} days. Sorted with the riskiest ones first — the safest to delete, because nothing has used them recently, ONLY for rows without the "no usage feed" caveat below; the rest have simply never been checked either way.`,
   );
   lines.push('');
   if (report.unusedGrants.length === 0) {

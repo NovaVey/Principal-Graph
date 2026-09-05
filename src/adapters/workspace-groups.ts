@@ -37,6 +37,9 @@
 import { createSign } from 'node:crypto';
 import { ensurePrincipal, ensureResource, type Queryable } from '../upsert.js';
 import type { Relation } from '../model.js';
+import { checkBlastRadius, type RevocationGuardOptions } from '../revocation-guard.js';
+import { recordGrantCreated, recordGrantRevoked } from '../grant-run-history.js';
+import { recordResourceSeen } from '../resource-liveness.js';
 
 const DIRECTORY_API_BASE = 'https://admin.googleapis.com/admin/directory/v1';
 const TOKEN_URL = 'https://oauth2.googleapis.com/token';
@@ -145,7 +148,7 @@ export function relationFromRole(role: string | undefined): Relation {
   return (role ?? 'MEMBER').toLowerCase();
 }
 
-export interface WorkspaceAdapterOptions {
+export interface WorkspaceAdapterOptions extends RevocationGuardOptions {
   /** Google Group emails or IDs — explicit, never discovered. See this file's header. */
   groups: string[];
   /** Overridable for testing; defaults to a real call against the Admin SDK Directory API. */
@@ -161,6 +164,8 @@ export interface WorkspaceAdapterOptions {
    * scripts/run-workspace-adapter.ts's `--dry-run` flag.
    */
   dryRun?: boolean;
+  /** The adapter_run id this invocation is running under — see McpConfigAdapterOptions.runId's own doc comment. */
+  runId?: string;
 }
 
 export interface WorkspaceGrantResult {
@@ -196,6 +201,17 @@ export async function runWorkspaceAdapter(
       source: 'workspace',
       externalId: group,
     });
+    // fetchMembers() above already succeeded — the group is confirmed to
+    // still exist this run. See src/resource-liveness.ts's own header.
+    await recordResourceSeen(db, resourceId, opts.runId);
+
+    // Captured BEFORE this run writes anything — see postgres-roles.ts's
+    // own comment on the same line for why.
+    const { rows: priorRows } = await db.query<{ count: string }>(
+      `select count(*)::text from grant_edge where resource_id = $1 and source = 'workspace' and revoked_at is null`,
+      [resourceId],
+    );
+    const priorLiveCount = Number(priorRows[0]?.count ?? '0');
 
     const principalIds: string[] = [];
     const relations: Relation[] = [];
@@ -210,13 +226,15 @@ export async function runWorkspaceAdapter(
         externalId: member.email,
       });
       if (!opts.dryRun) {
-        await db.query(
+        const { rows } = await db.query<{ id: string }>(
           `insert into grant_edge (principal_id, resource_id, relation, source)
            values ($1, $2, $3, 'workspace')
            on conflict (principal_id, resource_id, relation, source) do update
-             set observed_at = now(), revoked_at = null`,
+             set observed_at = now(), revoked_at = null
+           returning id`,
           [principalId, resourceId, relation],
         );
+        if (rows[0]) await recordGrantCreated(db, rows[0].id, opts.runId);
       }
       principalIds.push(principalId);
       relations.push(relation);
@@ -232,20 +250,30 @@ export async function runWorkspaceAdapter(
     // since Google's resolved membership list IS authoritative for this
     // group.
     //
-    // In dry-run mode this is the exact same WHERE clause as a plain
-    // SELECT instead of an UPDATE — see WorkspaceAdapterOptions.dryRun.
-    const revokeQuery = opts.dryRun
-      ? `select p.external_id, g.relation
-           from grant_edge g
-           join principal p on p.id = g.principal_id
-          where g.resource_id = $1
-            and g.source = 'workspace'
-            and g.revoked_at is null
-            and not exists (
-              select 1 from unnest($2::uuid[], $3::text[]) as cur(principal_id, relation)
-               where cur.principal_id = g.principal_id and cur.relation = g.relation
-            )`
-      : `update grant_edge g
+    // Always run as a SELECT first — even on a real run — so the
+    // blast-radius guard below (src/revocation-guard.ts) sees the
+    // candidate count before anything is actually revoked: a truncated
+    // members response reads exactly like "everyone lost access."
+    const { rows: candidateRows } = await db.query<{ external_id: string; relation: string }>(
+      `select p.external_id, g.relation
+         from grant_edge g
+         join principal p on p.id = g.principal_id
+        where g.resource_id = $1
+          and g.source = 'workspace'
+          and g.revoked_at is null
+          and not exists (
+            select 1 from unnest($2::uuid[], $3::text[]) as cur(principal_id, relation)
+             where cur.principal_id = g.principal_id and cur.relation = g.relation
+          )`,
+      [resourceId, principalIds, relations],
+    );
+
+    let revokedRows = candidateRows;
+    if (!opts.dryRun) {
+      checkBlastRadius(group, priorLiveCount, candidateRows.length, opts);
+
+      const { rows } = await db.query<{ id: string; external_id: string; relation: string }>(
+        `update grant_edge g
             set revoked_at = now()
            from principal p
           where g.principal_id = p.id
@@ -256,11 +284,12 @@ export async function runWorkspaceAdapter(
               select 1 from unnest($2::uuid[], $3::text[]) as cur(principal_id, relation)
                where cur.principal_id = g.principal_id and cur.relation = g.relation
             )
-          returning p.external_id, g.relation`;
-    const { rows: revokedRows } = await db.query<{ external_id: string; relation: string }>(
-      revokeQuery,
-      [resourceId, principalIds, relations],
-    );
+          returning g.id, p.external_id, g.relation`,
+        [resourceId, principalIds, relations],
+      );
+      for (const row of rows) await recordGrantRevoked(db, row.id, opts.runId);
+      revokedRows = rows;
+    }
 
     results.push({
       group,

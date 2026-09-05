@@ -14,12 +14,13 @@ to have a security team.
 classification, five grant-source adapters (MCP config, GitHub, AWS,
 Google Workspace, Postgres), a Postgres *usage* adapter (the first on the
 other side of the ledger — see [Usage 14](#14-track-real-postgres-query-activity)),
-the report (CLI and HTTP, with an optional Slack alert) with five policy
-checks (no-trifecta, stale-grant, chain-intact, on-behalf-of-escalation,
-plus an opt-in per-adapter freshness check), migration tracking, adapter
-run-history, and the export bridge into Relationship-Based-Authorization
-are all implemented and tested. See [Related projects](#related-projects)
-for what feeds this repo, what it feeds, and what it doesn't do yet.
+the report (CLI and HTTP, with an optional Slack alert) with three
+default policy checks (no-trifecta, stale-grant, on-behalf-of-escalation)
+plus two opt-in ones (chain-intact, per-adapter freshness), migration
+tracking, adapter run-history, and the export bridge into
+Relationship-Based-Authorization are all implemented and tested. See
+[Related projects](#related-projects) for what feeds this repo, what it
+feeds, and what it doesn't do yet.
 
 ## Contents
 
@@ -41,6 +42,9 @@ for what feeds this repo, what it feeds, and what it doesn't do yet.
   - [12. Populate grants from Postgres role membership](#12-populate-grants-from-postgres-role-membership)
   - [13. Verify the event chain hasn't been tampered with](#13-verify-the-event-chain-hasnt-been-tampered-with)
   - [14. Track real Postgres query activity](#14-track-real-postgres-query-activity)
+  - [15. Guard against runaway revocation](#15-guard-against-runaway-revocation)
+  - [16. Answer "which run touched this grant"](#16-answer-which-run-touched-this-grant)
+  - [17. Stop treating deleted resources as live forever](#17-stop-treating-deleted-resources-as-live-forever)
 - [Data model](#data-model)
 - [Project layout](#project-layout)
 - [Development](#development)
@@ -286,7 +290,12 @@ npm run report > report.txt   # or save it
 Four plain-text sections, one command:
 
 1. **Unused grants** — permissions nobody's exercised in 90 days, riskiest
-   first.
+   first. Only true "safest to delete" for a `source` with a usage feed
+   at all (currently `mcp-config` via the broker sink, and `postgres` via
+   [Usage 14](#14-track-real-postgres-query-activity)) — a row from
+   `github`/`aws`/`workspace` gets an explicit caveat instead, since
+   nothing has ever looked there and "unused" only means "never checked."
+   See `SOURCES_WITH_USAGE_FEED` in `src/views/report.ts`.
 2. **Trifecta exposure** — which principals can read private data, ingest
    untrusted content, *and* reach the network, all at once.
 3. **Acting on behalf of** — which human each agent's `event.on_behalf_of`
@@ -379,7 +388,7 @@ hand-written set of "should never happen" rules
 nonzero if any fail — built for CI/cron ("did access, right now, obey the
 rules we've stated"), not for a human reading a summary.
 
-Four rules ship by default:
+Three rules ship by default:
 
 - **`no-trifecta`** — no principal should hold `read_private` +
   `ingest_untrusted` + `egress` at once (reuses `trifecta_exposure`
@@ -387,10 +396,6 @@ Four rules ship by default:
 - **`stale-grant`** — no `admin`/`write` grant should sit unused past 30
   days (its own parameterized query — tighter and configurable, unlike
   `unused_grant`'s fixed 90-day window).
-- **`chain-intact`** — the event chain (`src/log.ts`'s `verifyChain()`)
-  hasn't been tampered with. That function existed and was tested with
-  nothing ever calling it on a schedule — see [Usage 13](#13-verify-the-event-chain-hasnt-been-tampered-with)
-  for the standalone runner this rule shares its call with.
 - **`on-behalf-of-escalation`** — no agent's `allow` event on behalf of a
   human (`event.on_behalf_of`) who holds no grant on that resource at
   all. The one rule genuinely built on this project's own thesis (one
@@ -399,18 +404,29 @@ Four rules ship by default:
   BEHALF OF" report section for the same relationship, described rather
   than judged.
 
-A fifth, **`adapter-freshness`** (`{ adapter, maxAgeHours }`), is *not* in
-the default set — evaluating it needs a specific adapter name and a
-maximum age in hours, and guessing either (which adapters actually run
-in your deployment, what cadence counts as "fresh") is exactly the kind
-of guess this project's adapters already refuse to make (see e.g.
-[Usage 12](#12-populate-grants-from-postgres-role-membership)'s
-`roleTiers` having no default). Pass your own list to `evaluatePolicies()`
-to add one per adapter you actually schedule — a stale or silently-failing
-real run (`dry_run = false`) beyond your own limit is a violation; a
-dry-run-only or never-run adapter isn't, same "nothing to report yet"
-stance as [Usage 11](#11-check-on-scheduled-adapter-runs)'s own
-`latestRuns()`.
+Two more exist but are deliberately *not* in the default set, for two
+different reasons:
+
+- **`adapter-freshness`** (`{ adapter, maxAgeHours }`) needs a specific
+  adapter name and a maximum age in hours, and guessing either (which
+  adapters actually run in your deployment, what cadence counts as
+  "fresh") is exactly the kind of guess this project's adapters already
+  refuse to make (see e.g. [Usage 12](#12-populate-grants-from-postgres-role-membership)'s
+  `roleTiers` having no default). Pass your own list to
+  `evaluatePolicies()` to add one per adapter you actually schedule — a
+  stale or silently-failing real run (`dry_run = false`) beyond your own
+  limit is a violation; a dry-run-only or never-run adapter isn't, same
+  "nothing to report yet" stance as [Usage 11](#11-check-on-scheduled-adapter-runs)'s
+  own `latestRuns()`.
+- **`chain-intact`** calls `src/log.ts`'s own `verifyChain()`, which pulls
+  the *entire* event table into memory on every call (frozen — no
+  bounded variant exists without duplicating its hash algorithm outside
+  its one source of truth, a risk not worth taking for what this
+  property exists to guarantee). In the default set, a routine
+  `policy-check` cron would get slower forever as the log grows. Run it
+  on its own periodic cadence instead — see [Usage 13](#13-verify-the-event-chain-hasnt-been-tampered-with)
+  — or pass `[...POLICIES, { kind: 'chain-intact' }]` yourself if you
+  want it folded into one report anyway.
 
 Same shape as `TOOL_CAPABILITIES` — a plain, hand-written TypeScript
 array, not a parsed text format. `Relationship-Based-Authorization`
@@ -516,10 +532,13 @@ suite ever called it. This is that runner: replays the whole chain,
 prints the first break in each broken run (a row's hash no longer
 matches its own content, or it no longer links to the row before it —
 someone edited or deleted an `event` row directly), and exits nonzero if
-it finds one. The `chain-intact` policy rule ([Usage 10](#10-check-policy-violations))
-calls the same function — run either on a schedule; they report the same
-thing two different ways (a plain break list here, a `PolicyViolation`
-there).
+it finds one. Run this on its own periodic cadence (a full audit, not a
+per-invocation check) — it's an unbounded full-table scan by design
+(replaying the *whole* chain is the property), so it shouldn't run on
+every `policy-check` tick. `chain-intact` ([Usage 10](#10-check-policy-violations))
+calls the exact same function for anyone who wants it folded into one
+report instead — deliberately not in `policy-check`'s own default set,
+for that same cost reason.
 
 ### 14. Track real Postgres query activity
 
@@ -553,6 +572,14 @@ Run it on a tight interval (every minute, say) to narrow that gap, not to
 close it; `pgaudit` statement logging would close it properly, and isn't
 what this adapter does.
 
+A tight interval on a continuously busy role would otherwise write one
+event per run forever — `PRINCIPAL_GRAPH_PG_USAGE_DEDUPE_MINUTES`
+(default 5) skips the write when that (principal, resource) pair already
+has an allow event within the window, so a role that's been active the
+whole time gets one row per window, not one per cron tick, into a table
+that by construction can never be pruned. It's still reported as active
+either way — this only affects whether a fresh row gets written.
+
 > **Live-verified**: a real second connection genuinely running a query
 > as a tier-member role, observed live via `pg_stat_activity` while this
 > adapter's own CLI ran concurrently — both the "active and a tier
@@ -560,6 +587,110 @@ what this adapter does.
 > (see `test/postgres-usage.spec.ts`). The resulting event was then
 > confirmed, end to end, to move the same grant out of the report's
 > UNUSED GRANTS section via `npm run report`.
+
+### 15. Guard against runaway revocation
+
+Four adapters — [mcp-config](#2-populate-grants-from-your-agents-config),
+[GitHub](#3-populate-grants-from-github-repo-collaborators),
+[Workspace](#5-populate-grants-from-google-workspace-group-membership),
+[Postgres roles](#12-populate-grants-from-postgres-role-membership) — are
+full-inventory: every live grant in scope that isn't in this run's
+current set gets revoked. Exactly right when the source's response is
+complete, and exactly wrong when it isn't — a truncated API response, a
+misread config file, a briefly-unreachable target — because a
+full-inventory diff can't tell "everyone actually lost access" apart
+from "the source told us nothing." Both read identically.
+
+`src/revocation-guard.ts` turns the old mitigation (a human remembering
+`--dry-run`) into a rule: each adapter now refuses to revoke more than
+50% of a scope's prior live grant count in one run, once that scope has
+at least 5 prior live grants — below that floor, percentages are noise
+(one person leaving a 2-person repo is already 50%; a 3-of-4 reshuffle
+is 75%, both completely ordinary). "Scope" is per resource (a repo, a
+group, a target database) or per principal (mcp-config's one agent),
+never averaged across a whole run — the actual failure this guards
+against wipes out ONE resource while the others stay fine, and an
+across-the-run average could hide that inside a total that looks safe.
+
+Pass `{ force: true }` to any of the four adapters to bypass the check
+for a run where mass revocation is genuinely intended (an offboarded
+team, a decommissioned repo) — never inferred, always explicit.
+`maxFraction`/`minPriorCount` are overridable too; see
+`RevocationGuardOptions`'s own doc comment.
+
+`dryRun` is unaffected either way — a preview already has zero side
+effects, so it always shows the full candidate list, alarming or not.
+
+> **Live-verified**: each of the four adapters has its own test that
+> grants six real principals, truncates the source down to two, confirms
+> the guard blocks the write (`grant_edge` unchanged), then confirms
+> `force: true` applies the exact same revocation the guard just
+> blocked. Caught a real bug along the way: the first version measured
+> "prior" live count *after* this run's own grants had already been
+> upserted, undercounting what actually changed — fixed by capturing the
+> count before any write happens, in every adapter.
+
+### 16. Answer "which run touched this grant"
+
+`adapter_run` (schema/004) records that a run happened; `grant_edge`
+(frozen) records `source` and `observed_at`, but nothing connected the
+two — "which run created Alice's admin grant, which run revoked it, and
+did that run succeed" was only answerable by grepping logs and eyeballing
+timestamps.
+
+`schema/007_grant_edge_run_history.sql` adds `grant_edge_run`, a side
+table keyed on `grant_edge.id` (frozen — this can't be two new columns
+on it directly, same workaround shape as `005`/`006`) — all five grant
+adapters now take an optional `runId` (the id `startRun()` already
+returns, threaded straight through by each `scripts/run-*-adapter.ts`)
+and record it every time they create/refresh or revoke a grant. Omitted
+entirely, nothing is linked — no fabricated history for a grant written
+before this migration existed, or by a caller (a test, an ad hoc script)
+that never wired up `startRun()`/`finishRun()` around its call.
+
+```ts
+import { getGrantRunHistory } from './src/grant-run-history.js';
+
+const { createdByRun, revokedByRun } = await getGrantRunHistory(pool, grantEdgeId);
+// createdByRun?.status / revokedByRun?.status — did that run actually succeed?
+```
+
+This is also what makes [Usage 15](#15-guard-against-runaway-revocation)'s
+own guard auditable after the fact — not just "was a revocation blocked
+right now" but "which run tried it, and did it retry and succeed later."
+
+### 17. Stop treating deleted resources as live forever
+
+`resource` (frozen) has no `last_seen`, unlike `principal`, which does
+(bumped by `ensurePrincipal()` on every sighting). A deleted S3 bucket or
+an archived GitHub repo keeps every grant it ever had, live, forever —
+indistinguishable in the report from a resource that's still there.
+
+`schema/008_resource_last_seen.sql` adds `resource_last_seen` — the same
+side-table workaround as `005`/`006`/`007`. Wired into exactly three
+adapters — [GitHub](#3-populate-grants-from-github-repo-collaborators),
+[Workspace](#5-populate-grants-from-google-workspace-group-membership),
+[Postgres roles](#12-populate-grants-from-postgres-role-membership) —
+right after the call that proves the resource is genuinely still
+reachable this run (each adapter's own fetch/query call throws before
+recording anything if the target is gone). Deliberately **not** wired
+into `mcp-config` (a tool "resource" has no independent existence beyond
+being in the config file this run just read — already fully captured by
+the grant itself) or `aws-s3` (`SimulatePrincipalPolicy` evaluates a
+policy against a resource ARN; it never confirms that resource actually
+exists, so there's no genuine signal to record there — see
+`src/resource-liveness.ts`'s own header for the full reasoning on both).
+
+The report's UNUSED GRANTS section ([Usage 7](#7-run-the-report)) now
+shows "resource last confirmed present: `<timestamp>`" for a row with any
+recorded liveness data — silent, not a caveat, for a row without any
+(most rows, from a source this isn't wired into, or seen only before
+this migration existed).
+
+> **Live-verified**: a real `runGithubAdapter()` call, real report,
+> confirmed showing both the "no usage feed" caveat and the resource
+> liveness annotation together on the same row — see `npm run report`'s
+> own output format in `test/report.spec.ts`.
 
 ## Data model
 
@@ -595,7 +726,15 @@ scheduled write side (see [Usage 11](#11-check-on-scheduled-adapter-runs)) —
 also internal bookkeeping, not part of the grant graph. A fifth,
 `schema/005_unused_grant_relation_fix.sql`, adds `unused_grant_by_relation`
 — `unused_grant`'s own query with the relation-matching fix above applied;
-this is what `report.ts` actually reads now.
+this is what `report.ts` actually reads now. A sixth,
+`schema/006_on_behalf_of_index.sql`, adds one partial index serving
+`on-behalf-of-escalation`'s own query shape — indexes only, same as the
+third. A seventh, `schema/007_grant_edge_run_history.sql`, adds
+`grant_edge_run` — see [Usage 16](#16-answer-which-run-touched-this-grant)
+— also internal bookkeeping, not part of the grant graph. An eighth,
+`schema/008_resource_last_seen.sql`, adds `resource_last_seen` — see
+[Usage 17](#17-stop-treating-deleted-resources-as-live-forever) — also
+internal bookkeeping, not part of the grant graph.
 
 ## Project layout
 
@@ -605,6 +744,9 @@ schema/            SQL migrations — 001_core.sql is the shared core
                      003_performance_indexes.sql adds indexes only, no schema change
                      004_adapter_runs.sql adds adapter_run, scheduled-run history
                      005_unused_grant_relation_fix.sql adds unused_grant_by_relation
+                     006_on_behalf_of_index.sql adds an index only, no schema change
+                     007_grant_edge_run_history.sql adds grant_edge_run
+                     008_resource_last_seen.sql adds resource_last_seen
 rba/
   principal-graph.authz  RBA's own namespace schema for this project's grant data
 src/
@@ -613,8 +755,11 @@ src/
   upsert.ts          ensurePrincipal / ensureResource — how adapters upsert identity
   migrate.ts          discoverMigrations / runMigrations — schema/*.sql tracking + apply
   run-history.ts      startRun / finishRun / latestRuns — adapter_run bookkeeping
+  grant-run-history.ts  links a grant_edge row to the adapter_run that created/revoked it
+  resource-liveness.ts  records the last time a resource was confirmed to still exist
   capabilities.ts    TOOL_CAPABILITIES (hand-written) + how resources get classified
   policies.ts         POLICIES (hand-written) + evaluatePolicies() — "should never happen" rules
+  revocation-guard.ts  checkBlastRadius() — caps full-inventory revocation per run
   notify-slack.ts      posts policy violations to a Slack Incoming Webhook
   db.ts              Pool construction (reads DATABASE_URL)
   server.ts          GET /report, /report.json, /health — node:http, no framework

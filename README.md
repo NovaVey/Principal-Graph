@@ -386,6 +386,24 @@ a weaker echo of that, not a complement to it. Add a rule by adding a
 `PolicyRule` variant and a matching case in `evaluatePolicies()`'s switch
 — TypeScript won't let you add the variant without also handling it.
 
+Set `PRINCIPAL_GRAPH_SLACK_WEBHOOK_URL` to also post any violations to a
+Slack channel via an [Incoming Webhook](https://api.slack.com/messaging/webhooks)
+— bare `fetch`, no SDK (see `src/notify-slack.ts`). Deliberately an alert,
+not a heartbeat: nothing is posted when there are no violations, the same
+reasoning that kept [Usage 11](#11-check-on-scheduled-adapter-runs)'s own
+run-history a pull-based check rather than a notification on every run. A
+failed Slack post is logged but never changes the exit code — that still
+reflects policy state alone, not whether Slack heard about it.
+
+> **Not yet live-verified** against a real Slack workspace (no webhook
+> was available while building it) — same caveat, same reason, as the AWS
+> and Workspace adapters above. Verified as far as possible without one:
+> the request shape matches Slack's own documented Incoming Webhook
+> payload exactly, checked end-to-end (a real trifecta violation, a real
+> local HTTP server standing in for Slack, both the success and a
+> failed-webhook path) against a mock server, the same depth the GitHub
+> adapter's own real HTTP client got.
+
 ### 11. Check on scheduled adapter runs
 
 ```bash
@@ -497,6 +515,7 @@ src/
   run-history.ts      startRun / finishRun / latestRuns — adapter_run bookkeeping
   capabilities.ts    TOOL_CAPABILITIES (hand-written) + how resources get classified
   policies.ts         POLICIES (hand-written) + evaluatePolicies() — "should never happen" rules
+  notify-slack.ts      posts policy violations to a Slack Incoming Webhook
   db.ts              Pool construction (reads DATABASE_URL)
   server.ts          GET /report, /report.json, /health — node:http, no framework
   adapters/

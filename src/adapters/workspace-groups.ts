@@ -37,6 +37,7 @@
 import { createSign } from 'node:crypto';
 import { ensurePrincipal, ensureResource, type Queryable } from '../upsert.js';
 import type { Relation } from '../model.js';
+import { checkBlastRadius, type RevocationGuardOptions } from '../revocation-guard.js';
 
 const DIRECTORY_API_BASE = 'https://admin.googleapis.com/admin/directory/v1';
 const TOKEN_URL = 'https://oauth2.googleapis.com/token';
@@ -145,7 +146,7 @@ export function relationFromRole(role: string | undefined): Relation {
   return (role ?? 'MEMBER').toLowerCase();
 }
 
-export interface WorkspaceAdapterOptions {
+export interface WorkspaceAdapterOptions extends RevocationGuardOptions {
   /** Google Group emails or IDs — explicit, never discovered. See this file's header. */
   groups: string[];
   /** Overridable for testing; defaults to a real call against the Admin SDK Directory API. */
@@ -197,6 +198,14 @@ export async function runWorkspaceAdapter(
       externalId: group,
     });
 
+    // Captured BEFORE this run writes anything — see postgres-roles.ts's
+    // own comment on the same line for why.
+    const { rows: priorRows } = await db.query<{ count: string }>(
+      `select count(*)::text from grant_edge where resource_id = $1 and source = 'workspace' and revoked_at is null`,
+      [resourceId],
+    );
+    const priorLiveCount = Number(priorRows[0]?.count ?? '0');
+
     const principalIds: string[] = [];
     const relations: Relation[] = [];
     const grants: Record<string, Relation> = {};
@@ -232,20 +241,30 @@ export async function runWorkspaceAdapter(
     // since Google's resolved membership list IS authoritative for this
     // group.
     //
-    // In dry-run mode this is the exact same WHERE clause as a plain
-    // SELECT instead of an UPDATE — see WorkspaceAdapterOptions.dryRun.
-    const revokeQuery = opts.dryRun
-      ? `select p.external_id, g.relation
-           from grant_edge g
-           join principal p on p.id = g.principal_id
-          where g.resource_id = $1
-            and g.source = 'workspace'
-            and g.revoked_at is null
-            and not exists (
-              select 1 from unnest($2::uuid[], $3::text[]) as cur(principal_id, relation)
-               where cur.principal_id = g.principal_id and cur.relation = g.relation
-            )`
-      : `update grant_edge g
+    // Always run as a SELECT first — even on a real run — so the
+    // blast-radius guard below (src/revocation-guard.ts) sees the
+    // candidate count before anything is actually revoked: a truncated
+    // members response reads exactly like "everyone lost access."
+    const { rows: candidateRows } = await db.query<{ external_id: string; relation: string }>(
+      `select p.external_id, g.relation
+         from grant_edge g
+         join principal p on p.id = g.principal_id
+        where g.resource_id = $1
+          and g.source = 'workspace'
+          and g.revoked_at is null
+          and not exists (
+            select 1 from unnest($2::uuid[], $3::text[]) as cur(principal_id, relation)
+             where cur.principal_id = g.principal_id and cur.relation = g.relation
+          )`,
+      [resourceId, principalIds, relations],
+    );
+
+    let revokedRows = candidateRows;
+    if (!opts.dryRun) {
+      checkBlastRadius(group, priorLiveCount, candidateRows.length, opts);
+
+      const { rows } = await db.query<{ external_id: string; relation: string }>(
+        `update grant_edge g
             set revoked_at = now()
            from principal p
           where g.principal_id = p.id
@@ -256,11 +275,11 @@ export async function runWorkspaceAdapter(
               select 1 from unnest($2::uuid[], $3::text[]) as cur(principal_id, relation)
                where cur.principal_id = g.principal_id and cur.relation = g.relation
             )
-          returning p.external_id, g.relation`;
-    const { rows: revokedRows } = await db.query<{ external_id: string; relation: string }>(
-      revokeQuery,
-      [resourceId, principalIds, relations],
-    );
+          returning p.external_id, g.relation`,
+        [resourceId, principalIds, relations],
+      );
+      revokedRows = rows;
+    }
 
     results.push({
       group,

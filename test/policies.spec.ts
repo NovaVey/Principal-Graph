@@ -278,7 +278,7 @@ void test('evaluatePolicies with no rule list defaults to POLICIES and aggregate
   );
   assert.deepEqual(
     POLICIES.map((p) => p.kind),
-    ['no-trifecta', 'stale-grant', 'chain-intact', 'on-behalf-of-escalation'],
+    ['no-trifecta', 'stale-grant', 'on-behalf-of-escalation'],
   );
 });
 

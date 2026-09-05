@@ -53,6 +53,19 @@
  * externalId: target.label) for the resource, ('human', 'postgres',
  * roleName) for the principal — so a grant and its usage land on the SAME
  * rows, not two that happen to share a label.
+ *
+ * Deduplicated within `dedupeWindowMinutes`: a role that's continuously
+ * busy would otherwise get one appendEvent() per run — at the tight
+ * interval this file's own header recommends to narrow the sampling gap
+ * (e.g. every minute), that's ~1,440 rows/day for a single role, each
+ * one taking the chain's global advisory lock (src/log.ts), into a table
+ * that by construction can never be pruned. Before writing, this checks
+ * whether the (principal, resource) pair already has an allow event
+ * within the window and skips the write if so — using the same
+ * `event_allow_pair_idx` (schema/003_performance_indexes.sql) the
+ * grant/policy queries already rely on, so the check itself stays cheap.
+ * A deduped role is still reported as `active` (it genuinely is); see
+ * `deduped` for which ones didn't get a fresh row this run.
  */
 
 import { Client } from 'pg';
@@ -112,6 +125,8 @@ export const queryActiveRolesFromDb: QueryActiveRoles = async (connectionString,
   }
 };
 
+const DEFAULT_DEDUPE_WINDOW_MINUTES = 5;
+
 export interface PostgresUsageAdapterOptions {
   /** Same explicit targets as postgres-roles.ts — never discovered. */
   targets: PostgresTarget[];
@@ -119,13 +134,42 @@ export interface PostgresUsageAdapterOptions {
   roleTiers: RoleTiers;
   /** Overridable for testing; defaults to a real connection per target via queryActiveRolesFromDb. */
   queryActiveRoles?: QueryActiveRoles;
+  /**
+   * Skip writing a new allow event for a (principal, resource) pair that
+   * already has one this recently. Default 5 — long enough to absorb a
+   * tight (e.g. one-minute) cron cadence without silently missing
+   * genuinely new activity after a real gap. See this file's own header.
+   */
+  dedupeWindowMinutes?: number;
+}
+
+/** True if `principalId` already has a recorded allow event on `resourceId` within `windowMinutes` — see this file's own header on why this exists. */
+async function hasRecentAllowEvent(
+  pool: Pool,
+  principalId: string,
+  resourceId: string,
+  windowMinutes: number,
+): Promise<boolean> {
+  const { rows } = await pool.query(
+    `select 1
+       from event
+      where principal_id = $1
+        and resource_id  = $2
+        and decision     = 'allow'
+        and occurred_at  > now() - ($3::text || ' minutes')::interval
+      limit 1`,
+    [principalId, resourceId, String(windowMinutes)],
+  );
+  return rows.length > 0;
 }
 
 export interface PostgresUsageResult {
   target: string;
   resourceId: string;
-  /** Login roles this run recorded an allow event for — active, and a member of at least one tracked tier. */
+  /** Login roles observed active this run — active, and a member of at least one tracked tier. Includes roles whose event was deduped; see `deduped`. */
   active: string[];
+  /** Which of `active` already had a recent-enough allow event and so were not re-logged this run. */
+  deduped: string[];
 }
 
 /**
@@ -139,6 +183,7 @@ export async function runPostgresUsageAdapter(
   opts: PostgresUsageAdapterOptions,
 ): Promise<PostgresUsageResult[]> {
   const queryActiveRoles = opts.queryActiveRoles ?? queryActiveRolesFromDb;
+  const dedupeWindowMinutes = opts.dedupeWindowMinutes ?? DEFAULT_DEDUPE_WINDOW_MINUTES;
   const results: PostgresUsageResult[] = [];
 
   for (const target of opts.targets) {
@@ -150,12 +195,23 @@ export async function runPostgresUsageAdapter(
     });
 
     const active: string[] = [];
+    const deduped: string[] = [];
     for (const roleName of activeRoles) {
       const principalId = await ensurePrincipal(pool, {
         kind: 'human',
         source: 'postgres',
         externalId: roleName,
       });
+      active.push(roleName);
+
+      if (
+        dedupeWindowMinutes > 0 &&
+        (await hasRecentAllowEvent(pool, principalId, resourceId, dedupeWindowMinutes))
+      ) {
+        deduped.push(roleName);
+        continue;
+      }
+
       await appendEvent(pool, {
         occurredAt: new Date(),
         principalId,
@@ -170,9 +226,8 @@ export async function runPostgresUsageAdapter(
         reversible: null,
         requestDigest: null,
       });
-      active.push(roleName);
     }
-    results.push({ target: target.label, resourceId, active });
+    results.push({ target: target.label, resourceId, active, deduped });
   }
 
   return results;

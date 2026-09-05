@@ -21,6 +21,7 @@ import {
   toolNameFromPermissionEntry,
 } from '../src/adapters/mcp-config.js';
 import { createPrincipalGraphAuditSink } from '../src/adapters/broker-audit-sink.js';
+import { BlastRadiusExceededError } from '../src/revocation-guard.js';
 import { pool, resetDatabase } from './helpers.js';
 
 before(resetDatabase);
@@ -187,6 +188,44 @@ void test('dryRun previews grants and revokes accurately without writing to gran
       [real.principalId],
     );
     assert.equal(stillLive[0]?.revoked_at, null, 'the previewed revoke must not actually apply');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+void test("runMcpConfigAdapter refuses to revoke most of an agent's tools at real scale, unless forced", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'principal-graph-test-'));
+  const settingsPath = join(dir, 'settings.json');
+  try {
+    const sixTools = ['Read', 'Write', 'Bash', 'Grep', 'Glob', 'WebFetch'];
+    writeFileSync(settingsPath, JSON.stringify({ permissions: { allow: sixTools } }));
+    const agent = { source: 'manual', externalId: 'blast-radius-agent' };
+    await runMcpConfigAdapter(pool, { agent, configPaths: [settingsPath] });
+
+    // A truncated/misread config: only 2 of 6 tools remain — 4 of 6 (67%)
+    // would be revoked, past the default 50% cap at a real (>=5) prior
+    // population.
+    writeFileSync(settingsPath, JSON.stringify({ permissions: { allow: ['Read', 'Write'] } }));
+
+    await assert.rejects(
+      () => runMcpConfigAdapter(pool, { agent, configPaths: [settingsPath] }),
+      BlastRadiusExceededError,
+    );
+
+    const { rows: stillLive } = await pool.query<{ count: string }>(
+      `select count(*)::text from grant_edge where source = 'mcp-config' and revoked_at is null`,
+    );
+    assert.equal(stillLive[0]?.count, '6', 'the blocked run must not have revoked anything');
+
+    const forced = await runMcpConfigAdapter(pool, {
+      agent,
+      configPaths: [settingsPath],
+      force: true,
+    });
+    assert.deepEqual(
+      forced.revokedTools.sort(compareToolNames),
+      ['Bash', 'Grep', 'Glob', 'WebFetch'].sort(compareToolNames),
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

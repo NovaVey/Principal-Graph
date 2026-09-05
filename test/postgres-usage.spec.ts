@@ -34,6 +34,7 @@ void test('runPostgresUsageAdapter records an honest allow event per active role
   });
 
   assert.deepEqual(new Set(result?.active), new Set(['alice', 'bob']));
+  assert.deepEqual(result?.deduped, [], 'nothing to dedupe against on a first-ever run');
 
   const { rows: events } = await pool.query<{
     external_id: string;
@@ -81,17 +82,19 @@ void test('runPostgresUsageAdapter lands on the SAME principal/resource rows as 
   assert.ok(result?.resourceId);
 });
 
-void test('runPostgresUsageAdapter is a log, not a snapshot: repeated runs append, never overwrite', async () => {
+void test('runPostgresUsageAdapter is a log, not a snapshot: with dedupe off, repeated runs append, never overwrite', async () => {
   const target = { label: 'app-db', connectionString: 'unused-with-a-fake-query' };
   await runPostgresUsageAdapter(pool, {
     targets: [target],
     roleTiers: ROLE_TIERS,
     queryActiveRoles: fakeActive(['alice']),
+    dedupeWindowMinutes: 0,
   });
   await runPostgresUsageAdapter(pool, {
     targets: [target],
     roleTiers: ROLE_TIERS,
     queryActiveRoles: fakeActive(['alice']),
+    dedupeWindowMinutes: 0,
   });
 
   const { rows } = await pool.query<{ count: string }>(
@@ -102,6 +105,59 @@ void test('runPostgresUsageAdapter is a log, not a snapshot: repeated runs appen
   assert.equal(rows[0]?.count, '2', 'two separate observations, two separate rows');
 });
 
+void test('runPostgresUsageAdapter dedupes a back-to-back run within the window (default: 5 minutes)', async () => {
+  const target = { label: 'app-db', connectionString: 'unused-with-a-fake-query' };
+  const first = await runPostgresUsageAdapter(pool, {
+    targets: [target],
+    roleTiers: ROLE_TIERS,
+    queryActiveRoles: fakeActive(['alice']),
+  });
+  assert.deepEqual(first[0]?.deduped, []);
+
+  const second = await runPostgresUsageAdapter(pool, {
+    targets: [target],
+    roleTiers: ROLE_TIERS,
+    queryActiveRoles: fakeActive(['alice']),
+  });
+  // Still reported as active (it genuinely is) — just not re-logged.
+  assert.deepEqual(second[0]?.active, ['alice']);
+  assert.deepEqual(second[0]?.deduped, ['alice']);
+
+  const { rows } = await pool.query<{ count: string }>(
+    `select count(*)::text from event e
+       join principal p on p.id = e.principal_id
+      where p.external_id = 'alice'`,
+  );
+  assert.equal(rows[0]?.count, '1', 'the second run must not have written a second row');
+});
+
+void test('runPostgresUsageAdapter does not dedupe once the prior event has aged out of the window', async () => {
+  const target = { label: 'app-db', connectionString: 'unused-with-a-fake-query' };
+  await runPostgresUsageAdapter(pool, {
+    targets: [target],
+    roleTiers: ROLE_TIERS,
+    queryActiveRoles: fakeActive(['alice']),
+  });
+  // Backdate the one existing event well outside any window, the way a
+  // genuinely earlier observation would be by the time this run happens.
+  await pool.query(`update event set occurred_at = now() - interval '1 hour'`);
+
+  const second = await runPostgresUsageAdapter(pool, {
+    targets: [target],
+    roleTiers: ROLE_TIERS,
+    queryActiveRoles: fakeActive(['alice']),
+    dedupeWindowMinutes: 5,
+  });
+  assert.deepEqual(second[0]?.deduped, [], 'a real gap must not be silently swallowed');
+
+  const { rows } = await pool.query<{ count: string }>(
+    `select count(*)::text from event e
+       join principal p on p.id = e.principal_id
+      where p.external_id = 'alice'`,
+  );
+  assert.equal(rows[0]?.count, '2');
+});
+
 void test('runPostgresUsageAdapter with no active roles records nothing', async () => {
   const target = { label: 'quiet-db', connectionString: 'unused-with-a-fake-query' };
   const [result] = await runPostgresUsageAdapter(pool, {
@@ -110,6 +166,7 @@ void test('runPostgresUsageAdapter with no active roles records nothing', async 
     queryActiveRoles: fakeActive([]),
   });
   assert.deepEqual(result?.active, []);
+  assert.deepEqual(result?.deduped, []);
 
   const { rows } = await pool.query<{ count: string }>(`select count(*)::text from event`);
   assert.equal(rows[0]?.count, '0');

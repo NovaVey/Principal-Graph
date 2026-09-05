@@ -16,6 +16,7 @@ import {
   type GithubCollaborator,
   type FetchCollaborators,
 } from '../src/adapters/github-collaborators.js';
+import { BlastRadiusExceededError } from '../src/revocation-guard.js';
 import { pool, resetDatabase } from './helpers.js';
 
 before(resetDatabase);
@@ -209,4 +210,48 @@ void test('runGithubAdapter with no collaborators revokes every prior grant on t
 
   assert.deepEqual(second[0]?.grants, {});
   assert.deepEqual(second[0]?.revoked, ['alice (was: admin)']);
+});
+
+void test('runGithubAdapter refuses to revoke most of a repo at real scale, unless forced', async () => {
+  const repo = 'novavey/big-repo';
+  const logins = ['alice', 'bob', 'carol', 'dave', 'erin', 'frank'];
+  await runGithubAdapter(pool, {
+    repos: [repo],
+    token: 'unused-with-a-fake-fetcher',
+    fetchCollaborators: fakeFetcher({
+      [repo]: logins.map((login) => ({ login, type: 'User', permissions: { pull: true } })),
+    }),
+  });
+
+  // A truncated response: only 2 of 6 remain — 4 of 6 (67%) would be
+  // revoked, past the default 50% cap at a real (>=5) prior population.
+  const truncated = fakeFetcher({
+    [repo]: [
+      { login: 'alice', type: 'User', permissions: { pull: true } },
+      { login: 'bob', type: 'User', permissions: { pull: true } },
+    ],
+  });
+
+  await assert.rejects(
+    () => runGithubAdapter(pool, { repos: [repo], token: 'unused', fetchCollaborators: truncated }),
+    BlastRadiusExceededError,
+  );
+
+  // Nothing was actually revoked by the blocked attempt.
+  const { rows: stillLive } = await pool.query<{ count: string }>(
+    `select count(*)::text from grant_edge where source = 'github' and revoked_at is null`,
+  );
+  assert.equal(stillLive[0]?.count, '6', 'the blocked run must not have revoked anything');
+
+  // The same run, forced, applies exactly as it would have without the guard.
+  const forced = await runGithubAdapter(pool, {
+    repos: [repo],
+    token: 'unused',
+    fetchCollaborators: truncated,
+    force: true,
+  });
+  assert.deepEqual(
+    [...(forced[0]?.revoked ?? [])].sort(),
+    ['carol (was: read)', 'dave (was: read)', 'erin (was: read)', 'frank (was: read)'].sort(),
+  );
 });

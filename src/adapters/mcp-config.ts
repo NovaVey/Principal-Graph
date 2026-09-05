@@ -39,6 +39,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { ensurePrincipal, ensureResource, type Queryable } from '../upsert.js';
+import { checkBlastRadius, type RevocationGuardOptions } from '../revocation-guard.js';
 
 /**
  * A plain, explicit UTF-16-code-unit string comparator for `grantedTools`/
@@ -158,7 +159,7 @@ export function defaultClaudeCodeConfigPaths(projectRoot: string = process.cwd()
   ];
 }
 
-export interface McpConfigAdapterOptions {
+export interface McpConfigAdapterOptions extends RevocationGuardOptions {
   /** The agent principal these grants are attributed to. Not defaulted — see BrokerAuditSinkOptions.agent's own doc comment for why an adapter should never guess an identity. */
   agent: McpConfigAgentIdentity;
   /** Defaults to defaultClaudeCodeConfigPaths(). */
@@ -201,6 +202,17 @@ export async function runMcpConfigAdapter(
 
   const principalId = await ensurePrincipal(db, { kind: 'agent', ...opts.agent });
 
+  // Captured BEFORE this run writes anything — see the blast-radius
+  // guard below; the count as it stood prior to this run, not inflated
+  // by grants this same run is about to (re)create.
+  const { rows: priorRows } = await db.query<{ count: string }>(
+    `select count(*)::text
+       from grant_edge
+      where principal_id = $1 and source = 'mcp-config' and relation = 'can_call' and revoked_at is null`,
+    [principalId],
+  );
+  const priorLiveCount = Number(priorRows[0]?.count ?? '0');
+
   const grantedTools: string[] = [];
   const resourceIds: string[] = [];
   for (const toolName of [...tools].sort(compareToolNames)) {
@@ -229,19 +241,29 @@ export async function runMcpConfigAdapter(
   // nothing at all: `= any('{}'::uuid[])` is always false, so `not (...)`
   // is always true, with no empty-array special case needed.
   //
-  // In dry-run mode this is the exact same WHERE clause as a plain SELECT
-  // instead of an UPDATE — reports precisely what would be revoked without
-  // ever setting revoked_at. See McpConfigAdapterOptions.dryRun.
-  const revokeQuery = opts.dryRun
-    ? `select r.external_id
+  // Always run as a SELECT first — even on a real run — so the blast-radius
+  // guard below sees the candidate count *before* anything is actually
+  // revoked (see src/revocation-guard.ts's own header on why this matters:
+  // a truncated/misread config file reads exactly like "revoke everything").
+  const candidateQuery = `select r.external_id
          from grant_edge g
          join resource r on r.id = g.resource_id
         where g.principal_id = $1
           and g.source = 'mcp-config'
           and g.relation = 'can_call'
           and g.revoked_at is null
-          and not (g.resource_id = any($2::uuid[]))`
-    : `update grant_edge g
+          and not (g.resource_id = any($2::uuid[]))`;
+  const { rows: candidateRows } = await db.query<{ external_id: string }>(candidateQuery, [
+    principalId,
+    resourceIds,
+  ]);
+
+  let revokedRows = candidateRows;
+  if (!opts.dryRun) {
+    checkBlastRadius(opts.agent.externalId, priorLiveCount, candidateRows.length, opts);
+
+    const { rows } = await db.query<{ external_id: string }>(
+      `update grant_edge g
           set revoked_at = now()
          from resource r
         where g.resource_id = r.id
@@ -250,11 +272,11 @@ export async function runMcpConfigAdapter(
           and g.relation = 'can_call'
           and g.revoked_at is null
           and not (g.resource_id = any($2::uuid[]))
-        returning r.external_id`;
-  const { rows: revokedRows } = await db.query<{ external_id: string }>(revokeQuery, [
-    principalId,
-    resourceIds,
-  ]);
+        returning r.external_id`,
+      [principalId, resourceIds],
+    );
+    revokedRows = rows;
+  }
 
   return {
     principalId,

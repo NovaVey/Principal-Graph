@@ -51,6 +51,7 @@
 import { Client } from 'pg';
 import { ensurePrincipal, ensureResource, type Queryable } from '../upsert.js';
 import type { Relation } from '../model.js';
+import { checkBlastRadius, type RevocationGuardOptions } from '../revocation-guard.js';
 
 export interface RoleTiers {
   read: string;
@@ -127,7 +128,7 @@ export interface PostgresTarget {
   connectionString: string;
 }
 
-export interface PostgresAdapterOptions {
+export interface PostgresAdapterOptions extends RevocationGuardOptions {
   /** Explicit target databases — never discovered. See this file's header. */
   targets: PostgresTarget[];
   /** The three role names this project's read/write/admin vocabulary maps onto, in every target. Required — no default; see this file's header on why. */
@@ -175,6 +176,15 @@ export async function runPostgresAdapter(
       externalId: target.label,
     });
 
+    // Captured BEFORE this run writes anything — the blast-radius check
+    // below needs the count as it stood prior to this run, not inflated
+    // by grants this same run is about to (re)create.
+    const { rows: priorRows } = await db.query<{ count: string }>(
+      `select count(*)::text from grant_edge where resource_id = $1 and source = 'postgres' and revoked_at is null`,
+      [resourceId],
+    );
+    const priorLiveCount = Number(priorRows[0]?.count ?? '0');
+
     // (principal_id, relation) pairs live as of this run — a role can
     // hold more than one tier at once (e.g. both read and write), so
     // these are NOT one-per-principal; a login role appears once per
@@ -211,21 +221,33 @@ export async function runPostgresAdapter(
     // whose tier changed (old tier's row revoked, new tier's row live).
     // Same shape as github-collaborators.ts/workspace-groups.ts's own
     // revoke query — this target's role catalog IS authoritative, same
-    // full-inventory reasoning as those two. In dry-run mode this is the
-    // same WHERE clause as a plain SELECT instead of an UPDATE — see
-    // PostgresAdapterOptions.dryRun.
-    const revokeQuery = opts.dryRun
-      ? `select p.external_id, g.relation
-           from grant_edge g
-           join principal p on p.id = g.principal_id
-          where g.resource_id = $1
-            and g.source = 'postgres'
-            and g.revoked_at is null
-            and not exists (
-              select 1 from unnest($2::uuid[], $3::text[]) as cur(principal_id, relation)
-               where cur.principal_id = g.principal_id and cur.relation = g.relation
-            )`
-      : `update grant_edge g
+    // full-inventory reasoning as those two.
+    //
+    // Always run as a SELECT first — even on a real run — so the
+    // blast-radius guard below (src/revocation-guard.ts) sees the
+    // candidate count before anything is actually revoked: a target
+    // that's briefly unreachable mid-query, or a role catalog query that
+    // comes back empty, reads exactly like "everyone lost access."
+    const { rows: candidateRows } = await db.query<{ external_id: string; relation: string }>(
+      `select p.external_id, g.relation
+         from grant_edge g
+         join principal p on p.id = g.principal_id
+        where g.resource_id = $1
+          and g.source = 'postgres'
+          and g.revoked_at is null
+          and not exists (
+            select 1 from unnest($2::uuid[], $3::text[]) as cur(principal_id, relation)
+             where cur.principal_id = g.principal_id and cur.relation = g.relation
+          )`,
+      [resourceId, principalIds, relations],
+    );
+
+    let revokedRows = candidateRows;
+    if (!opts.dryRun) {
+      checkBlastRadius(target.label, priorLiveCount, candidateRows.length, opts);
+
+      const { rows } = await db.query<{ external_id: string; relation: string }>(
+        `update grant_edge g
             set revoked_at = now()
            from principal p
           where g.principal_id = p.id
@@ -236,11 +258,11 @@ export async function runPostgresAdapter(
               select 1 from unnest($2::uuid[], $3::text[]) as cur(principal_id, relation)
                where cur.principal_id = g.principal_id and cur.relation = g.relation
             )
-          returning p.external_id, g.relation`;
-    const { rows: revokedRows } = await db.query<{ external_id: string; relation: string }>(
-      revokeQuery,
-      [resourceId, principalIds, relations],
-    );
+          returning p.external_id, g.relation`,
+        [resourceId, principalIds, relations],
+      );
+      revokedRows = rows;
+    }
 
     results.push({
       target: target.label,

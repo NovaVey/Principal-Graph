@@ -46,11 +46,29 @@ async function main(): Promise<void> {
       try {
         const result = await runRbaExport(pool, { apiUrl, apiKey });
         console.log(`written: ${result.written}, deleted: ${result.deleted}`);
-        if (result.failures.length > 0) {
+
+        // Dead-lettered failures don't block the watermark (that's the
+        // whole point — see src/exporters/rba.ts's own header) but are
+        // still worth an operator's attention: printed either way, never
+        // silently retried forever without a trace anywhere.
+        if (result.deadLettered.length > 0) {
           console.error(
-            `${result.failures.length} failure(s) — watermark NOT advanced, will retry next run:`,
+            `${result.deadLettered.length} tuple(s) still stuck after repeated failures — retried automatically every run from here on, no longer blocking the watermark:`,
           );
-          for (const failure of result.failures) {
+          for (const failure of result.deadLettered) {
+            const t = failure.tuple;
+            console.error(
+              `  ${failure.op} ${t.objectNs}:${t.objectId}#${t.relation}@${t.subjectNs}:${t.subjectId} — ${failure.error}`,
+            );
+          }
+        }
+
+        const blockingFailures = result.failures.filter((f) => !result.deadLettered.includes(f));
+        if (blockingFailures.length > 0) {
+          console.error(
+            `${blockingFailures.length} failure(s) — watermark NOT advanced, will retry next run:`,
+          );
+          for (const failure of blockingFailures) {
             const t = failure.tuple;
             console.error(
               `  ${failure.op} ${t.objectNs}:${t.objectId}#${t.relation}@${t.subjectNs}:${t.subjectId} — ${failure.error}`,
@@ -59,13 +77,17 @@ async function main(): Promise<void> {
           process.exitCode = 1;
           await finishRun(pool, runId, {
             status: 'failure',
-            error: `${result.failures.length} failure(s); first: ${result.failures[0]?.error}`,
+            error: `${blockingFailures.length} failure(s); first: ${blockingFailures[0]?.error}`,
           });
         } else {
-          console.log('synced');
+          console.log(
+            result.deadLettered.length > 0
+              ? `synced (${result.deadLettered.length} tuple(s) still dead-lettered)`
+              : 'synced',
+          );
           await finishRun(pool, runId, {
             status: 'success',
-            detail: `written ${result.written}, deleted ${result.deleted}`,
+            detail: `written ${result.written}, deleted ${result.deleted}${result.deadLettered.length > 0 ? `, ${result.deadLettered.length} dead-lettered` : ''}`,
           });
         }
       } catch (err) {

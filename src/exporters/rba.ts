@@ -43,6 +43,25 @@
  * false` / `deleted: false` on a repeat rather than erroring), so
  * re-attempting the same window next run is always safe; silently
  * advancing past a failure would mean that change never gets retried.
+ *
+ * That last point has its own sharp edge, closed by
+ * `rba_export_dead_letter` (schema/011_rba_export_dead_letter.sql): "leave
+ * the watermark untouched" was previously unconditional — ONE tuple that
+ * fails EVERY run (an unpublished namespace, a permanently malformed
+ * value) pinned the watermark forever, so every later run redid the whole
+ * window and failed on that exact same tuple again, advancing nothing for
+ * every OTHER grant that changed in the meantime too. Below
+ * `deadLetterThreshold` consecutive failures, a tuple still blocks the
+ * watermark exactly as before (a fresh or occasional failure should still
+ * get a full retry-next-window). At the threshold it graduates: retried
+ * every run from `rba_export_dead_letter` directly, decoupled from the
+ * window and the watermark, until it finally succeeds (which deletes its
+ * row) — never silently dropped, but never allowed to hold the rest of
+ * the graph hostage either. See runRbaExport()'s own comments for the
+ * mechanics, including the one case this needs to guard explicitly: a
+ * 'write' stuck in the dead letter whose grant is later revoked must not
+ * keep trying to write it back after a 'delete' for the same tuple has
+ * already gone through.
  */
 
 import type { Queryable } from '../upsert.js';
@@ -147,6 +166,14 @@ export interface RunRbaExportOptions {
    * suite doesn't sit through real delays.
    */
   requestsPerMinute?: number;
+  /**
+   * Consecutive failures a single tuple tolerates before it stops blocking
+   * the watermark and graduates to being retried every run from
+   * rba_export_dead_letter directly instead — see this file's header.
+   * Default 5. Tests pass a small value so the suite doesn't need 5 real
+   * failing runs to prove the behavior.
+   */
+  deadLetterThreshold?: number;
 }
 
 export interface RbaExportFailure {
@@ -156,14 +183,103 @@ export interface RbaExportFailure {
 }
 
 export interface RbaExportResult {
-  /** True only when every write/delete this run attempted succeeded — the watermark only advances on a fully clean run; see this file's header. */
+  /**
+   * True when nothing BLOCKING the watermark failed this run — a tuple
+   * that just reached `deadLetterThreshold` (see `deadLettered` below)
+   * does not count against this; a "fresh" failure below the threshold
+   * still does, exactly as before dead-lettering existed.
+   */
   synced: boolean;
   written: number;
   deleted: number;
+  /** Every write/delete this run attempted and failed — blocking or not. */
   failures: RbaExportFailure[];
+  /**
+   * The subset of `failures` that reached `deadLetterThreshold` consecutive
+   * failures this run. These no longer block `synced`/the watermark — they
+   * are retried every run from rba_export_dead_letter directly until one
+   * finally succeeds, decoupled from the incremental window.
+   */
+  deadLettered: RbaExportFailure[];
 }
 
 const DEFAULT_REQUESTS_PER_MINUTE = 15;
+const DEFAULT_DEAD_LETTER_THRESHOLD = 5;
+
+/** `object_id`/`subject_id` are always `${source}:${externalId}` (tupleFromRow()) — split on the FIRST colon, since an external_id (e.g. a GitHub "owner/repo") is never guaranteed colon-free itself, but a source name (a short, fixed string this project's own adapters define) always is. */
+function splitIdentityRef(ref: string): { source: string; externalId: string } {
+  const i = ref.indexOf(':');
+  return i === -1
+    ? { source: ref, externalId: '' }
+    : { source: ref.slice(0, i), externalId: ref.slice(i + 1) };
+}
+
+interface DeadLetterRow {
+  object_ns: string;
+  object_id: string;
+  relation: string;
+  subject_ns: string;
+  subject_id: string;
+  op: 'write' | 'delete';
+  consecutive_failures: number;
+}
+
+function deadLetterKey(op: string, tuple: RbaTuple): string {
+  return [
+    op,
+    tuple.objectNs,
+    tuple.objectId,
+    tuple.relation,
+    tuple.subjectNs,
+    tuple.subjectId,
+  ].join(' ');
+}
+
+function tupleFromDeadLetterRow(row: DeadLetterRow): RbaTuple {
+  return {
+    objectNs: row.object_ns,
+    objectId: row.object_id,
+    relation: row.relation,
+    subjectNs: row.subject_ns,
+    subjectId: row.subject_id,
+  };
+}
+
+/**
+ * True if a LIVE (revoked_at is null) grant still matches this tuple's
+ * identity — only ever checked for a dead-lettered 'write' before
+ * retrying it, never for a 'delete' (retrying a delete for something
+ * already gone is a safe idempotent no-op per this file's own header).
+ * Guards the one real hazard dead-lettering introduces on its own: a
+ * 'write' stuck failing whose grant is later revoked would otherwise keep
+ * trying to write it back into RBA forever, fighting the 'delete' that
+ * already went through for the same tuple once the revocation itself
+ * synced.
+ */
+async function grantStillLive(db: Queryable, row: DeadLetterRow): Promise<boolean> {
+  const object = splitIdentityRef(row.object_id);
+  const subject = splitIdentityRef(row.subject_id);
+  const { rows } = await db.query(
+    `select 1
+       from grant_edge g
+       join resource  r on r.id = g.resource_id
+       join principal p on p.id = g.principal_id
+      where r.kind = $1 and r.source = $2 and r.external_id = $3
+        and p.source = $4 and p.external_id = $5
+        and g.relation = $6
+        and g.revoked_at is null
+      limit 1`,
+    [
+      row.object_ns,
+      object.source,
+      object.externalId,
+      subject.source,
+      subject.externalId,
+      row.relation,
+    ],
+  );
+  return rows.length > 0;
+}
 
 function resolveClient(opts: RunRbaExportOptions): RbaClient {
   if (opts.client) return opts.client;
@@ -247,16 +363,52 @@ export async function runRbaExport(
       ).rows
     : [];
 
+  const deadLetterThreshold = opts.deadLetterThreshold ?? DEFAULT_DEAD_LETTER_THRESHOLD;
+
+  // Every tuple currently tracked as having failed at least once, from any
+  // previous run — retried FIRST, every run, regardless of whether it's
+  // still inside this run's own window (the whole point of dead-lettering
+  // is decoupling a stuck tuple from the watermark once it crosses the
+  // threshold; see this file's header).
+  const { rows: trackedRows } = await db.query<DeadLetterRow>(
+    `select object_ns, object_id, relation, subject_ns, subject_id, op, consecutive_failures
+       from rba_export_dead_letter`,
+  );
+  const tracked = new Set(trackedRows.map((r) => deadLetterKey(r.op, tupleFromDeadLetterRow(r))));
+
+  const retryOps: { op: 'write' | 'delete'; tuple: RbaTuple; row: DeadLetterRow }[] = [];
+  for (const row of trackedRows) {
+    const tuple = tupleFromDeadLetterRow(row);
+    if (row.op === 'write' && !(await grantStillLive(db, row))) {
+      // Stale: this grant was revoked (or never existed) since this write
+      // started failing. The revoke's own 'delete' either already synced
+      // or will on its own via the normal window below — retrying this
+      // write now would just fight it. Clean up and move on; not a
+      // failure, not a success, just no longer relevant.
+      await db.query(
+        `delete from rba_export_dead_letter
+          where object_ns = $1 and object_id = $2 and relation = $3 and subject_ns = $4 and subject_id = $5 and op = $6`,
+        [row.object_ns, row.object_id, row.relation, row.subject_ns, row.subject_id, row.op],
+      );
+      continue;
+    }
+    retryOps.push({ op: row.op, tuple, row });
+  }
+
   // Writes before deletes: if a run gets interrupted partway (or hits a
   // failure that halts progress before this file's own retry story kicks
   // in), representing current access takes priority over cleaning up
-  // history that's already gone.
-  const ops: { op: 'write' | 'delete'; tuple: RbaTuple }[] = [
+  // history that's already gone. Anything already covered by a retry
+  // above is excluded here — never attempted twice in the same run.
+  const windowOps: { op: 'write' | 'delete'; tuple: RbaTuple }[] = [
     ...toWriteRows.map((row) => ({ op: 'write' as const, tuple: tupleFromRow(row) })),
     ...toDeleteRows.map((row) => ({ op: 'delete' as const, tuple: tupleFromRow(row) })),
-  ];
+  ].filter((o) => !tracked.has(deadLetterKey(o.op, o.tuple)));
+
+  const ops: { op: 'write' | 'delete'; tuple: RbaTuple }[] = [...retryOps, ...windowOps];
 
   const failures: RbaExportFailure[] = [];
+  const deadLettered: RbaExportFailure[] = [];
   let written = 0;
   let deleted = 0;
 
@@ -270,14 +422,50 @@ export async function runRbaExport(
         await client.deleteTuple(tuple);
         deleted += 1;
       }
+      // Success clears any tracking — whether this was a fresh op or a
+      // retry from the dead letter, it's resolved now.
+      await db.query(
+        `delete from rba_export_dead_letter
+          where object_ns = $1 and object_id = $2 and relation = $3 and subject_ns = $4 and subject_id = $5 and op = $6`,
+        [tuple.objectNs, tuple.objectId, tuple.relation, tuple.subjectNs, tuple.subjectId, op],
+      );
     } catch (cause) {
-      failures.push({ op, tuple, error: cause instanceof Error ? cause.message : String(cause) });
+      const error = cause instanceof Error ? cause.message : String(cause);
+      const failure: RbaExportFailure = { op, tuple, error };
+      failures.push(failure);
+
+      const { rows: upserted } = await db.query<{ consecutive_failures: number }>(
+        `insert into rba_export_dead_letter
+           (object_ns, object_id, relation, subject_ns, subject_id, op, consecutive_failures, last_error, last_attempted_at)
+         values ($1, $2, $3, $4, $5, $6, 1, $7, now())
+         on conflict (object_ns, object_id, relation, subject_ns, subject_id, op) do update
+           set consecutive_failures = rba_export_dead_letter.consecutive_failures + 1,
+               last_error = excluded.last_error,
+               last_attempted_at = now()
+         returning consecutive_failures`,
+        [
+          tuple.objectNs,
+          tuple.objectId,
+          tuple.relation,
+          tuple.subjectNs,
+          tuple.subjectId,
+          op,
+          error,
+        ],
+      );
+      if ((upserted[0]?.consecutive_failures ?? 1) >= deadLetterThreshold) {
+        deadLettered.push(failure);
+      }
     }
     const isLast = i === ops.length - 1;
     if (!isLast && delayMs > 0) await sleep(delayMs);
   }
 
-  const synced = failures.length === 0;
+  // A dead-lettered failure doesn't block the watermark — that's the
+  // whole point of crossing the threshold; only a still-fresh failure
+  // does, exactly as every failure did before dead-lettering existed.
+  const blockingFailures = failures.filter((f) => !deadLettered.includes(f));
+  const synced = blockingFailures.length === 0;
   if (synced) {
     await db.query(
       `insert into rba_export_state (exporter, last_synced_at)
@@ -287,5 +475,5 @@ export async function runRbaExport(
     );
   }
 
-  return { synced, written, deleted, failures };
+  return { synced, written, deleted, failures, deadLettered };
 }

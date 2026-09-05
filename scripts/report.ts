@@ -6,8 +6,11 @@
  *   DATABASE_URL=... npm run report > report.txt
  *
  * PRINCIPAL_GRAPH_REPORT_DENIAL_DAYS / PRINCIPAL_GRAPH_REPORT_DENIAL_LIMIT
- * override the denials section's window/row cap (defaults: 30 days, 50 rows)
- * — see src/views/report.ts's own defaults.
+ * override the denials section's window/row cap (defaults: 30 days, 50 rows).
+ * PRINCIPAL_GRAPH_REPORT_UNUSED_GRANT_LIMIT / PRINCIPAL_GRAPH_REPORT_TRIFECTA_LIMIT
+ * do the same for the other two uncapped-until-now sections (both default
+ * 50 rows) — see src/views/report.ts's own defaults and BuildReportOptions'
+ * doc comments for why these exist at all.
  */
 
 import { createPool } from '../src/db.js';
@@ -26,6 +29,8 @@ async function main(): Promise<void> {
     const report = await buildReport(pool, {
       denialWindowDays: envInt('PRINCIPAL_GRAPH_REPORT_DENIAL_DAYS'),
       denialLimit: envInt('PRINCIPAL_GRAPH_REPORT_DENIAL_LIMIT'),
+      unusedGrantLimit: envInt('PRINCIPAL_GRAPH_REPORT_UNUSED_GRANT_LIMIT'),
+      trifectaLimit: envInt('PRINCIPAL_GRAPH_REPORT_TRIFECTA_LIMIT'),
     });
     process.stdout.write(formatReport(report));
   } finally {

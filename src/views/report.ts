@@ -121,6 +121,10 @@ export interface Report {
   /** True if there were more denials in the window than denialLimit returned. */
   denialsTruncated: boolean;
   denials: DenialRow[];
+  /** True if there were more unused grants than unusedGrantLimit returned — see that option's own doc comment. */
+  unusedGrantsTruncated: boolean;
+  /** True if there were more trifecta-exposed principals than trifectaLimit returned. */
+  trifectaTruncated: boolean;
 }
 
 /**
@@ -154,17 +158,40 @@ export function resolveName(displayName: string | null, externalId: string): str
 
 const DEFAULT_DENIAL_WINDOW_DAYS = 30;
 const DEFAULT_DENIAL_LIMIT = 50;
+/**
+ * Unused grants and trifecta exposure had no cap at all until now — a
+ * real deployment with 18k live grants produced a report that printed
+ * 18,091 lines, the exact thing the report's own bar ("reads in two
+ * minutes") exists to prevent. denialLimit already proved the shape:
+ * cap the array `buildReport()` returns (so `/report.json` sees the same
+ * bound `formatReport()`'s prose does), expose a `*Truncated` flag, and
+ * let `formatReport()` print an "N more" line instead of silently
+ * dropping rows with no trace. Both sections are already sorted
+ * most-actionable-first before this cap applies (unusedGrants by danger
+ * rank, ties by how long a grant's sat unused; trifectaExposure
+ * alphabetically, since there's no risk ranking between two principals
+ * that already hold the full trifecta) — cutting the tail keeps exactly
+ * the rows worth reading first.
+ */
+const DEFAULT_UNUSED_GRANT_LIMIT = 50;
+const DEFAULT_TRIFECTA_LIMIT = 50;
 
 export interface BuildReportOptions {
   /** How many days of `event` history the denials section covers. Default 30. */
   denialWindowDays?: number;
   /** Caps how many denials are returned (newest first) — a wall of hundreds of rows defeats "reads in two minutes". Default 50. */
   denialLimit?: number;
+  /** Caps how many unused-grant rows are returned (riskiest, then longest-unused, first) — see this option's own header comment. Default 50. */
+  unusedGrantLimit?: number;
+  /** Caps how many trifecta-exposure rows are returned. Default 50. */
+  trifectaLimit?: number;
 }
 
 export async function buildReport(db: Queryable, opts: BuildReportOptions = {}): Promise<Report> {
   const denialWindowDays = opts.denialWindowDays ?? DEFAULT_DENIAL_WINDOW_DAYS;
   const denialLimit = opts.denialLimit ?? DEFAULT_DENIAL_LIMIT;
+  const unusedGrantLimit = opts.unusedGrantLimit ?? DEFAULT_UNUSED_GRANT_LIMIT;
+  const trifectaLimit = opts.trifectaLimit ?? DEFAULT_TRIFECTA_LIMIT;
 
   const [unusedGrantRows, trifectaRows, onBehalfOfRows, denialRows] = await Promise.all([
     db.query<{
@@ -279,7 +306,7 @@ export async function buildReport(db: Queryable, opts: BuildReportOptions = {}):
     ),
   ]);
 
-  const unusedGrants: UnusedGrantRow[] = unusedGrantRows.rows
+  const unusedGrantsSorted: UnusedGrantRow[] = unusedGrantRows.rows
     .map((r) => ({
       principalKind: r.principal_kind,
       principal: resolveName(r.principal, r.principal_external_id),
@@ -301,8 +328,10 @@ export async function buildReport(db: Queryable, opts: BuildReportOptions = {}):
       // doc comment.
       return a.firstObservedAt.getTime() - b.firstObservedAt.getTime();
     });
+  const unusedGrantsTruncated = unusedGrantsSorted.length > unusedGrantLimit;
+  const unusedGrants = unusedGrantsSorted.slice(0, unusedGrantLimit);
 
-  const trifectaExposure: TrifectaRow[] = trifectaRows.rows
+  const trifectaSorted: TrifectaRow[] = trifectaRows.rows
     .map((r) => ({
       principalId: r.id,
       kind: r.kind,
@@ -310,6 +339,8 @@ export async function buildReport(db: Queryable, opts: BuildReportOptions = {}):
       capabilities: r.capabilities,
     }))
     .sort((a, b) => a.displayName.localeCompare(b.displayName));
+  const trifectaTruncated = trifectaSorted.length > trifectaLimit;
+  const trifectaExposure = trifectaSorted.slice(0, trifectaLimit);
 
   const actingOnBehalfOf: OnBehalfOfRow[] = onBehalfOfRows.rows.map((r) => ({
     agentKind: r.agent_kind,
@@ -334,7 +365,9 @@ export async function buildReport(db: Queryable, opts: BuildReportOptions = {}):
     generatedAt: new Date(),
     unusedGrantWindowDays: 90,
     unusedGrants,
+    unusedGrantsTruncated,
     trifectaExposure,
+    trifectaTruncated,
     actingOnBehalfOf,
     denialWindowDays,
     denialsTruncated,
@@ -402,6 +435,11 @@ export function formatReport(report: Report): string {
     lines.push('  None — every live grant has been used in the window.');
   } else {
     for (const row of report.unusedGrants) lines.push(formatUnusedGrant(row));
+    if (report.unusedGrantsTruncated) {
+      lines.push(
+        `  ... more unused grants exist than shown here (the ${report.unusedGrants.length} riskiest/longest-unused only — raise unusedGrantLimit, or read /report.json for the rest).`,
+      );
+    }
   }
   lines.push('');
 
@@ -416,6 +454,11 @@ export function formatReport(report: Report): string {
     lines.push('  None — no principal currently holds all three at once.');
   } else {
     for (const row of report.trifectaExposure) lines.push(formatTrifectaRow(row));
+    if (report.trifectaTruncated) {
+      lines.push(
+        `  ... more trifecta-exposed principals exist than shown here (${report.trifectaExposure.length} shown — raise trifectaLimit, or read /report.json for the rest).`,
+      );
+    }
   }
   lines.push('');
 

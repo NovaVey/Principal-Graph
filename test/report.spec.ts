@@ -447,6 +447,88 @@ void test("buildReport's denials respect the day window and the row limit", asyn
   assert.equal(wideReport.denialsTruncated, true);
 });
 
+void test('buildReport caps unused grants and trifecta exposure, keeping the riskiest/first-sorted rows, with an "N more" line in the text output', async () => {
+  const agent = await ensurePrincipal(pool, {
+    kind: 'agent',
+    source: 'manual',
+    externalId: 'cap-test-agent',
+  });
+
+  // Three write_irreversible grants, oldest first — with unusedGrantLimit: 2,
+  // only the two oldest (most-worth-a-look, per the sort) should survive.
+  for (const [i, ts] of ['2020-01-01', '2020-06-01', '2021-01-01'].entries()) {
+    const tool = await ensureResource(pool, {
+      kind: 'tool',
+      source: 'manual',
+      externalId: `cap-tool-${i}`,
+      displayName: `Cap Tool ${i}`,
+    });
+    await setResourceCapabilities(pool, tool, ['write_irreversible']);
+    await grant(agent, tool, new Date(`${ts}T00:00:00Z`));
+  }
+
+  const full = await buildReport(pool);
+  assert.equal(full.unusedGrants.length, 3);
+  assert.equal(full.unusedGrantsTruncated, false);
+
+  const capped = await buildReport(pool, { unusedGrantLimit: 2 });
+  assert.equal(capped.unusedGrants.length, 2);
+  assert.equal(capped.unusedGrantsTruncated, true);
+  assert.deepEqual(
+    capped.unusedGrants.map((g) => g.resource),
+    ['Cap Tool 0', 'Cap Tool 1'],
+    'kept the two oldest (riskiest tie-break) — not an arbitrary two',
+  );
+
+  const text = formatReport(capped);
+  assert.ok(
+    text.includes('more unused grants exist than shown here'),
+    'a truncated section must say so in the text report',
+  );
+  assert.ok(
+    !text.includes('Cap Tool 2'),
+    'the dropped row must not appear in the text output either',
+  );
+
+  // Trifecta: three fully-exposed principals, capped to 1.
+  const readTool = await ensureResource(pool, {
+    kind: 'tool',
+    source: 'manual',
+    externalId: 'cap-read',
+  });
+  await setResourceCapabilities(pool, readTool, ['read_private']);
+  const ingestTool = await ensureResource(pool, {
+    kind: 'tool',
+    source: 'manual',
+    externalId: 'cap-ingest',
+  });
+  await setResourceCapabilities(pool, ingestTool, ['ingest_untrusted']);
+  const egressTool = await ensureResource(pool, {
+    kind: 'tool',
+    source: 'manual',
+    externalId: 'cap-egress',
+  });
+  await setResourceCapabilities(pool, egressTool, ['egress']);
+
+  for (const name of ['Alice Agent', 'Bob Agent']) {
+    const p = await ensurePrincipal(pool, {
+      kind: 'agent',
+      source: 'manual',
+      externalId: name.toLowerCase().replace(' ', '-'),
+      displayName: name,
+    });
+    await grant(p, readTool);
+    await grant(p, ingestTool);
+    await grant(p, egressTool);
+  }
+
+  const cappedTrifecta = await buildReport(pool, { unusedGrantLimit: 2, trifectaLimit: 1 });
+  assert.equal(cappedTrifecta.trifectaExposure.length, 1);
+  assert.equal(cappedTrifecta.trifectaTruncated, true);
+  const trifectaText = formatReport(cappedTrifecta);
+  assert.ok(trifectaText.includes('more trifecta-exposed principals exist than shown here'));
+});
+
 void test('buildReport falls back to external_id when display_name is null, in every section', async () => {
   // Neither ensurePrincipal nor ensureResource is given a displayName here —
   // this is exactly what a bare adapter call (e.g. broker-audit-sink.ts's

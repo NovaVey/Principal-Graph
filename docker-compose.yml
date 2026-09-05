@@ -1,0 +1,75 @@
+# Replaces README's own Quick Start dance (a manual `docker run postgres`
+# plus three `docker exec ... psql -f schema/*.sql` lines) with one
+# command: `docker compose up`. Postgres, the migration runner, and the
+# report server; every adapter is still its own separate, explicit
+# invocation (`docker compose run --rm sync`, or
+# `docker compose run --rm app node dist/scripts/run-github-adapter.js`)
+# — nothing here guesses which of your sources are actually configured
+# the way `npm run sync` (scripts/run-sync.ts) already does for you.
+#
+#   docker compose up            # postgres + migrate + the report server
+#   docker compose run --rm sync # everything npm run sync would run, configured via .env
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: devpass
+      POSTGRES_DB: principalgraph
+    ports:
+      - '5432:5432'
+    volumes:
+      - principalgraph-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  migrate:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:devpass@postgres:5432/principalgraph
+    command: ['node', 'dist/scripts/run-migrations.js']
+
+  # `docker compose up` only ever starts this and `postgres` (see
+  # `depends_on` below) — `sync` and any one-off adapter run are meant to
+  # be invoked explicitly (`docker compose run --rm sync`), the same way
+  # this repo's own README never suggests running every adapter on every
+  # `npm install`.
+  app:
+    build: .
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql://postgres:devpass@postgres:5432/principalgraph
+      # PRINCIPAL_GRAPH_REPORT_API_KEY is required — see src/server.ts's
+      # own header on why there's no default. Set it in a real .env file
+      # (never committed) rather than hardcoding it here.
+      PRINCIPAL_GRAPH_REPORT_API_KEY: ${PRINCIPAL_GRAPH_REPORT_API_KEY:?set PRINCIPAL_GRAPH_REPORT_API_KEY (a .env file, or your shell) before running this}
+    ports:
+      - '8080:8080'
+
+  # `docker compose run --rm sync` — every adapter this deployment has
+  # actually configured, in one pass. Reads the exact same
+  # PRINCIPAL_GRAPH_*/RBA_*/GOOGLE_APPLICATION_CREDENTIALS env vars
+  # scripts/run-sync.ts's own header documents; set whichever ones you
+  # use in a .env file (docker compose reads one automatically) — a
+  # source you haven't configured is skipped, not an error.
+  sync:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:devpass@postgres:5432/principalgraph
+    profiles: ['tools']
+    command: ['node', 'dist/scripts/run-sync.js']
+
+volumes:
+  principalgraph-data:

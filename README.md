@@ -82,6 +82,7 @@ feeds, and what it doesn't do yet.
   - [16. Answer "which run touched this grant"](#16-answer-which-run-touched-this-grant)
   - [17. Stop treating deleted resources as live forever](#17-stop-treating-deleted-resources-as-live-forever)
   - [18. Prevent two runs of the same adapter from overlapping](#18-prevent-two-runs-of-the-same-adapter-from-overlapping)
+  - [19. Run every configured adapter in one command](#19-run-every-configured-adapter-in-one-command)
 - [Data model](#data-model)
 - [Project layout](#project-layout)
 - [Development](#development)
@@ -153,6 +154,21 @@ so editing one after the fact is a loud error instead of an undetectable
 rewrite of schema history — pointed for a project whose whole thesis is
 tamper evidence. CI uses it too. See that script's own header for how to
 adopt it on a database that already has some migrations applied the old way.
+
+**Running the packaged app, not developing against it?** This isn't
+published as an npm package yet (see [Usage 1](#1-wire-your-broker-to-the-event-log)),
+but it is a real Docker image — `Dockerfile`/`docker-compose.yml`, this
+repo's root:
+
+```bash
+PRINCIPAL_GRAPH_REPORT_API_KEY=... docker compose up   # postgres + migrate + the report server
+docker compose run --rm sync                            # everything npm run sync would run — see Usage 19
+```
+
+One image, every script: `docker run <image> node dist/scripts/run-github-adapter.js`
+runs any adapter directly, the same compiled output `docker compose up`'s
+own `app`/`migrate` services already run — see the Dockerfile's own header
+for why it ships compiled JS rather than the whole TypeScript toolchain.
 
 ## Usage
 
@@ -901,6 +917,35 @@ whole run in it.
 > refused immediately with `AdapterAlreadyRunningError` while the first is
 > still running, and completes normally once the first finishes.
 
+### 19. Run every configured adapter in one command
+
+```bash
+DATABASE_URL=... npm run sync
+DATABASE_URL=... npm run sync -- --dry-run
+```
+
+Scheduling used to mean a scheduler knowing about, and keeping in sync by
+hand, all eleven separate `npm run adapter:*`/`export:rba` entries —
+[Usage 18](#18-prevent-two-runs-of-the-same-adapter-from-overlapping)'s
+own "all seven scheduled scripts" count is exactly the list this
+collapses into one cron entry. `scripts/run-sync.ts` runs the five grant
+adapters, the usage adapter, and the RBA exporter, in that order (the RBA
+exporter last, since it should reflect `grant_edge` as it stands *after*
+every adapter above has had its turn this pass) — as real child
+processes, never re-implemented: this never touches an adapter's own
+argv parsing, run-history wrapping, or overlap lock, it only decides
+which scripts have enough configuration to attempt this pass at all. A
+step whose required env vars aren't all set is skipped and reported as
+skipped — never silently absent, and never left to crash confusingly
+partway through its own real logic. `mcp-config` has no required
+configuration at all, so it always runs. `--dry-run` (or any other flag)
+is forwarded as-is to every step; the usage adapter and the RBA exporter
+don't parse it at all, so it's simply ignored there, same as passing an
+argument a script doesn't look at.
+
+Exits nonzero if any invoked step failed — built for cron, same shape as
+every other script here.
+
 ## Data model
 
 Five tables (`schema/001_core.sql`):
@@ -1043,8 +1088,11 @@ scripts/
   run-verify-chain.ts          npm run verify-chain
   run-server.ts               npm run serve
   run-policy-check.ts          npm run policy-check
+  run-sync.ts                  npm run sync — every configured adapter, one command
   report.ts                  npm run report
 test/                one *.spec.ts per module, run against a real Postgres
+Dockerfile             one image, compiled JS — CMD defaults to the report server
+docker-compose.yml     postgres + migrate + the report server; `run --rm sync` for everything else
 ```
 
 Adapters only write; views only read. Nothing in `adapters/` imports from
@@ -1073,7 +1121,10 @@ npm run format:check
 
 CI (`.github/workflows/ci.yml`) runs the `verify` sequence on every push/PR,
 across Node 20/22/24, against a `postgres:16` service container, plus a
-`gitleaks` secret-scan job. `schema/001_core.sql`, `src/model.ts`, and
+`gitleaks` secret-scan job and a `docker` job that builds the real
+Dockerfile/docker-compose.yml this repo ships and smoke-tests the
+compiled image (migrate, serve, `npm run sync`'s own equivalent — see
+Quick Start). `schema/001_core.sql`, `src/model.ts`, and
 `src/log.ts` are specified byte-for-byte by this project's build brief and
 are excluded from `format`/`format:check` — see `.prettierignore` and
 `eslint.config.js`'s own comments before "fixing" a lint/format finding in

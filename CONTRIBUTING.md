@@ -81,6 +81,8 @@ what a new test actually exercises.
 ## Opening a PR
 
 CI (`.github/workflows/ci.yml`) runs the same `verify` sequence across
-Node 20/22/24 against a real `postgres:16` service container, plus lint
-and a secret scan. All of it needs to be green — see README's
-[Development](README.md#development) section for exactly what CI runs.
+Node 20/22/24 against a real `postgres:16` service container, plus lint,
+a secret scan, and a real Docker build + smoke test of the shipped
+`Dockerfile`/`docker-compose.yml`. All of it needs to be green — see
+README's [Development](README.md#development) section for exactly what
+CI runs.

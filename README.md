@@ -10,7 +10,7 @@ questions that currently need two different tools and a person to join by
 hand — a grant graph plus a tamper-evident event log, for companies too small
 to have a security team.
 
-**v1.0.0.** The event log, the broker integration that feeds it, capability
+**v1.1.0.** The event log, the broker integration that feeds it, capability
 classification, five grant-source adapters (MCP config, GitHub, AWS,
 Google Workspace, Postgres), a Postgres *usage* adapter (the first on the
 other side of the ledger — see [Usage 14](#14-track-real-postgres-query-activity)),
@@ -38,7 +38,23 @@ of silently connecting to the wrong database, an adapter policy names but
 that has never actually run is now a violation, an edited already-applied
 migration is now detected, `permissions.ask`/scoped `deny` entries are
 read correctly, and a mass-violation Slack alert can no longer exceed
-Slack's own message-size limit and get silently dropped). See
+Slack's own message-size limit and get silently dropped).
+
+A third pass measured this project's own real ceilings and closed five
+more: broker-sink writes are now batched under one advisory-lock hold
+instead of one per event, the fix for a measured ~1,100 events/sec
+ceiling on the naive per-event path ([Usage 1](#1-wire-your-broker-to-the-event-log));
+`chain-intact` now verifies only what changed since the last checkpoint
+instead of replaying the whole chain on every `policy-check` tick,
+confirmed at 100k rows to have cost 1.2s and 100MB+ RSS the old way
+([Usage 13](#13-verify-the-event-chain-hasnt-been-tampered-with)); a
+caller-supplied future timestamp on a broker event can no longer
+permanently mask a stale grant; the report's unused-grants and
+trifecta-exposure sections are capped the same way denials already were,
+instead of printing thousands of rows unbounded ([Usage 7](#7-run-the-report));
+and the report server now runs under its own read-only Postgres role
+instead of sharing every adapter's full-access credential
+([Usage 9](#9-serve-the-report-over-http)). See
 [Related projects](#related-projects) for what feeds this repo, what it
 feeds, and what it doesn't do yet.
 

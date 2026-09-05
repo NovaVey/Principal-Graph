@@ -1003,6 +1003,7 @@ rba/
   principal-graph.authz  RBA's own namespace schema for this project's grant data
 src/
   model.ts          shared types every adapter/view imports from
+  resource-vocabulary.ts  the real, current resource.kind/relation list — model.ts's own unions are frozen and already stale
   log.ts             hash-chained append + chain verifier
   chain-hash.ts       log.ts's own hash format, duplicated for code that can't touch that frozen file
   event-batch.ts      appendEventBatch()/EventBatcher — batches event appends under one lock hold

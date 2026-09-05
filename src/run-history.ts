@@ -10,8 +10,16 @@
 
 import type { Queryable } from './upsert.js';
 
-/** The source strings this covers — the five adapters' own grant_edge.source values, plus 'rba-export' for the exporter. See schema/004_adapter_runs.sql's own comment. */
-export type AdapterName = 'mcp-config' | 'github' | 'aws' | 'workspace' | 'postgres' | 'rba-export';
+/**
+ * The source strings this covers — the five grant adapters' own
+ * grant_edge.source values, 'postgres-usage' for the usage adapter
+ * (src/adapters/postgres-usage.ts — a distinct name from 'postgres'
+ * itself, since it's a separate scheduled process with its own success/
+ * failure history, even though it shares that adapter's `source` on the
+ * rows it writes), and 'rba-export' for the exporter.
+ */
+export type AdapterName =
+  'mcp-config' | 'github' | 'aws' | 'workspace' | 'postgres' | 'postgres-usage' | 'rba-export';
 
 /** Inserts an in-progress row (finished_at/status still null) and returns its id — pass that id to finishRun() once the work completes or fails. */
 export async function startRun(

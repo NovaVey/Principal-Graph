@@ -174,6 +174,122 @@ void test('buildReport surfaces trifecta exposure', async () => {
   );
 });
 
+void test('buildReport surfaces who a human behind an agent is, most-recent-first', async () => {
+  const agent = await ensurePrincipal(pool, {
+    kind: 'agent',
+    source: 'manual',
+    externalId: 'deploy-bot',
+    displayName: 'Deploy Bot',
+  });
+  const alice = await ensurePrincipal(pool, {
+    kind: 'human',
+    source: 'manual',
+    externalId: 'alice',
+    displayName: 'Alice',
+  });
+  const bob = await ensurePrincipal(pool, {
+    kind: 'human',
+    source: 'manual',
+    externalId: 'bob',
+    displayName: 'Bob',
+  });
+  const prodBucket = await ensureResource(pool, {
+    kind: 'bucket',
+    source: 'manual',
+    externalId: 'prod',
+    displayName: 'Prod Bucket',
+  });
+
+  await appendEvent(pool, {
+    occurredAt: new Date('2024-01-01T00:00:00Z'),
+    principalId: agent,
+    onBehalfOf: alice,
+    resourceId: prodBucket,
+    action: 'call',
+    decision: 'allow',
+    denyReason: null,
+    taintLabels: [],
+    reversible: true,
+    requestDigest: null,
+  });
+  // A more recent event for the same triple — must collapse to one row,
+  // with the later timestamp, not one row per event.
+  await appendEvent(pool, {
+    occurredAt: new Date('2024-06-01T00:00:00Z'),
+    principalId: agent,
+    onBehalfOf: alice,
+    resourceId: prodBucket,
+    action: 'call',
+    decision: 'allow',
+    denyReason: null,
+    taintLabels: [],
+    reversible: true,
+    requestDigest: null,
+  });
+  // A different human, earlier — must sort after Alice's (most-recent-first).
+  await appendEvent(pool, {
+    occurredAt: new Date('2024-03-01T00:00:00Z'),
+    principalId: agent,
+    onBehalfOf: bob,
+    resourceId: prodBucket,
+    action: 'call',
+    decision: 'allow',
+    denyReason: null,
+    taintLabels: [],
+    reversible: true,
+    requestDigest: null,
+  });
+  // No on_behalf_of at all — must not show up here.
+  await appendEvent(pool, {
+    occurredAt: new Date(),
+    principalId: agent,
+    onBehalfOf: null,
+    resourceId: prodBucket,
+    action: 'call',
+    decision: 'allow',
+    denyReason: null,
+    taintLabels: [],
+    reversible: true,
+    requestDigest: null,
+  });
+  // A denied call on behalf of a human — must not show up (this section
+  // is about attributed activity, not blocked attempts).
+  const carol = await ensurePrincipal(pool, {
+    kind: 'human',
+    source: 'manual',
+    externalId: 'carol',
+    displayName: 'Carol',
+  });
+  await appendEvent(pool, {
+    occurredAt: new Date(),
+    principalId: agent,
+    onBehalfOf: carol,
+    resourceId: prodBucket,
+    action: 'call',
+    decision: 'deny',
+    denyReason: 'blocked',
+    taintLabels: [],
+    reversible: true,
+    requestDigest: null,
+  });
+
+  const report = await buildReport(pool);
+  assert.equal(report.actingOnBehalfOf.length, 2);
+  assert.equal(report.actingOnBehalfOf[0]?.human, 'Alice');
+  assert.equal(report.actingOnBehalfOf[0]?.agent, 'Deploy Bot');
+  assert.equal(report.actingOnBehalfOf[0]?.resource, 'Prod Bucket');
+  assert.equal(
+    report.actingOnBehalfOf[0]?.lastOccurredAt.toISOString(),
+    new Date('2024-06-01T00:00:00Z').toISOString(),
+  );
+  assert.equal(report.actingOnBehalfOf[1]?.human, 'Bob');
+
+  const text = formatReport(report);
+  assert.ok(text.includes('ACTING ON BEHALF OF'));
+  assert.ok(text.includes('"Deploy Bot" (agent) acted for "Alice" on Prod Bucket'));
+  assert.ok(!text.includes('Carol'));
+});
+
 void test("buildReport's denials respect the day window and the row limit", async () => {
   const agent = await ensurePrincipal(pool, {
     kind: 'agent',
@@ -296,6 +412,9 @@ void test('formatReport reads as plain text with friendly empty states and no ra
   const emptyText = formatReport(emptyReport);
   assert.ok(emptyText.includes('None — every live grant has been used'));
   assert.ok(emptyText.includes('None — no principal currently holds all three'));
+  assert.ok(
+    emptyText.includes('None — no event has ever recorded who a human behind an agent was'),
+  );
   assert.ok(emptyText.includes('None in the window'));
   // No internal jargon leaking into the prose.
   for (const jargon of ['sinkClass', 'TaintLevel', 'capability model', 'severity']) {
@@ -333,6 +452,7 @@ void test('formatReport reads as plain text with friendly empty states and no ra
   const text = formatReport(report);
   assert.ok(text.includes('UNUSED GRANTS'));
   assert.ok(text.includes('TRIFECTA EXPOSURE'));
+  assert.ok(text.includes('ACTING ON BEHALF OF'));
   assert.ok(text.includes('DENIALS'));
   assert.ok(text.includes('Shell Exec'));
   assert.ok(text.includes('Format Test Agent'));

@@ -13,11 +13,25 @@ import { evaluatePolicies, POLICIES, type PolicyRule } from '../src/policies.js'
 import { appendEvent } from '../src/log.js';
 import { ensurePrincipal, ensureResource } from '../src/upsert.js';
 import { setResourceCapabilities } from '../src/capabilities.js';
+import { startRun, finishRun } from '../src/run-history.js';
 import { pool, resetDatabase } from './helpers.js';
 
-before(resetDatabase);
-beforeEach(resetDatabase);
+/**
+ * resetDatabase() (test/helpers.ts) doesn't touch adapter_run — it's
+ * schema/004's own table, outside the core graph it truncates, and only
+ * test/run-history.spec.ts otherwise owns resetting it. The
+ * adapter-freshness tests below write to it directly, so this file resets
+ * it too, the same way run-history.spec.ts's own resetAdapterRuns() does.
+ */
+async function resetForPoliciesTests(): Promise<void> {
+  await resetDatabase();
+  await pool.query('truncate table adapter_run');
+}
+
+before(resetForPoliciesTests);
+beforeEach(resetForPoliciesTests);
 after(async () => {
+  await pool.query('truncate table adapter_run');
   await pool.end();
 });
 
@@ -264,6 +278,212 @@ void test('evaluatePolicies with no rule list defaults to POLICIES and aggregate
   );
   assert.deepEqual(
     POLICIES.map((p) => p.kind),
-    ['no-trifecta', 'stale-grant'],
+    ['no-trifecta', 'stale-grant', 'chain-intact', 'on-behalf-of-escalation'],
   );
+});
+
+void test('chain-intact: no violation on an intact chain', async () => {
+  const agent = await ensurePrincipal(pool, { kind: 'agent', source: 'manual', externalId: 'a1' });
+  const tool = await ensureResource(pool, { kind: 'tool', source: 'manual', externalId: 't1' });
+  await appendEvent(pool, {
+    occurredAt: new Date(),
+    principalId: agent,
+    onBehalfOf: null,
+    resourceId: tool,
+    action: 'call',
+    decision: 'allow',
+    denyReason: null,
+    taintLabels: [],
+    reversible: true,
+    requestDigest: null,
+  });
+
+  const violations = await evaluatePolicies(pool, [{ kind: 'chain-intact' }]);
+  assert.deepEqual(violations, []);
+});
+
+void test('chain-intact: a violation, with a readable description, when a row is tampered with directly', async () => {
+  const agent = await ensurePrincipal(pool, { kind: 'agent', source: 'manual', externalId: 'a1' });
+  const tool = await ensureResource(pool, { kind: 'tool', source: 'manual', externalId: 't1' });
+  const first = await appendEvent(pool, {
+    occurredAt: new Date(),
+    principalId: agent,
+    onBehalfOf: null,
+    resourceId: tool,
+    action: 'call',
+    decision: 'allow',
+    denyReason: null,
+    taintLabels: [],
+    reversible: true,
+    requestDigest: null,
+  });
+
+  // Bypass appendEvent() entirely, the way a rogue UPDATE would — same
+  // tampering shape as test/log.spec.ts's own verifyChain test.
+  await pool.query('update event set action = $1 where id = $2', ['tampered', first.id]);
+
+  const violations = await evaluatePolicies(pool, [{ kind: 'chain-intact' }]);
+  assert.equal(violations.length, 1);
+  assert.equal(violations[0]?.rule.kind, 'chain-intact');
+  assert.ok(violations[0]?.description.includes('hash no longer matches'));
+});
+
+void test('on-behalf-of-escalation: no violation when the human holds a direct grant on the resource', async () => {
+  const agent = await ensurePrincipal(pool, {
+    kind: 'agent',
+    source: 'manual',
+    externalId: 'agent1',
+  });
+  const human = await ensurePrincipal(pool, {
+    kind: 'human',
+    source: 'manual',
+    externalId: 'human1',
+  });
+  const resource = await ensureResource(pool, { kind: 'repo', source: 'manual', externalId: 'r1' });
+  await grant(human, resource, 'read');
+
+  await appendEvent(pool, {
+    occurredAt: new Date(),
+    principalId: agent,
+    onBehalfOf: human,
+    resourceId: resource,
+    action: 'call',
+    decision: 'allow',
+    denyReason: null,
+    taintLabels: [],
+    reversible: true,
+    requestDigest: null,
+  });
+
+  const violations = await evaluatePolicies(pool, [{ kind: 'on-behalf-of-escalation' }]);
+  assert.deepEqual(violations, []);
+});
+
+void test('on-behalf-of-escalation: a violation, with a readable description, when the human holds no grant there at all', async () => {
+  const agent = await ensurePrincipal(pool, {
+    kind: 'agent',
+    source: 'manual',
+    externalId: 'agent1',
+    displayName: 'Deploy Bot',
+  });
+  const human = await ensurePrincipal(pool, {
+    kind: 'human',
+    source: 'manual',
+    externalId: 'human1',
+    displayName: 'Alice',
+  });
+  const resource = await ensureResource(pool, {
+    kind: 'bucket',
+    source: 'manual',
+    externalId: 'b1',
+    displayName: 'Prod Bucket',
+  });
+
+  await appendEvent(pool, {
+    occurredAt: new Date(),
+    principalId: agent,
+    onBehalfOf: human,
+    resourceId: resource,
+    action: 'call',
+    decision: 'allow',
+    denyReason: null,
+    taintLabels: [],
+    reversible: true,
+    requestDigest: null,
+  });
+
+  const violations = await evaluatePolicies(pool, [{ kind: 'on-behalf-of-escalation' }]);
+  assert.equal(violations.length, 1);
+  assert.equal(violations[0]?.rule.kind, 'on-behalf-of-escalation');
+  assert.ok(violations[0]?.description.includes('Deploy Bot'));
+  assert.ok(violations[0]?.description.includes('Alice'));
+  assert.ok(violations[0]?.description.includes('Prod Bucket'));
+});
+
+void test('on-behalf-of-escalation: no violation for an event with no on_behalf_of at all', async () => {
+  const agent = await ensurePrincipal(pool, {
+    kind: 'agent',
+    source: 'manual',
+    externalId: 'agent1',
+  });
+  const resource = await ensureResource(pool, {
+    kind: 'bucket',
+    source: 'manual',
+    externalId: 'b1',
+  });
+  await appendEvent(pool, {
+    occurredAt: new Date(),
+    principalId: agent,
+    onBehalfOf: null,
+    resourceId: resource,
+    action: 'call',
+    decision: 'allow',
+    denyReason: null,
+    taintLabels: [],
+    reversible: true,
+    requestDigest: null,
+  });
+
+  const violations = await evaluatePolicies(pool, [{ kind: 'on-behalf-of-escalation' }]);
+  assert.deepEqual(violations, []);
+});
+
+void test('adapter-freshness: no violation for a recent successful real run', async () => {
+  const runId = await startRun(pool, 'github');
+  await finishRun(pool, runId, { status: 'success', detail: 'ok' });
+
+  const violations = await evaluatePolicies(pool, [
+    { kind: 'adapter-freshness', adapter: 'github', maxAgeHours: 24 },
+  ]);
+  assert.deepEqual(violations, []);
+});
+
+void test('adapter-freshness: a violation for a stale successful run, a failed run, and a never-finished run', async () => {
+  const stale = await startRun(pool, 'aws');
+  await pool.query(
+    `update adapter_run set started_at = now() - interval '48 hours' where id = $1`,
+    [stale],
+  );
+  await finishRun(pool, stale, { status: 'success', detail: 'ok' });
+  await pool.query(
+    `update adapter_run set finished_at = now() - interval '48 hours' where id = $1`,
+    [stale],
+  );
+
+  const violations = await evaluatePolicies(pool, [
+    { kind: 'adapter-freshness', adapter: 'aws', maxAgeHours: 24 },
+  ]);
+  assert.equal(violations.length, 1);
+  assert.ok(violations[0]?.description.includes('aws'));
+  assert.ok(violations[0]?.description.includes('48h ago'));
+});
+
+void test('adapter-freshness: a violation for the most recent real run having failed, regardless of age', async () => {
+  const runId = await startRun(pool, 'workspace');
+  await finishRun(pool, runId, { status: 'failure', error: 'boom' });
+
+  const violations = await evaluatePolicies(pool, [
+    { kind: 'adapter-freshness', adapter: 'workspace', maxAgeHours: 24 },
+  ]);
+  assert.equal(violations.length, 1);
+  assert.ok(violations[0]?.description.includes('failed: boom'));
+});
+
+void test('adapter-freshness: no violation when nothing has ever run for that adapter', async () => {
+  const violations = await evaluatePolicies(pool, [
+    { kind: 'adapter-freshness', adapter: 'postgres', maxAgeHours: 24 },
+  ]);
+  assert.deepEqual(violations, []);
+});
+
+void test('adapter-freshness: a dry run alone does not count as evidence of freshness', async () => {
+  const runId = await startRun(pool, 'mcp-config', { dryRun: true });
+  await finishRun(pool, runId, { status: 'success', detail: 'preview only' });
+
+  const violations = await evaluatePolicies(pool, [
+    { kind: 'adapter-freshness', adapter: 'mcp-config', maxAgeHours: 24 },
+  ]);
+  // Same "nothing to report yet" stance as "never run at all" — a
+  // dry-run-only history isn't a freshness violation to guess at.
+  assert.deepEqual(violations, []);
 });

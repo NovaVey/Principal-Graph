@@ -19,13 +19,19 @@
  * that's still what the report is for.
  */
 
+import type { Pool } from 'pg';
 import type { Queryable } from './upsert.js';
 import type { Relation } from './model.js';
 import { resolveName } from './views/report.js';
+import { verifyChain } from './log.js';
+import type { AdapterName } from './run-history.js';
 
 export type PolicyRule =
   | { kind: 'no-trifecta' }
-  | { kind: 'stale-grant'; relations: readonly Relation[]; maxUnusedDays: number };
+  | { kind: 'stale-grant'; relations: readonly Relation[]; maxUnusedDays: number }
+  | { kind: 'chain-intact' }
+  | { kind: 'on-behalf-of-escalation' }
+  | { kind: 'adapter-freshness'; adapter: AdapterName; maxAgeHours: number };
 
 export interface PolicyViolation {
   rule: PolicyRule;
@@ -42,14 +48,39 @@ export interface PolicyViolation {
  *     matching allow event) but with a configurable window and relation
  *     filter — `unused_grant`'s own 90-day window is hardcoded (see
  *     src/views/report.ts's own comment on it), so this rule runs its
- *     own parameterized query instead of reusing that view. It also fixes
- *     a gap the view still has (frozen, so unfixable there): matching an
- *     allow event to a grant by relation, not just (principal, resource) —
- *     see checkStaleGrant's own comment.
+ *     own parameterized query instead of reusing a view. It also carries
+ *     the relation-matching fix schema/005_unused_grant_relation_fix.sql's
+ *     own `unused_grant_by_relation` view now has too (see that
+ *     migration's header for why it's duplicated rather than shared via a
+ *     function — a real, measured performance regression, not a style
+ *     choice) — see checkStaleGrant's own comment for the fix itself, and
+ *     test/policies.spec.ts / test/report.spec.ts for the test keeping
+ *     the two behaviorally in sync.
+ *   - `chain-intact` calls src/log.ts's own verifyChain() — that function
+ *     existed, and was tested, with nothing ever actually calling it on a
+ *     schedule (see scripts/run-verify-chain.ts, the other thing that
+ *     does now). Parameterless, like `no-trifecta` — there's no
+ *     configuration a broken hash chain could possibly need.
+ *   - `on-behalf-of-escalation` is the one rule genuinely unique to this
+ *     project's own thesis (one `principal` table, `event.on_behalf_of`
+ *     tracking which human an agent is acting for): an agent's `allow`
+ *     event recorded on behalf of a human who holds no live grant on
+ *     that resource, directly, at all. See checkOnBehalfOfEscalation's
+ *     own comment for why "holds no grant at all" rather than trying to
+ *     match a specific relation.
+ *   - `adapter-freshness` is deliberately NOT in the default set below —
+ *     it needs a specific adapter name and a maximum age in hours, and
+ *     guessing either (which adapters actually run in this deployment,
+ *     what cadence counts as "fresh") is exactly the kind of guess this
+ *     project's adapters already refuse to make (see e.g.
+ *     PostgresAdapterOptions.roleTiers's own "no default" reasoning).
+ *     Configure one instance per adapter you actually schedule.
  */
 export const POLICIES: readonly PolicyRule[] = [
   { kind: 'no-trifecta' },
   { kind: 'stale-grant', relations: ['admin', 'write'], maxUnusedDays: 30 },
+  { kind: 'chain-intact' },
+  { kind: 'on-behalf-of-escalation' },
 ];
 
 async function checkNoTrifecta(db: Queryable): Promise<PolicyViolation[]> {
@@ -100,11 +131,14 @@ async function checkStaleGrant(
              -- same principal (e.g. the AWS adapter granting read+write+
              -- admin on one bucket at once) — matching on (principal,
              -- resource) alone, the way schema/001_core.sql's own
-             -- unused_grant view does (frozen, can't be fixed there), would
-             -- let one allow event mask every relation on that resource,
-             -- not just the one actually exercised. event.action carries
-             -- no dedicated relation column (schema/001_core.sql and
-             -- src/log.ts are both frozen too), so this is the workaround:
+             -- unused_grant view does (frozen, can't be fixed there — see
+             -- schema/005_unused_grant_relation_fix.sql's own
+             -- unused_grant_by_relation, which report.ts reads instead,
+             -- for the same fix applied there), would let one allow event
+             -- mask every relation on that resource, not just the one
+             -- actually exercised. event.action carries no dedicated
+             -- relation column (schema/001_core.sql and src/log.ts are
+             -- both frozen too), so this is the workaround:
              -- an event's action either IS the relation it exercised
              -- ('read', 'write', 'owner', ...) and is matched exactly, or
              -- it's 'call' — src/adapters/broker-audit-sink.ts's own
@@ -128,6 +162,136 @@ async function checkStaleGrant(
   });
 }
 
+async function checkChainIntact(db: Queryable): Promise<PolicyViolation[]> {
+  const rule: PolicyRule = { kind: 'chain-intact' };
+  // verifyChain() (src/log.ts, frozen) is typed against a real `Pool`
+  // specifically, but only ever calls `.query()` on it — the one method
+  // Queryable's PoolClient branch also has. Every actual caller of
+  // evaluatePolicies (scripts/run-policy-check.ts, this file's own tests)
+  // passes a real Pool regardless; this cast just satisfies the frozen
+  // signature, it doesn't change what runs.
+  const breaks = await verifyChain(db as Pool);
+  return breaks.map((b) => ({
+    rule,
+    description:
+      b.reason === 'hash_mismatch'
+        ? `Event chain broken at seq ${b.seq} (event ${b.eventId}): its hash no longer matches its own recorded content — the row was edited directly.`
+        : `Event chain broken at seq ${b.seq} (event ${b.eventId}): it no longer links to the row before it — a row was deleted or inserted directly.`,
+  }));
+}
+
+async function checkOnBehalfOfEscalation(db: Queryable): Promise<PolicyViolation[]> {
+  const rule: PolicyRule = { kind: 'on-behalf-of-escalation' };
+  const { rows } = await db.query<{
+    agent: string | null;
+    agent_external_id: string;
+    human: string | null;
+    human_external_id: string;
+    resource: string | null;
+    resource_external_id: string;
+  }>(
+    // Deliberately "the human holds no grant on this resource AT ALL",
+    // not "no grant matching the specific relation this event exercised"
+    // — unlike checkStaleGrant, this isn't asking "was this exact
+    // permission used," it's asking "does this human have any standing
+    // access here whatsoever." Trying to match a specific relation would
+    // reopen the exact ambiguity checkStaleGrant's own comment describes
+    // (an event's action is either a relation or the honest 'call'
+    // sentinel) for no real gain — zero grants of any kind is already an
+    // unambiguous, conservative signal on its own.
+    //
+    // Unwindowed on purpose: this checks live state (does the human hold
+    // a grant right now), not a lookback period — an escalation that
+    // happened once and was never remedied (the human still holds
+    // nothing there) stays a live violation, exactly like `no-trifecta`
+    // stays live until the underlying grants change. If the human is
+    // later granted access directly, this naturally stops flagging it —
+    // nothing to clean up by hand.
+    `select distinct ap.display_name as agent, ap.external_id as agent_external_id,
+            hp.display_name as human, hp.external_id as human_external_id,
+            r.display_name as resource, r.external_id as resource_external_id
+       from event e
+       join principal ap on ap.id = e.principal_id
+       join principal hp on hp.id = e.on_behalf_of
+       join resource  r  on r.id = e.resource_id
+      where e.decision = 'allow'
+        and e.on_behalf_of is not null
+        and not exists (
+          select 1 from grant_edge g
+           where g.principal_id = e.on_behalf_of
+             and g.resource_id  = e.resource_id
+             and g.revoked_at is null
+        )`,
+  );
+  return rows.map((r) => {
+    const agent = resolveName(r.agent, r.agent_external_id);
+    const human = resolveName(r.human, r.human_external_id);
+    const resource = resolveName(r.resource, r.resource_external_id);
+    return {
+      rule,
+      description: `"${agent}" acted on ${resource} on behalf of "${human}", who holds no grant there directly — an agent-mediated privilege escalation.`,
+    };
+  });
+}
+
+async function checkAdapterFreshness(
+  db: Queryable,
+  rule: Extract<PolicyRule, { kind: 'adapter-freshness' }>,
+): Promise<PolicyViolation[]> {
+  const { rows } = await db.query<{
+    started_at: Date;
+    finished_at: Date | null;
+    status: 'success' | 'failure' | null;
+    error: string | null;
+  }>(
+    // dry_run = false: schema/004_adapter_runs.sql's own comment on that
+    // column — a dry run is "never counted as evidence an adapter's
+    // actual grants are current," so it can't count as evidence of
+    // freshness either.
+    `select started_at, finished_at, status, error
+       from adapter_run
+      where adapter = $1 and dry_run = false
+      order by started_at desc
+      limit 1`,
+    [rule.adapter],
+  );
+  const latest = rows[0];
+  // Never run for real at all — the same "nothing to report yet" stance
+  // as latestRuns() (src/run-history.ts): an adapter this deployment has
+  // simply never configured to run for real isn't this rule's problem to
+  // guess at.
+  if (!latest) return [];
+
+  if (!latest.finished_at) {
+    const ageHours = (Date.now() - latest.started_at.getTime()) / 3_600_000;
+    if (ageHours <= rule.maxAgeHours) return [];
+    return [
+      {
+        rule,
+        description: `The '${rule.adapter}' adapter's last real run started ${Math.floor(ageHours)}h ago and never finished (still running, or the process died) — beyond this policy's ${rule.maxAgeHours}h freshness limit.`,
+      },
+    ];
+  }
+
+  if (latest.status === 'failure') {
+    return [
+      {
+        rule,
+        description: `The '${rule.adapter}' adapter's last real run failed${latest.error ? `: ${latest.error}` : ''} — its grants may no longer be current.`,
+      },
+    ];
+  }
+
+  const ageHours = (Date.now() - latest.finished_at.getTime()) / 3_600_000;
+  if (ageHours <= rule.maxAgeHours) return [];
+  return [
+    {
+      rule,
+      description: `The '${rule.adapter}' adapter last succeeded ${Math.floor(ageHours)}h ago — beyond this policy's ${rule.maxAgeHours}h freshness limit.`,
+    },
+  ];
+}
+
 /** Evaluates every given rule (default: POLICIES) against live data and returns every violation found, across all rules — never stops at the first. */
 export async function evaluatePolicies(
   db: Queryable,
@@ -141,6 +305,15 @@ export async function evaluatePolicies(
         break;
       case 'stale-grant':
         violations.push(...(await checkStaleGrant(db, rule)));
+        break;
+      case 'chain-intact':
+        violations.push(...(await checkChainIntact(db)));
+        break;
+      case 'on-behalf-of-escalation':
+        violations.push(...(await checkOnBehalfOfEscalation(db)));
+        break;
+      case 'adapter-freshness':
+        violations.push(...(await checkAdapterFreshness(db, rule)));
         break;
     }
   }

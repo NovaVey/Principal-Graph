@@ -31,7 +31,8 @@
     "policy-check": "tsx scripts/run-policy-check.ts",
     "verify-chain": "tsx scripts/run-verify-chain.ts",
     "sync": "tsx scripts/run-sync.ts",
-    "erase-identity": "tsx scripts/run-erasure.ts"
+    "erase-identity": "tsx scripts/run-erasure.ts",
+    "doctor": "tsx scripts/run-doctor.ts"
   },
   "repository": {
     "type": "git",

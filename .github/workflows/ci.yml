@@ -98,6 +98,8 @@ jobs:
           curl -sf -H "Authorization: Bearer $PRINCIPAL_GRAPH_REPORT_API_KEY" http://localhost:8080/report | head -5
       - name: npm run sync equivalent — nothing configured but mcp-config, must still exit 0
         run: docker compose run --rm sync
+      - name: npm run doctor equivalent — must exit 0 against a freshly migrated database
+        run: docker compose run --rm doctor
       - name: Tear down
         if: always()
         run: docker compose down -v

@@ -63,9 +63,16 @@ it — a reactive, per-request anonymization that's provably safe against
 the hash chain, with its one honest limitation (a source system that
 still lists the person will recreate them on its next sync) stated
 plainly rather than glossed over
-([Usage 20](#20-erase-a-principals-identity)). See
-[Related projects](#related-projects) for what feeds this repo, what it
-feeds, and what it doesn't do yet.
+([Usage 20](#20-erase-a-principals-identity)).
+
+`npm run doctor` is new too: a read-only pre-flight over one deployment —
+database reachable, every migration applied, the event chain intact, a
+configured report-only credential actually can't write — that answers
+"is this wired up correctly" without reading logs after something's
+already gone wrong
+([Usage 21](#21-check-whether-a-deployment-is-actually-set-up-correctly)).
+See [Related projects](#related-projects) for what feeds this repo, what
+it feeds, and what it doesn't do yet.
 
 ## Contents
 
@@ -93,6 +100,7 @@ feeds, and what it doesn't do yet.
   - [18. Prevent two runs of the same adapter from overlapping](#18-prevent-two-runs-of-the-same-adapter-from-overlapping)
   - [19. Run every configured adapter in one command](#19-run-every-configured-adapter-in-one-command)
   - [20. Erase a principal's identity](#20-erase-a-principals-identity)
+  - [21. Check whether a deployment is actually set up correctly](#21-check-whether-a-deployment-is-actually-set-up-correctly)
 - [Data model](#data-model)
 - [Project layout](#project-layout)
 - [Development](#development)
@@ -173,6 +181,7 @@ repo's root:
 ```bash
 PRINCIPAL_GRAPH_REPORT_API_KEY=... docker compose up   # postgres + migrate + the report server
 docker compose run --rm sync                            # everything npm run sync would run — see Usage 19
+docker compose run --rm doctor                          # read-only pre-flight — see Usage 21
 ```
 
 One image, every script: `docker run <image> node dist/scripts/run-github-adapter.js`
@@ -1005,6 +1014,39 @@ full-inventory revocation already stops re-observing them the moment
 they're gone) but not "erase them here while they remain a live member of
 the source system," which the source system itself has to honor.
 
+### 21. Check whether a deployment is actually set up correctly
+
+```bash
+DATABASE_URL=... npm run doctor
+docker compose run --rm doctor   # same thing, packaged
+```
+
+A pre-flight, not a policy or security check — `npm run policy-check`
+([Usage 10](#10-check-policy-violations)) already answers "did access,
+right now, obey the rules we've stated," and `npm run sync`
+([Usage 19](#19-run-every-configured-adapter-in-one-command)) already
+answers "run whatever's configured." Nothing before this answered "is the
+thing I just deployed actually wired up correctly" without reading logs
+after something had already gone wrong.
+
+`npm run doctor` checks, in order: the database is reachable; every
+`schema/*.sql` file is applied (reads `schema_migrations` directly —
+never applies anything itself, unlike `runMigrations()`, since a health
+check that mutates schema as a side effect of merely checking is exactly
+the kind of surprise this project argues against elsewhere); the event
+chain is intact (`verifyChainIncremental()`, the same incremental check
+`policy-check`'s opt-in `chain-intact` rule already uses); and, if
+`PRINCIPAL_GRAPH_REPORT_DATABASE_URL` is set, that it both connects and
+is genuinely read-only — checked with `has_table_privilege()`, never by
+attempting a real write to find out. It finishes by listing which of
+`npm run sync`'s seven steps are configured, the same
+`isConfigured()`/`missingEnv()` logic that script already uses, so
+"why didn't sync run X" has one place to look instead of two.
+
+Exits nonzero if any check fails. A step reported as "not configured" is
+informational only, exactly like `sync` itself reporting a step
+"skipped" — a partially configured deployment isn't a doctor failure.
+
 ## Data model
 
 Five tables (`schema/001_core.sql`):
@@ -1122,6 +1164,7 @@ src/
   revocation-guard.ts  checkBlastRadius() — caps full-inventory revocation per run
   notify-slack.ts      posts policy violations to a Slack Incoming Webhook, capped under Slack's own message-size limit
   erasure.ts          erasePrincipalIdentity()/previewPrincipalErasure() — reactive "right to erasure" against principal's external_id/display_name
+  doctor.ts            checkDatabaseConnectivity / checkPendingMigrations / checkChainIntact / checkReportRoleIsReadOnly — the read-only checks behind npm run doctor
   db.ts              Pool construction (reads DATABASE_URL, warns loudly if unset)
   server.ts          GET /report, /report.json, /health — node:http, no framework
   adapters/
@@ -1151,10 +1194,11 @@ scripts/
   run-policy-check.ts          npm run policy-check
   run-sync.ts                  npm run sync — every configured adapter, one command
   run-erasure.ts               npm run erase-identity
+  run-doctor.ts                npm run doctor — read-only pre-flight
   report.ts                  npm run report
 test/                one *.spec.ts per module, run against a real Postgres
 Dockerfile             one image, compiled JS — CMD defaults to the report server
-docker-compose.yml     postgres + migrate + the report server; `run --rm sync` for everything else
+docker-compose.yml     postgres + migrate + the report server; `run --rm sync`/`run --rm doctor` for everything else
 ```
 
 Adapters only write; views only read. Nothing in `adapters/` imports from
@@ -1185,8 +1229,8 @@ CI (`.github/workflows/ci.yml`) runs the `verify` sequence on every push/PR,
 across Node 20/22/24, against a `postgres:16` service container, plus a
 `gitleaks` secret-scan job and a `docker` job that builds the real
 Dockerfile/docker-compose.yml this repo ships and smoke-tests the
-compiled image (migrate, serve, `npm run sync`'s own equivalent — see
-Quick Start). `schema/001_core.sql`, `src/model.ts`, and
+compiled image (migrate, serve, `npm run sync`/`npm run doctor`'s own
+equivalents — see Quick Start). `schema/001_core.sql`, `src/model.ts`, and
 `src/log.ts` are specified byte-for-byte by this project's build brief and
 are excluded from `format`/`format:check` — see `.prettierignore` and
 `eslint.config.js`'s own comments before "fixing" a lint/format finding in

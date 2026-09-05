@@ -34,12 +34,27 @@
  *   -- one row per schema/*.sql file already applied; leave out any not yet run
  */
 
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 import { createPool } from '../src/db.js';
 import { runMigrations } from '../src/migrate.js';
 
-const SCHEMA_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'schema');
+/**
+ * Resolved relative to the current working directory, not this file's
+ * own location (`import.meta.url`) — every documented invocation of this
+ * script (README's Quick Start, `npm run migrate` itself, the Dockerfile
+ * in this repo's own root) already assumes it's run from the repo root.
+ * A path relative to this file's own directory looks right when run via
+ * `tsx scripts/run-migrations.ts` (one level under the repo root, same
+ * as `schema/`) but silently breaks the moment this file is compiled and
+ * run from its `dist/scripts/run-migrations.js` location instead — an
+ * extra directory level `tsc` adds that this file's own relative path
+ * math didn't account for. Caught live, building this repo's own
+ * Dockerfile: `node dist/scripts/run-migrations.js` looked for
+ * `dist/schema` (which doesn't exist — schema/*.sql is never compiled,
+ * it's copied into the image as-is) instead of the real `schema/` at the
+ * repo root.
+ */
+const SCHEMA_DIR = join(process.cwd(), 'schema');
 
 async function main(): Promise<void> {
   const pool = createPool();

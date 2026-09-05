@@ -72,6 +72,12 @@ async function main(): Promise<void> {
           console.log(`${result.bucket}: ${arns.length} principal(s) with access`);
           for (const arn of arns) {
             console.log(`  ${arn}: ${result.grants[arn]?.join(', ')}`);
+            const conditionalRelations = result.conditional[arn];
+            if (conditionalRelations && conditionalRelations.length > 0) {
+              console.log(
+                `    conditional (unevaluated context — MFA, source IP, ...; may not hold at runtime): ${conditionalRelations.join(', ')}`,
+              );
+            }
           }
           if (result.revoked.length > 0) {
             console.log(

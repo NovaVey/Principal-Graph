@@ -71,8 +71,22 @@ configured report-only credential actually can't write — that answers
 "is this wired up correctly" without reading logs after something's
 already gone wrong
 ([Usage 21](#21-check-whether-a-deployment-is-actually-set-up-correctly)).
-See [Related projects](#related-projects) for what feeds this repo, what
-it feeds, and what it doesn't do yet.
+
+The same review flagged "the environments dimension" as the most
+invasive of its remaining gaps — investigating it found a real, scoped
+bug rather than a case for the schema change that name implies: the
+Postgres adapters checked several targets in one run against one shared
+`roleTiers`, but only scoped the *resource* identity to the target, not
+the *principal* — so `app_write` on a `prod` cluster and `app_write` on
+a `staging` cluster, a real and common shape, silently merged into one
+principal. Fixed by scoping the principal side the same way the resource
+side already was ([Usage 12](#12-populate-grants-from-postgres-role-membership)) —
+no schema change, no frozen file touched, and every other adapter's
+`(source, external_id)` convention turned out to already be
+environment-safe for free (a GitHub login, a Workspace email, an AWS ARN
+are all globally unique identities on their own). See [Related
+projects](#related-projects) for what feeds this repo, what it feeds,
+and what it doesn't do yet.
 
 ## Contents
 
@@ -702,6 +716,26 @@ Accepts `--dry-run` — see [Usage 2](#2-populate-grants-from-your-agents-config
 > first version of this adapter reported its own connecting credential as
 > a member of every tier, before that fix.
 
+A principal's `external_id` here is `<target.label>:<role name>`
+(`postgresPrincipalExternalId()`), not the bare role name — a real gap a
+codebase review caught: `targets` accepts several targets in one run
+against one shared `roleTiers`, and Postgres role names are cluster-
+local, so `app_write` on a `prod` target and `app_write` on a `staging`
+target are two unrelated service accounts that happen to share a naming
+convention — the overwhelmingly common one. Without the target prefix,
+`ensurePrincipal()`'s `(source, external_id)` upsert would silently merge
+them into one `principal` row holding live grants against both targets'
+resources, which is exactly the shape that turns
+`trifecta_exposure`/`checkNoTrifecta` ([Usage 10](#10-check-policy-violations))
+into a false positive stitched together from two unrelated environments,
+and propagates the same false unification into the RBA export
+([Usage 8](#8-sync-grants-into-rba-for-real-multi-hop-reachability)'s
+`identityRef()` builds a subject id from this exact `external_id`). The
+resource side was already scoped by `label`; this closes the same gap on
+the principal side, with no schema change — `postgres-usage.ts` (below)
+imports the same helper so a grant and its usage keep landing on the
+same row for a given (target, role) pair.
+
 ### 13. Verify the event chain hasn't been tampered with
 
 ```bash
@@ -776,7 +810,13 @@ honest `allow` event for each — `action = 'call'`, the same sentinel the
 broker sink uses, because this genuinely doesn't know which tier a query
 exercised and isn't going to guess by parsing SQL text (see
 [Usage 6](#6-classify-what-each-tool-can-do)'s own "a wrong automatic
-classification is worse than a short manual one").
+classification is worse than a short manual one"). Same target-scoped
+principal identity as [Usage 12](#12-populate-grants-from-postgres-role-membership)
+(`<target.label>:<role name>`, via the same `postgresPrincipalExternalId()`
+helper, not reimplemented here) — required so a grant and its usage land
+on the same row for a given (target, role) pair, and so two targets that
+happen to share a role name never merge into one principal; see that
+section for the full reasoning.
 
 **Honest limitation, not closed here**: this is a snapshot, not a log. A
 role that connects, runs one query, and disconnects between two runs is

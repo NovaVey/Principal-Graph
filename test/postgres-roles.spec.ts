@@ -15,6 +15,7 @@ import assert from 'node:assert/strict';
 import {
   runPostgresAdapter,
   queryTargetRolesFromDb,
+  postgresPrincipalExternalId,
   type QueryTargetRoles,
   type RoleMembers,
 } from '../src/adapters/postgres-roles.js';
@@ -50,7 +51,11 @@ void test('runPostgresAdapter grants from tier membership, one relation per tier
   );
   assert.deepEqual(
     new Set(liveGrants.map((r) => `${r.external_id}:${r.relation}`)),
-    new Set(['alice:read', 'alice:write', 'bob:read']),
+    new Set([
+      `${postgresPrincipalExternalId(target, 'alice')}:read`,
+      `${postgresPrincipalExternalId(target, 'alice')}:write`,
+      `${postgresPrincipalExternalId(target, 'bob')}:read`,
+    ]),
   );
 
   // No structural human/service signal in Postgres roles — every principal lands as 'human'.
@@ -83,7 +88,11 @@ void test('a second run revokes lost tier membership and a tier change, keeps th
   assert.deepEqual(second[0]?.grants, { carol: ['read'], alice: ['admin'] });
   assert.deepEqual(
     [...(second[0]?.revoked ?? [])].sort(),
-    ['alice (was: read)', 'alice (was: write)', 'bob (was: read)'].sort(),
+    [
+      `${postgresPrincipalExternalId(target, 'alice')} (was: read)`,
+      `${postgresPrincipalExternalId(target, 'alice')} (was: write)`,
+      `${postgresPrincipalExternalId(target, 'bob')} (was: read)`,
+    ].sort(),
   );
 
   const { rows: live } = await pool.query<{ external_id: string; relation: string }>(
@@ -95,7 +104,10 @@ void test('a second run revokes lost tier membership and a tier change, keeps th
   );
   assert.deepEqual(
     new Set(live.map((r) => `${r.external_id}:${r.relation}`)),
-    new Set(['carol:read', 'alice:admin']),
+    new Set([
+      `${postgresPrincipalExternalId(target, 'carol')}:read`,
+      `${postgresPrincipalExternalId(target, 'alice')}:admin`,
+    ]),
   );
 });
 
@@ -114,7 +126,9 @@ void test('runPostgresAdapter with no members revokes every prior grant on that 
   });
 
   assert.deepEqual(second[0]?.grants, {});
-  assert.deepEqual(second[0]?.revoked, ['alice (was: admin)']);
+  assert.deepEqual(second[0]?.revoked, [
+    `${postgresPrincipalExternalId(target, 'alice')} (was: admin)`,
+  ]);
 });
 
 void test('runPostgresAdapter refuses to revoke most of a target at real scale, unless forced', async () => {
@@ -154,7 +168,12 @@ void test('runPostgresAdapter refuses to revoke most of a target at real scale, 
   });
   assert.deepEqual(
     [...(forced[0]?.revoked ?? [])].sort(),
-    ['carol (was: read)', 'dave (was: read)', 'erin (was: read)', 'frank (was: read)'].sort(),
+    [
+      `${postgresPrincipalExternalId(target, 'carol')} (was: read)`,
+      `${postgresPrincipalExternalId(target, 'dave')} (was: read)`,
+      `${postgresPrincipalExternalId(target, 'erin')} (was: read)`,
+      `${postgresPrincipalExternalId(target, 'frank')} (was: read)`,
+    ].sort(),
   );
 });
 
@@ -195,18 +214,77 @@ void test('dryRun previews grants and revokes accurately without writing to gran
     queryTargetRoles: second,
     dryRun: true,
   });
-  assert.deepEqual(dryRevoke[0]?.revoked, ['alice (was: write)']);
+  assert.deepEqual(dryRevoke[0]?.revoked, [
+    `${postgresPrincipalExternalId(target, 'alice')} (was: write)`,
+  ]);
 
   const { rows: stillLive } = await pool.query<{ relation: string }>(
     `select g.relation
        from grant_edge g
        join principal p on p.id = g.principal_id
-      where p.external_id = 'alice' and g.revoked_at is null`,
+      where p.external_id = $1 and g.revoked_at is null`,
+    [postgresPrincipalExternalId(target, 'alice')],
   );
   assert.deepEqual(
     new Set(stillLive.map((r) => r.relation)),
     new Set(['read', 'write']),
     'the previewed revoke must not actually apply — write is still live',
+  );
+});
+
+void test('two targets that happen to share a role name (a real prod/staging shape) resolve to two DISTINCT principals, never one merged actor', async () => {
+  const prod = { label: 'prod', connectionString: 'unused-with-a-fake-query' };
+  const staging = { label: 'staging', connectionString: 'unused-with-a-fake-query' };
+  // Both clusters use the exact same role-naming convention — the
+  // overwhelmingly common real case, and exactly what this adapter's own
+  // config shape (one `roleTiers` applied to every target in `targets`)
+  // actively invites checking in a single run.
+  const bothClusters = fakeQuery({ read: [], write: ['app_write'], admin: [] });
+
+  const [prodResult, stagingResult] = await runPostgresAdapter(pool, {
+    targets: [prod, staging],
+    roleTiers: ROLE_TIERS,
+    queryTargetRoles: bothClusters,
+  });
+
+  assert.notEqual(
+    prodResult?.resourceId,
+    stagingResult?.resourceId,
+    'two different targets must never share a resource row',
+  );
+
+  const { rows: principalRows } = await pool.query<{ id: string; external_id: string }>(
+    `select id, external_id from principal where source = 'postgres' order by external_id`,
+  );
+  assert.deepEqual(
+    principalRows.map((r) => r.external_id).sort(),
+    [
+      postgresPrincipalExternalId(prod, 'app_write'),
+      postgresPrincipalExternalId(staging, 'app_write'),
+    ].sort(),
+  );
+  assert.notEqual(
+    principalRows[0]?.id,
+    principalRows[1]?.id,
+    "'app_write' on prod and 'app_write' on staging must be two different principal rows, not one merged actor",
+  );
+
+  // Each target's grant_edge row must reference ITS OWN principal, never
+  // the other target's — the actual failure mode a merged principal
+  // would produce (one actor holding live grants on both environments).
+  const { rows: grantRows } = await pool.query<{ resource_id: string; principal_id: string }>(
+    `select resource_id, principal_id from grant_edge where source = 'postgres' and revoked_at is null`,
+  );
+  const principalIdByExternalId = new Map(principalRows.map((r) => [r.external_id, r.id]));
+  const prodGrant = grantRows.find((g) => g.resource_id === prodResult?.resourceId);
+  const stagingGrant = grantRows.find((g) => g.resource_id === stagingResult?.resourceId);
+  assert.equal(
+    prodGrant?.principal_id,
+    principalIdByExternalId.get(postgresPrincipalExternalId(prod, 'app_write')),
+  );
+  assert.equal(
+    stagingGrant?.principal_id,
+    principalIdByExternalId.get(postgresPrincipalExternalId(staging, 'app_write')),
   );
 });
 

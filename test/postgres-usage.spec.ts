@@ -16,9 +16,11 @@ import {
   queryActiveRolesFromDb,
   type QueryActiveRoles,
 } from '../src/adapters/postgres-usage.js';
+import { postgresPrincipalExternalId } from '../src/adapters/postgres-roles.js';
 import { pool, resetDatabase } from './helpers.js';
 
 const ROLE_TIERS = { read: 'app_read', write: 'app_write', admin: 'app_admin' };
+const TARGET = { label: 'app-db', connectionString: 'unused-with-a-fake-query' };
 
 /** Builds a QueryActiveRoles that returns a fixed list — no real connection. */
 function fakeActive(roles: string[]): QueryActiveRoles {
@@ -26,7 +28,7 @@ function fakeActive(roles: string[]): QueryActiveRoles {
 }
 
 void test('runPostgresUsageAdapter records an honest allow event per active role', async () => {
-  const target = { label: 'app-db', connectionString: 'unused-with-a-fake-query' };
+  const target = TARGET;
   const [result] = await runPostgresUsageAdapter(pool, {
     targets: [target],
     roleTiers: ROLE_TIERS,
@@ -51,7 +53,7 @@ void test('runPostgresUsageAdapter records an honest allow event per active role
   );
   assert.deepEqual(
     events.map((e) => e.external_id),
-    ['alice', 'bob'],
+    [postgresPrincipalExternalId(TARGET, 'alice'), postgresPrincipalExternalId(TARGET, 'bob')],
   );
   for (const e of events) {
     // The honest 'call' sentinel — this adapter never guesses which tier
@@ -63,7 +65,7 @@ void test('runPostgresUsageAdapter records an honest allow event per active role
 });
 
 void test('runPostgresUsageAdapter lands on the SAME principal/resource rows as the grant adapter would, by (source, external_id)', async () => {
-  const target = { label: 'app-db', connectionString: 'unused-with-a-fake-query' };
+  const target = TARGET;
   const [result] = await runPostgresUsageAdapter(pool, {
     targets: [target],
     roleTiers: ROLE_TIERS,
@@ -76,14 +78,15 @@ void test('runPostgresUsageAdapter lands on the SAME principal/resource rows as 
   assert.deepEqual(resourceRows, [{ kind: 'db', source: 'postgres' }]);
 
   const { rows: principalRows } = await pool.query<{ kind: string; source: string }>(
-    `select kind, source from principal where external_id = 'alice'`,
+    'select kind, source from principal where external_id = $1',
+    [postgresPrincipalExternalId(TARGET, 'alice')],
   );
   assert.deepEqual(principalRows, [{ kind: 'human', source: 'postgres' }]);
   assert.ok(result?.resourceId);
 });
 
 void test('runPostgresUsageAdapter is a log, not a snapshot: with dedupe off, repeated runs append, never overwrite', async () => {
-  const target = { label: 'app-db', connectionString: 'unused-with-a-fake-query' };
+  const target = TARGET;
   await runPostgresUsageAdapter(pool, {
     targets: [target],
     roleTiers: ROLE_TIERS,
@@ -100,13 +103,14 @@ void test('runPostgresUsageAdapter is a log, not a snapshot: with dedupe off, re
   const { rows } = await pool.query<{ count: string }>(
     `select count(*)::text from event e
        join principal p on p.id = e.principal_id
-      where p.external_id = 'alice'`,
+      where p.external_id = $1`,
+    [postgresPrincipalExternalId(TARGET, 'alice')],
   );
   assert.equal(rows[0]?.count, '2', 'two separate observations, two separate rows');
 });
 
 void test('runPostgresUsageAdapter dedupes a back-to-back run within the window (default: 5 minutes)', async () => {
-  const target = { label: 'app-db', connectionString: 'unused-with-a-fake-query' };
+  const target = TARGET;
   const first = await runPostgresUsageAdapter(pool, {
     targets: [target],
     roleTiers: ROLE_TIERS,
@@ -126,13 +130,14 @@ void test('runPostgresUsageAdapter dedupes a back-to-back run within the window 
   const { rows } = await pool.query<{ count: string }>(
     `select count(*)::text from event e
        join principal p on p.id = e.principal_id
-      where p.external_id = 'alice'`,
+      where p.external_id = $1`,
+    [postgresPrincipalExternalId(TARGET, 'alice')],
   );
   assert.equal(rows[0]?.count, '1', 'the second run must not have written a second row');
 });
 
 void test('runPostgresUsageAdapter does not dedupe once the prior event has aged out of the window', async () => {
-  const target = { label: 'app-db', connectionString: 'unused-with-a-fake-query' };
+  const target = TARGET;
   await runPostgresUsageAdapter(pool, {
     targets: [target],
     roleTiers: ROLE_TIERS,
@@ -153,7 +158,8 @@ void test('runPostgresUsageAdapter does not dedupe once the prior event has aged
   const { rows } = await pool.query<{ count: string }>(
     `select count(*)::text from event e
        join principal p on p.id = e.principal_id
-      where p.external_id = 'alice'`,
+      where p.external_id = $1`,
+    [postgresPrincipalExternalId(TARGET, 'alice')],
   );
   assert.equal(rows[0]?.count, '2');
 });

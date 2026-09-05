@@ -130,6 +130,35 @@ export interface PostgresTarget {
   connectionString: string;
 }
 
+/**
+ * The principal identity a Postgres login role resolves to: scoped to
+ * the target's own `label`, never the bare role name alone. Postgres
+ * role names are cluster-local — `app_write` on a prod cluster and
+ * `app_write` on a staging cluster (the overwhelmingly common naming
+ * convention, and this adapter's own config shape actively invites
+ * checking several targets with one shared `roleTiers` in a single run)
+ * are two unrelated service accounts that happen to share a name, not
+ * one actor. Without this scoping, `ensurePrincipal()`'s
+ * `(source, external_id)` upsert would silently merge them into one
+ * `principal` row holding live grants against BOTH targets' resources —
+ * exactly the shape that turns `trifecta_exposure`/`checkNoTrifecta`
+ * (src/policies.ts) into false positives stitched together from two
+ * unrelated environments, and propagates the same false unification
+ * into the RBA export (`identityRef()`, src/exporters/rba.ts, builds a
+ * subject id from this exact `external_id`).
+ *
+ * The resource side of this adapter already scopes by target (`target.label`
+ * as the resource's own `external_id`, above) — this closes the same gap
+ * on the principal side. postgres-usage.ts imports this rather than
+ * reimplementing the format, so a grant and its usage keep landing on
+ * the exact same principal row for a given (target, role) pair, per this
+ * file's own header, while two DIFFERENT targets sharing a role name
+ * resolve to two DIFFERENT rows.
+ */
+export function postgresPrincipalExternalId(target: PostgresTarget, roleName: string): string {
+  return `${target.label}:${roleName}`;
+}
+
 export interface PostgresAdapterOptions extends RevocationGuardOptions {
   /** Explicit target databases — never discovered. See this file's header. */
   targets: PostgresTarget[];
@@ -161,7 +190,13 @@ export interface PostgresGrantResult {
    * reason — see AwsGrantResult.grants.
    */
   grants: Record<string, Relation[]>;
-  /** `"<role> (was: <relation>)"` for every grant this run revoked. */
+  /**
+   * `"<identity> (was: <relation>)"` for every grant this run revoked —
+   * `<identity>` is postgresPrincipalExternalId()'s target-scoped form
+   * (`<target.label>:<role>`), not the bare role name, so which target a
+   * revoked role belonged to is unambiguous even read outside this
+   * result's own `target` field.
+   */
   revoked: string[];
 }
 
@@ -205,7 +240,7 @@ export async function runPostgresAdapter(
         const principalId = await ensurePrincipal(db, {
           kind: 'human',
           source: 'postgres',
-          externalId: roleName,
+          externalId: postgresPrincipalExternalId(target, roleName),
         });
         if (!opts.dryRun) {
           const { rows } = await db.query<{ id: string }>(

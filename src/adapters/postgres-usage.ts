@@ -51,8 +51,12 @@
  *
  * Same identity as postgres-roles.ts: (kind: 'db', source: 'postgres',
  * externalId: target.label) for the resource, ('human', 'postgres',
- * roleName) for the principal — so a grant and its usage land on the SAME
- * rows, not two that happen to share a label.
+ * postgresPrincipalExternalId(target, roleName)) for the principal — so
+ * a grant and its usage land on the SAME rows for a given (target, role)
+ * pair. That helper (imported from postgres-roles.ts, not reimplemented
+ * here) scopes the identity to the target, not the bare role name alone
+ * — see its own doc comment for why a shared role-naming convention
+ * across two targets must never merge into one principal.
  *
  * Deduplicated within `dedupeWindowMinutes`: a role that's continuously
  * busy would otherwise get one appendEvent() per run — at the tight
@@ -72,7 +76,11 @@ import { Client } from 'pg';
 import type { Pool } from 'pg';
 import { appendEvent } from '../log.js';
 import { ensurePrincipal, ensureResource } from '../upsert.js';
-import type { PostgresTarget, RoleTiers } from './postgres-roles.js';
+import {
+  postgresPrincipalExternalId,
+  type PostgresTarget,
+  type RoleTiers,
+} from './postgres-roles.js';
 
 /**
  * Given a target's connection string and the three tier role names,
@@ -200,7 +208,7 @@ export async function runPostgresUsageAdapter(
       const principalId = await ensurePrincipal(pool, {
         kind: 'human',
         source: 'postgres',
-        externalId: roleName,
+        externalId: postgresPrincipalExternalId(target, roleName),
       });
       active.push(roleName);
 

@@ -26,7 +26,7 @@
 
 import { createPool } from '../src/db.js';
 import { runRbaExport } from '../src/exporters/rba.js';
-import { startRun, finishRun } from '../src/run-history.js';
+import { startRun, finishRun, withAdapterLock } from '../src/run-history.js';
 
 async function main(): Promise<void> {
   const apiUrl = process.env.RBA_API_URL;
@@ -37,39 +37,45 @@ async function main(): Promise<void> {
 
   const pool = createPool();
   try {
-    const runId = await startRun(pool, 'rba-export');
-    try {
-      const result = await runRbaExport(pool, { apiUrl, apiKey });
-      console.log(`written: ${result.written}, deleted: ${result.deleted}`);
-      if (result.failures.length > 0) {
-        console.error(
-          `${result.failures.length} failure(s) — watermark NOT advanced, will retry next run:`,
-        );
-        for (const failure of result.failures) {
-          const t = failure.tuple;
+    // The exporter this project is most exposed on here: it can
+    // legitimately run for hours under its own 20-requests/minute rate
+    // limit (src/exporters/rba.ts's own header), and cron has no idea —
+    // see src/run-history.ts's withAdapterLock().
+    await withAdapterLock(pool, 'rba-export', async () => {
+      const runId = await startRun(pool, 'rba-export');
+      try {
+        const result = await runRbaExport(pool, { apiUrl, apiKey });
+        console.log(`written: ${result.written}, deleted: ${result.deleted}`);
+        if (result.failures.length > 0) {
           console.error(
-            `  ${failure.op} ${t.objectNs}:${t.objectId}#${t.relation}@${t.subjectNs}:${t.subjectId} — ${failure.error}`,
+            `${result.failures.length} failure(s) — watermark NOT advanced, will retry next run:`,
           );
+          for (const failure of result.failures) {
+            const t = failure.tuple;
+            console.error(
+              `  ${failure.op} ${t.objectNs}:${t.objectId}#${t.relation}@${t.subjectNs}:${t.subjectId} — ${failure.error}`,
+            );
+          }
+          process.exitCode = 1;
+          await finishRun(pool, runId, {
+            status: 'failure',
+            error: `${result.failures.length} failure(s); first: ${result.failures[0]?.error}`,
+          });
+        } else {
+          console.log('synced');
+          await finishRun(pool, runId, {
+            status: 'success',
+            detail: `written ${result.written}, deleted ${result.deleted}`,
+          });
         }
-        process.exitCode = 1;
+      } catch (err) {
         await finishRun(pool, runId, {
           status: 'failure',
-          error: `${result.failures.length} failure(s); first: ${result.failures[0]?.error}`,
+          error: err instanceof Error ? err.message : String(err),
         });
-      } else {
-        console.log('synced');
-        await finishRun(pool, runId, {
-          status: 'success',
-          detail: `written ${result.written}, deleted ${result.deleted}`,
-        });
+        throw err;
       }
-    } catch (err) {
-      await finishRun(pool, runId, {
-        status: 'failure',
-        error: err instanceof Error ? err.message : String(err),
-      });
-      throw err;
-    }
+    });
   } finally {
     await pool.end();
   }

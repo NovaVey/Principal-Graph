@@ -32,7 +32,7 @@ import {
   runWorkspaceAdapter,
   type ServiceAccountCredentials,
 } from '../src/adapters/workspace-groups.js';
-import { startRun, finishRun } from '../src/run-history.js';
+import { startRun, finishRun, withAdapterLock } from '../src/run-history.js';
 
 function parseList(raw: string | undefined): string[] {
   return (raw ?? '')
@@ -65,42 +65,51 @@ async function main(): Promise<void> {
   const dryRun = process.argv.includes('--dry-run');
   const pool = createPool();
   try {
-    const runId = await startRun(pool, 'workspace', { dryRun });
-    try {
-      const results = await runWorkspaceAdapter(pool, {
-        groups,
-        credentials,
-        adminEmail,
-        dryRun,
-        runId,
-      });
-      if (dryRun) console.log('DRY RUN — nothing below was actually written to grant_edge\n');
-      let totalGrants = 0;
-      let totalRevoked = 0;
-      for (const result of results) {
-        const emails = Object.keys(result.grants);
-        totalGrants += emails.length;
-        totalRevoked += result.revoked.length;
-        console.log(`${result.group}: ${emails.length} member(s)`);
-        for (const email of emails) {
-          console.log(`  ${email}: ${result.grants[email]}`);
+    const runOnce = async (): Promise<void> => {
+      const runId = await startRun(pool, 'workspace', { dryRun });
+      try {
+        const results = await runWorkspaceAdapter(pool, {
+          groups,
+          credentials,
+          adminEmail,
+          dryRun,
+          runId,
+        });
+        if (dryRun) console.log('DRY RUN — nothing below was actually written to grant_edge\n');
+        let totalGrants = 0;
+        let totalRevoked = 0;
+        for (const result of results) {
+          const emails = Object.keys(result.grants);
+          totalGrants += emails.length;
+          totalRevoked += result.revoked.length;
+          console.log(`${result.group}: ${emails.length} member(s)`);
+          for (const email of emails) {
+            console.log(`  ${email}: ${result.grants[email]}`);
+          }
+          if (result.revoked.length > 0) {
+            console.log(
+              `  ${dryRun ? 'would revoke' : 'revoked this run'}: ${result.revoked.join(', ')}`,
+            );
+          }
         }
-        if (result.revoked.length > 0) {
-          console.log(
-            `  ${dryRun ? 'would revoke' : 'revoked this run'}: ${result.revoked.join(', ')}`,
-          );
-        }
+        await finishRun(pool, runId, {
+          status: 'success',
+          detail: `${results.length} group(s), ${totalGrants} member(s), ${totalRevoked} revoked`,
+        });
+      } catch (err) {
+        await finishRun(pool, runId, {
+          status: 'failure',
+          error: err instanceof Error ? err.message : String(err),
+        });
+        throw err;
       }
-      await finishRun(pool, runId, {
-        status: 'success',
-        detail: `${results.length} group(s), ${totalGrants} member(s), ${totalRevoked} revoked`,
-      });
-    } catch (err) {
-      await finishRun(pool, runId, {
-        status: 'failure',
-        error: err instanceof Error ? err.message : String(err),
-      });
-      throw err;
+    };
+    // See run-github-adapter.ts's own comment on the same line: a dry run
+    // never writes to grant_edge, so it skips the lock entirely.
+    if (dryRun) {
+      await runOnce();
+    } else {
+      await withAdapterLock(pool, 'workspace', runOnce);
     }
   } finally {
     await pool.end();

@@ -33,7 +33,7 @@
 
 import { createPool } from '../src/db.js';
 import { runPostgresAdapter } from '../src/adapters/postgres-roles.js';
-import { startRun, finishRun } from '../src/run-history.js';
+import { startRun, finishRun, withAdapterLock } from '../src/run-history.js';
 import type { PostgresTarget } from '../src/adapters/postgres-roles.js';
 
 function parseTargets(raw: string | undefined): PostgresTarget[] {
@@ -87,36 +87,45 @@ async function main(): Promise<void> {
   const dryRun = process.argv.includes('--dry-run');
   const pool = createPool();
   try {
-    const runId = await startRun(pool, 'postgres', { dryRun });
-    try {
-      const results = await runPostgresAdapter(pool, { targets, roleTiers, dryRun, runId });
-      if (dryRun) console.log('DRY RUN — nothing below was actually written to grant_edge\n');
-      let totalGrants = 0;
-      let totalRevoked = 0;
-      for (const result of results) {
-        const roles = Object.keys(result.grants);
-        totalGrants += roles.length;
-        totalRevoked += result.revoked.length;
-        console.log(`${result.target}: ${roles.length} role(s) with tier membership`);
-        for (const role of roles) {
-          console.log(`  ${role}: ${result.grants[role]?.join(', ')}`);
+    const runOnce = async (): Promise<void> => {
+      const runId = await startRun(pool, 'postgres', { dryRun });
+      try {
+        const results = await runPostgresAdapter(pool, { targets, roleTiers, dryRun, runId });
+        if (dryRun) console.log('DRY RUN — nothing below was actually written to grant_edge\n');
+        let totalGrants = 0;
+        let totalRevoked = 0;
+        for (const result of results) {
+          const roles = Object.keys(result.grants);
+          totalGrants += roles.length;
+          totalRevoked += result.revoked.length;
+          console.log(`${result.target}: ${roles.length} role(s) with tier membership`);
+          for (const role of roles) {
+            console.log(`  ${role}: ${result.grants[role]?.join(', ')}`);
+          }
+          if (result.revoked.length > 0) {
+            console.log(
+              `  ${dryRun ? 'would revoke' : 'revoked this run'}: ${result.revoked.join(', ')}`,
+            );
+          }
         }
-        if (result.revoked.length > 0) {
-          console.log(
-            `  ${dryRun ? 'would revoke' : 'revoked this run'}: ${result.revoked.join(', ')}`,
-          );
-        }
+        await finishRun(pool, runId, {
+          status: 'success',
+          detail: `${results.length} target(s), ${totalGrants} role(s), ${totalRevoked} revoked`,
+        });
+      } catch (err) {
+        await finishRun(pool, runId, {
+          status: 'failure',
+          error: err instanceof Error ? err.message : String(err),
+        });
+        throw err;
       }
-      await finishRun(pool, runId, {
-        status: 'success',
-        detail: `${results.length} target(s), ${totalGrants} role(s), ${totalRevoked} revoked`,
-      });
-    } catch (err) {
-      await finishRun(pool, runId, {
-        status: 'failure',
-        error: err instanceof Error ? err.message : String(err),
-      });
-      throw err;
+    };
+    // See run-github-adapter.ts's own comment on the same line: a dry run
+    // never writes to grant_edge, so it skips the lock entirely.
+    if (dryRun) {
+      await runOnce();
+    } else {
+      await withAdapterLock(pool, 'postgres', runOnce);
     }
   } finally {
     await pool.end();

@@ -120,11 +120,17 @@ async function checkStaleGrant(
     resource: string | null;
     resource_external_id: string;
     relation: string;
-    observed_at: Date;
+    first_observed_at: Date;
   }>(
+    // first_observed_at (schema/010_grant_edge_observed_split.sql), not
+    // observed_at: observed_at is bumped by every adapter run that merely
+    // confirms this grant is still live, so a 200-day-old grant
+    // re-observed a second ago would read "unused for 0 day(s)" —
+    // self-contradicting text on a genuine violation. first_observed_at
+    // is set once and never touched again.
     `select p.display_name as principal, p.external_id as principal_external_id,
             r.display_name as resource, r.external_id as resource_external_id,
-            g.relation, g.observed_at
+            g.relation, g.first_observed_at
        from grant_edge g
        join principal p on p.id = g.principal_id
        join resource  r on r.id = g.resource_id
@@ -163,7 +169,9 @@ async function checkStaleGrant(
   return rows.map((r) => {
     const who = resolveName(r.principal, r.principal_external_id);
     const what = resolveName(r.resource, r.resource_external_id);
-    const unusedDays = Math.floor((Date.now() - r.observed_at.getTime()) / (24 * 60 * 60 * 1000));
+    const unusedDays = Math.floor(
+      (Date.now() - r.first_observed_at.getTime()) / (24 * 60 * 60 * 1000),
+    );
     return {
       rule,
       description: `"${who}" holds a '${r.relation}' grant on ${what}, unused for ${unusedDays} day(s) — beyond this policy's ${rule.maxUnusedDays}-day limit.`,

@@ -210,14 +210,20 @@ export async function runRbaExport(
   );
   const lastSyncedAt = stateRows[0]?.last_synced_at ?? null;
 
+  // changed_at (schema/010_grant_edge_observed_split.sql), not
+  // observed_at: observed_at is bumped by every adapter run that merely
+  // confirms a grant is still live, so watermarking on it would match
+  // every live grant after ANY run, not just the ones that actually
+  // changed — exactly the full resync this incremental design exists to
+  // avoid. changed_at only moves on a real create/reinstate transition.
   const { rows: toWriteRows } = await db.query<GrantTupleRow>(
     `select ${GRANT_TUPLE_COLUMNS}
        from grant_edge g
        join resource  r on r.id = g.resource_id
        join principal p on p.id = g.principal_id
       where g.revoked_at is null
-        and g.observed_at > coalesce($1::timestamptz, '-infinity'::timestamptz)
-        and g.observed_at <= $2::timestamptz`,
+        and g.changed_at > coalesce($1::timestamptz, '-infinity'::timestamptz)
+        and g.changed_at <= $2::timestamptz`,
     [lastSyncedAt, syncStartedAt],
   );
 

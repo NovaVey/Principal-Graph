@@ -91,6 +91,16 @@ function isPool(db: Queryable): db is Pool {
  * failed `await db.query(sql)` already does a few lines below, and folding
  * it into `MigrationOutcome['status']` instead would let a caller that
  * only checks `.every(o => o.status !== 'applied')` miss it entirely.
+ *
+ * On any failure, rolls back and releases the advisory lock (both best-
+ * effort — a secondary failure in either never masks the real error) before
+ * rethrowing. Found the hard way while building this: a migration file's
+ * own SQL is one multi-statement string carrying its own `begin; ...;
+ * commit;`, so a failing statement partway through leaves the session
+ * inside an aborted transaction where nothing else succeeds — including,
+ * without this, the unlock call itself, whose own resulting error silently
+ * replaced the real one, and a checked-out `Pool` client released back in
+ * that state would poison whichever caller got it next.
  */
 export async function runMigrations(db: Queryable, schemaDir: string): Promise<MigrationOutcome[]> {
   const usingPool = isPool(db);
@@ -139,9 +149,19 @@ export async function runMigrations(db: Queryable, schemaDir: string): Promise<M
         );
         outcomes.push({ version, file, status: 'applied' });
       }
-      return outcomes;
-    } finally {
+      const result = outcomes;
       await client.query('select pg_advisory_unlock($1)', [MIGRATE_LOCK_KEY]);
+      return result;
+    } catch (err) {
+      // A migration file's own SQL is a multi-statement string carrying
+      // its own `begin; ...; commit;` — a failure partway through leaves
+      // this session inside an aborted transaction, where no further
+      // command succeeds (the advisory unlock below included) until it's
+      // rolled back. Best-effort cleanup; a secondary failure here must
+      // never mask the real error being thrown.
+      await client.query('rollback').catch(() => {});
+      await client.query('select pg_advisory_unlock($1)', [MIGRATE_LOCK_KEY]).catch(() => {});
+      throw err;
     }
   } finally {
     if (usingPool) client.release();

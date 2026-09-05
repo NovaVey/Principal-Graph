@@ -37,16 +37,23 @@ after(async () => {
   await pool.end();
 });
 
+/**
+ * `firstObservedAt` also seeds first_observed_at/changed_at, not just
+ * observed_at — checkStaleGrant's "unused for N day(s)" text now reads
+ * first_observed_at (schema/010_grant_edge_observed_split.sql), so a test
+ * simulating an old grant needs that column backdated too, not just
+ * observed_at.
+ */
 async function grant(
   principalId: string,
   resourceId: string,
   relation: string,
-  observedAt?: Date,
+  firstObservedAt?: Date,
 ): Promise<void> {
   await pool.query(
-    `insert into grant_edge (principal_id, resource_id, relation, source, observed_at)
-     values ($1, $2, $3, 'manual', coalesce($4, now()))`,
-    [principalId, resourceId, relation, observedAt ?? null],
+    `insert into grant_edge (principal_id, resource_id, relation, source, observed_at, first_observed_at, changed_at)
+     values ($1, $2, $3, 'manual', coalesce($4, now()), coalesce($4, now()), coalesce($4, now()))`,
+    [principalId, resourceId, relation, firstObservedAt ?? null],
   );
 }
 

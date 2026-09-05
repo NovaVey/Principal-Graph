@@ -222,6 +222,60 @@ void test('runMigrations holds the advisory lock for the whole pass, so a concur
   }
 });
 
+void test('a failing migration surfaces its real error, not a masked "transaction aborted", and leaves the connection usable afterward', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'principal-graph-migrate-test-'));
+  try {
+    writeFileSync(
+      join(dir, `${V1}_create_widget.sql`),
+      `create table migrate_spec_widget (id serial primary key);`,
+    );
+    // A migration whose own embedded transaction fails partway through —
+    // the exact shape that left the session in an aborted-transaction
+    // state and, before this fix, masked the real error below with a
+    // secondary "current transaction is aborted" from the advisory-unlock
+    // cleanup call.
+    writeFileSync(
+      join(dir, `${V2}_broken.sql`),
+      `begin;\nselect this_column_does_not_exist_anywhere from migrate_spec_widget;\ncommit;`,
+    );
+
+    await assert.rejects(() => runMigrations(pool, dir), /this_column_does_not_exist_anywhere/);
+
+    // V1 (the working migration before the broken one) must still be
+    // recorded — the loop stopped at V2, it didn't undo what came before.
+    const { rows } = await pool.query<{ version: string }>(
+      `select version from schema_migrations where version = $1`,
+      [V1],
+    );
+    assert.equal(rows.length, 1);
+
+    // The pool's connection must come back usable, not poisoned by a
+    // half-open transaction left on the client `runMigrations` checked
+    // out and released — proven by successfully running a real migration
+    // against the very same pool right after (V2's own broken file is
+    // still on disk and would fail identically every time, so this uses a
+    // fresh version number rather than retrying it).
+    const dir2 = mkdtempSync(join(tmpdir(), 'principal-graph-migrate-test-'));
+    try {
+      writeFileSync(
+        join(dir2, `${V1}_create_widget.sql`),
+        `create table migrate_spec_widget (id serial primary key);`,
+      );
+      writeFileSync(join(dir2, `903_recovers.sql`), `select 1;`);
+      const outcomes = await runMigrations(pool, dir2);
+      assert.deepEqual(
+        outcomes.map((o) => o.status),
+        ['already-applied', 'applied'],
+      );
+    } finally {
+      rmSync(dir2, { recursive: true, force: true });
+      await pool.query(`delete from schema_migrations where version = '903'`);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 void test('runMigrations only applies what is missing when some migrations are already recorded', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'principal-graph-migrate-test-'));
   try {

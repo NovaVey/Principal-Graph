@@ -212,7 +212,13 @@ export async function runPostgresAdapter(
             `insert into grant_edge (principal_id, resource_id, relation, source)
              values ($1, $2, $3, 'postgres')
              on conflict (principal_id, resource_id, relation, source) do update
-               set observed_at = now(), revoked_at = null
+               set observed_at = now(),
+                   revoked_at = null,
+                   -- Bumped only on a real transition (reinstated after
+                   -- being revoked), never on a plain re-observation —
+                   -- see schema/010_grant_edge_observed_split.sql's own
+                   -- header.
+                   changed_at = case when grant_edge.revoked_at is not null then now() else grant_edge.changed_at end
              returning id`,
             [principalId, resourceId, tier],
           );

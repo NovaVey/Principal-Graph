@@ -12,11 +12,14 @@ to have a security team.
 
 **v1.0.0.** The event log, the broker integration that feeds it, capability
 classification, five grant-source adapters (MCP config, GitHub, AWS,
-Google Workspace, Postgres), the report (CLI and HTTP) with policy
-checks, migration tracking, adapter run-history, and the export bridge
-into Relationship-Based-Authorization are all implemented and tested. See
-[Related projects](#related-projects) for what feeds this repo, what it
-feeds, and what it doesn't do yet.
+Google Workspace, Postgres), a Postgres *usage* adapter (the first on the
+other side of the ledger — see [Usage 14](#14-track-real-postgres-query-activity)),
+the report (CLI and HTTP, with an optional Slack alert) with five policy
+checks (no-trifecta, stale-grant, chain-intact, on-behalf-of-escalation,
+plus an opt-in per-adapter freshness check), migration tracking, adapter
+run-history, and the export bridge into Relationship-Based-Authorization
+are all implemented and tested. See [Related projects](#related-projects)
+for what feeds this repo, what it feeds, and what it doesn't do yet.
 
 ## Contents
 
@@ -36,6 +39,8 @@ feeds, and what it doesn't do yet.
   - [10. Check policy violations](#10-check-policy-violations)
   - [11. Check on scheduled adapter runs](#11-check-on-scheduled-adapter-runs)
   - [12. Populate grants from Postgres role membership](#12-populate-grants-from-postgres-role-membership)
+  - [13. Verify the event chain hasn't been tampered with](#13-verify-the-event-chain-hasnt-been-tampered-with)
+  - [14. Track real Postgres query activity](#14-track-real-postgres-query-activity)
 - [Data model](#data-model)
 - [Project layout](#project-layout)
 - [Development](#development)
@@ -278,13 +283,18 @@ npm run report                # prints to stdout
 npm run report > report.txt   # or save it
 ```
 
-Three plain-text sections, one command:
+Four plain-text sections, one command:
 
 1. **Unused grants** — permissions nobody's exercised in 90 days, riskiest
    first.
 2. **Trifecta exposure** — which principals can read private data, ingest
    untrusted content, *and* reach the network, all at once.
-3. **Denials** — what the broker actually blocked recently, with the taint
+3. **Acting on behalf of** — which human each agent's `event.on_behalf_of`
+   activity is actually attributed to. Purely descriptive, like every
+   other section here — an agent acting for a human who holds no grant
+   at all is the `on-behalf-of-escalation` policy's job (see
+   [Usage 10](#10-check-policy-violations)), not this report's.
+4. **Denials** — what the broker actually blocked recently, with the taint
    labels that show why.
 
 `PRINCIPAL_GRAPH_REPORT_DENIAL_DAYS` / `PRINCIPAL_GRAPH_REPORT_DENIAL_LIMIT`
@@ -369,7 +379,7 @@ hand-written set of "should never happen" rules
 nonzero if any fail — built for CI/cron ("did access, right now, obey the
 rules we've stated"), not for a human reading a summary.
 
-Two rules ship by default:
+Four rules ship by default:
 
 - **`no-trifecta`** — no principal should hold `read_private` +
   `ingest_untrusted` + `egress` at once (reuses `trifecta_exposure`
@@ -377,6 +387,30 @@ Two rules ship by default:
 - **`stale-grant`** — no `admin`/`write` grant should sit unused past 30
   days (its own parameterized query — tighter and configurable, unlike
   `unused_grant`'s fixed 90-day window).
+- **`chain-intact`** — the event chain (`src/log.ts`'s `verifyChain()`)
+  hasn't been tampered with. That function existed and was tested with
+  nothing ever calling it on a schedule — see [Usage 13](#13-verify-the-event-chain-hasnt-been-tampered-with)
+  for the standalone runner this rule shares its call with.
+- **`on-behalf-of-escalation`** — no agent's `allow` event on behalf of a
+  human (`event.on_behalf_of`) who holds no grant on that resource at
+  all. The one rule genuinely built on this project's own thesis (one
+  `principal` table, a human behind every agent) rather than reused from
+  an existing view — see [Usage 7](#7-run-the-report)'s "ACTING ON
+  BEHALF OF" report section for the same relationship, described rather
+  than judged.
+
+A fifth, **`adapter-freshness`** (`{ adapter, maxAgeHours }`), is *not* in
+the default set — evaluating it needs a specific adapter name and a
+maximum age in hours, and guessing either (which adapters actually run
+in your deployment, what cadence counts as "fresh") is exactly the kind
+of guess this project's adapters already refuse to make (see e.g.
+[Usage 12](#12-populate-grants-from-postgres-role-membership)'s
+`roleTiers` having no default). Pass your own list to `evaluatePolicies()`
+to add one per adapter you actually schedule — a stale or silently-failing
+real run (`dry_run = false`) beyond your own limit is a violation; a
+dry-run-only or never-run adapter isn't, same "nothing to report yet"
+stance as [Usage 11](#11-check-on-scheduled-adapter-runs)'s own
+`latestRuns()`.
 
 Same shape as `TOOL_CAPABILITIES` — a plain, hand-written TypeScript
 array, not a parsed text format. `Relationship-Based-Authorization`
@@ -470,6 +504,63 @@ Accepts `--dry-run` — see [Usage 2](#2-populate-grants-from-your-agents-config
 > first version of this adapter reported its own connecting credential as
 > a member of every tier, before that fix.
 
+### 13. Verify the event chain hasn't been tampered with
+
+```bash
+npm run verify-chain
+```
+
+`src/log.ts`'s own `verifyChain()` is the entire tamper-evidence property
+this repo exists to prove — and until now, nothing outside its own test
+suite ever called it. This is that runner: replays the whole chain,
+prints the first break in each broken run (a row's hash no longer
+matches its own content, or it no longer links to the row before it —
+someone edited or deleted an `event` row directly), and exits nonzero if
+it finds one. The `chain-intact` policy rule ([Usage 10](#10-check-policy-violations))
+calls the same function — run either on a schedule; they report the same
+thing two different ways (a plain break list here, a `PolicyViolation`
+there).
+
+### 14. Track real Postgres query activity
+
+```bash
+PRINCIPAL_GRAPH_PG_TARGETS='[{"label":"prod","connectionString":"postgresql://readonly_audit@prod-host/app"}]' \
+PRINCIPAL_GRAPH_PG_READ_ROLE=app_read                                                                         \
+PRINCIPAL_GRAPH_PG_WRITE_ROLE=app_write                                                                       \
+PRINCIPAL_GRAPH_PG_ADMIN_ROLE=app_admin                                                                       \
+  npm run adapter:postgres-usage
+```
+
+The biggest structural gap this report had: five grant-source adapters
+write `grant_edge`; only the broker sink ever wrote `event`, and only for
+tool calls. That meant `unused_grant`/`stale-grant` could never see a
+matching allow event for a GitHub/AWS/Workspace/Postgres grant — not
+because nobody used it, but because nothing ever looked. This is the
+first adapter that looks, for one of those five sources: it reads
+`pg_stat_activity` (same target/role-tier config as [Usage 12](#12-populate-grants-from-postgres-role-membership),
+via the same authoritative `pg_has_role()`) for every currently-active
+login role that's a member of at least one tracked tier, and records an
+honest `allow` event for each — `action = 'call'`, the same sentinel the
+broker sink uses, because this genuinely doesn't know which tier a query
+exercised and isn't going to guess by parsing SQL text (see
+[Usage 6](#6-classify-what-each-tool-can-do)'s own "a wrong automatic
+classification is worse than a short manual one").
+
+**Honest limitation, not closed here**: this is a snapshot, not a log. A
+role that connects, runs one query, and disconnects between two runs is
+invisible to it — this only ever proves "active at the moment we looked."
+Run it on a tight interval (every minute, say) to narrow that gap, not to
+close it; `pgaudit` statement logging would close it properly, and isn't
+what this adapter does.
+
+> **Live-verified**: a real second connection genuinely running a query
+> as a tier-member role, observed live via `pg_stat_activity` while this
+> adapter's own CLI ran concurrently — both the "active and a tier
+> member" and "connected but idle" cases checked for real, not mocked
+> (see `test/postgres-usage.spec.ts`). The resulting event was then
+> confirmed, end to end, to move the same grant out of the report's
+> UNUSED GRANTS section via `npm run report`.
+
 ## Data model
 
 Five tables (`schema/001_core.sql`):
@@ -485,6 +576,11 @@ Five tables (`schema/001_core.sql`):
 Two views built on top, read by the report:
 
 - `unused_grant` — a live grant with no matching `allow` event in 90 days.
+  Frozen along with `001_core.sql` itself, and kept for reference — has a
+  real bug (matches an event to a grant by `(principal, resource)` alone,
+  so one allow event masks every relation a principal holds on the same
+  resource) that can't be fixed here. `src/views/report.ts` no longer
+  reads it.
 - `trifecta_exposure` — a principal whose live grants together cover
   `read_private`, `ingest_untrusted`, and `egress`.
 
@@ -496,7 +592,10 @@ serving `unused_grant` and `checkStaleGrant`'s shared query shape — no new
 tables, nothing that changes what any query returns. A fourth,
 `schema/004_adapter_runs.sql`, adds `adapter_run` — run-history for the
 scheduled write side (see [Usage 11](#11-check-on-scheduled-adapter-runs)) —
-also internal bookkeeping, not part of the grant graph.
+also internal bookkeeping, not part of the grant graph. A fifth,
+`schema/005_unused_grant_relation_fix.sql`, adds `unused_grant_by_relation`
+— `unused_grant`'s own query with the relation-matching fix above applied;
+this is what `report.ts` actually reads now.
 
 ## Project layout
 
@@ -505,6 +604,7 @@ schema/            SQL migrations — 001_core.sql is the shared core
                      002_rba_export_state.sql adds the RBA exporter's own sync state
                      003_performance_indexes.sql adds indexes only, no schema change
                      004_adapter_runs.sql adds adapter_run, scheduled-run history
+                     005_unused_grant_relation_fix.sql adds unused_grant_by_relation
 rba/
   principal-graph.authz  RBA's own namespace schema for this project's grant data
 src/
@@ -525,8 +625,9 @@ src/
     aws-s3.ts                    feeds grant_edge from IAM Policy Simulator results on S3 buckets
     workspace-groups.ts           feeds grant_edge from a Google Group's resolved membership
     postgres-roles.ts               feeds grant_edge from a target database's own tier-role membership
+    postgres-usage.ts                feeds event from pg_stat_activity — a usage adapter, not a grant one
   views/
-    report.ts         buildReport()/formatReport() — the three-section report
+    report.ts         buildReport()/formatReport() — the four-section report
   exporters/
     rba.ts             feeds RBA relationship tuples from grant_edge (the reverse of an adapter)
 scripts/
@@ -538,6 +639,8 @@ scripts/
   run-migrations.ts          npm run migrate
   run-adapter-status.ts       npm run adapter-status
   run-postgres-adapter.ts     npm run adapter:postgres
+  run-postgres-usage-adapter.ts   npm run adapter:postgres-usage
+  run-verify-chain.ts          npm run verify-chain
   run-server.ts               npm run serve
   run-policy-check.ts          npm run policy-check
   report.ts                  npm run report

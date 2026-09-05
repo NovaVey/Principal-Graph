@@ -6,7 +6,8 @@
  * postgres-roles.ts and postgres-usage.ts are documented (see
  * postgres-usage.ts's own header: "Same identity as postgres-roles.ts")
  * to upsert the exact same (kind: 'db'/'human', source: 'postgres',
- * external_id: <role name>) principal/resource rows. `npm run sync`
+ * external_id: postgresPrincipalExternalId(target, roleName)) principal/
+ * resource rows. `npm run sync`
  * itself only ever runs one adapter at a time, but nothing stops an
  * operator from running `npm run adapter:postgres-usage` by hand while
  * `npm run sync` is mid-way through `postgres-roles` — neither takes the
@@ -23,7 +24,11 @@
 import { before, beforeEach, after, test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { runPostgresAdapter, type QueryTargetRoles } from '../src/adapters/postgres-roles.js';
+import {
+  runPostgresAdapter,
+  postgresPrincipalExternalId,
+  type QueryTargetRoles,
+} from '../src/adapters/postgres-roles.js';
 import { runPostgresUsageAdapter, type QueryActiveRoles } from '../src/adapters/postgres-usage.js';
 import { verifyChain } from '../src/log.js';
 import { pool, resetDatabase } from './helpers.js';
@@ -76,7 +81,7 @@ void test('postgres-roles and postgres-usage racing on the same target/roles pro
   for (const role of SHARED_ROLES) {
     const { rows } = await pool.query<{ id: string; count: string }>(
       `select id, count(*)::text as count from principal where source = 'postgres' and external_id = $1 group by id`,
-      [role],
+      [postgresPrincipalExternalId(TARGET, role)],
     );
     assert.equal(rows.length, 1, `exactly one principal row for role ${role}, not a duplicate`);
     assert.equal(rows[0]?.count, '1');
@@ -88,14 +93,15 @@ void test('postgres-roles and postgres-usage racing on the same target/roles pro
   const { rows: principalRows } = await pool.query<{ id: string; external_id: string }>(
     `select id, external_id from principal where source = 'postgres'`,
   );
-  const principalIdByRole = new Map(principalRows.map((r) => [r.external_id, r.id]));
+  const principalIdByExternalId = new Map(principalRows.map((r) => [r.external_id, r.id]));
 
   const { rows: grantRows } = await pool.query<{ principal_id: string }>(
     `select principal_id from grant_edge where source = 'postgres' and revoked_at is null`,
   );
   for (const role of SHARED_ROLES) {
+    const principalId = principalIdByExternalId.get(postgresPrincipalExternalId(TARGET, role));
     assert.ok(
-      grantRows.some((g) => g.principal_id === principalIdByRole.get(role)),
+      grantRows.some((g) => g.principal_id === principalId),
       `grant_edge should reference the same principal id postgres-roles resolved for ${role}`,
     );
   }
@@ -104,8 +110,9 @@ void test('postgres-roles and postgres-usage racing on the same target/roles pro
     `select principal_id from event where action = 'call'`,
   );
   for (const role of SHARED_ROLES) {
+    const principalId = principalIdByExternalId.get(postgresPrincipalExternalId(TARGET, role));
     assert.ok(
-      eventRows.some((e) => e.principal_id === principalIdByRole.get(role)),
+      eventRows.some((e) => e.principal_id === principalId),
       `event should reference the same principal id postgres-usage resolved for ${role}`,
     );
   }

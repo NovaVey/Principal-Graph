@@ -59,6 +59,23 @@ namespace bucket {
 // Produced by src/adapters/workspace-groups.ts. Google's own three
 // membership roles, lowercased — see relationFromRole() in
 // src/adapters/workspace-groups.ts.
+//
+// Every relation's subject is `principal`, deliberately never a subject
+// SET (`principal | group#member`, letting one group nest inside
+// another) — a closed design question, not an open one. Google's own
+// `includeDerivedMembership` already resolves nested-group membership
+// into a flat list of real users before this adapter ever sees it, and a
+// nested `type: 'GROUP'` entry is skipped outright (see
+// workspace-groups.ts's own header) — so this project never actually
+// HAS group-nesting data to express as a subject-set rewrite in the
+// first place. Modeling `group#member` here anyway, against data that
+// doesn't exist, would duplicate territory RBA already owns for no
+// adapter's real output (the same reasoning src/policies.ts gives for
+// not building a second policy DSL), and nothing downstream would
+// consume it either: this exporter is one-way (`grant_edge` → RBA), and
+// no report/policy in this repo ever queries RBA back for a transitive
+// result. Revisit only if a real adapter starts producing actual
+// group-nesting data that some source API doesn't already flatten.
 namespace group {
   relation owner: principal
   relation manager: principal

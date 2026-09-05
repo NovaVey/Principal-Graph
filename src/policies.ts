@@ -23,7 +23,7 @@ import type { Pool } from 'pg';
 import type { Queryable } from './upsert.js';
 import type { Relation } from './model.js';
 import { resolveName } from './views/report.js';
-import { verifyChainAnchored } from './chain-checkpoint.js';
+import { verifyChainIncremental } from './chain-checkpoint.js';
 import type { AdapterName } from './run-history.js';
 
 export type PolicyRule =
@@ -71,20 +71,29 @@ export interface PolicyViolation {
  *     PostgresAdapterOptions.roleTiers's own "no default" reasoning).
  *     Configure one instance per adapter you actually schedule.
  *   - `chain-intact` is ALSO deliberately not in the default set, for a
- *     different reason: it calls src/log.ts's own verifyChain(), which
- *     pulls the ENTIRE event table into memory on every call (frozen —
- *     see its own doc comment; no bounded/incremental variant exists to
- *     call instead without duplicating its hash algorithm outside its
- *     one source of truth, a risk not worth taking for what this
- *     property exists to guarantee). In the default set, a routine
- *     `policy-check` cron would get slower forever as the log grows —
- *     confirmed with EXPLAIN ANALYZE at 100k rows before this comment was
- *     written. `npm run verify-chain` (scripts/run-verify-chain.ts) is
- *     the right way to run this: on its own periodic cadence (a full
- *     audit, not a per-run check), separate from `policy-check`. Still
- *     fully usable from `evaluatePolicies()` too — pass
+ *     narrower reason than it used to be: this rule calls
+ *     verifyChainIncremental() (src/chain-checkpoint.ts), which re-hashes
+ *     only the `event` rows added since the last checkpoint rather than
+ *     the whole table on every call — the cost that used to make this
+ *     rule unsafe for a routine cron (a full `verifyChain()` replay,
+ *     confirmed with EXPLAIN ANALYZE at 100k rows: 1.2s and 100MB+ RSS,
+ *     linear and unbounded as the log grows) no longer applies once a
+ *     checkpoint exists. verifyChainIncremental() does duplicate
+ *     src/log.ts's private hash algorithm outside its one source of
+ *     truth (src/chain-hash.ts) — safe specifically because src/log.ts is
+ *     frozen (nothing for the copy to drift from) and cross-checked
+ *     directly against real appendEvent() output
+ *     (test/chain-hash.spec.ts), not just asserted. What still keeps this
+ *     rule opt-in: the incremental path trusts everything at or before
+ *     the last checkpoint, so a row edited there without anything AFTER
+ *     it changing stays invisible to it forever — closing that fully
+ *     still needs a periodic full replay, and `npm run verify-chain`
+ *     (scripts/run-verify-chain.ts) is that job, on its own cadence,
+ *     separate from `policy-check`. Still fully usable from
+ *     `evaluatePolicies()` too — pass
  *     `[...POLICIES, { kind: 'chain-intact' }]` explicitly if you want it
- *     folded into one report anyway.
+ *     folded into one report anyway; it's now cheap enough to run on
+ *     every tick, it just isn't the thing that catches old tampering.
  */
 export const POLICIES: readonly PolicyRule[] = [
   { kind: 'no-trifecta' },
@@ -181,14 +190,19 @@ async function checkStaleGrant(
 
 async function checkChainIntact(db: Queryable): Promise<PolicyViolation[]> {
   const rule: PolicyRule = { kind: 'chain-intact' };
-  // verifyChainAnchored() (src/chain-checkpoint.ts) itself calls
-  // verifyChain() (src/log.ts, frozen), which is typed against a real
-  // `Pool` specifically but only ever calls `.query()` on it — the one
-  // method Queryable's PoolClient branch also has. Every actual caller of
-  // evaluatePolicies (scripts/run-policy-check.ts, this file's own tests)
-  // passes a real Pool regardless; this cast just satisfies the frozen
-  // signature, it doesn't change what runs.
-  const { breaks, anchorBreak } = await verifyChainAnchored(db as Pool);
+  // verifyChainIncremental() (src/chain-checkpoint.ts) only re-walks
+  // `event` rows added since the last checkpoint instead of the whole
+  // table on every call — see that function's own doc comment for the
+  // full reasoning and its one real trade-off (a full periodic replay,
+  // scripts/run-verify-chain.ts, is what still catches tampering older
+  // than the last checkpoint). It's typed against a real `Pool`
+  // specifically (via verifyChain(), src/log.ts, frozen) but only ever
+  // calls `.query()` on it — the one method Queryable's PoolClient branch
+  // also has. Every actual caller of evaluatePolicies
+  // (scripts/run-policy-check.ts, this file's own tests) passes a real
+  // Pool regardless; this cast just satisfies the frozen signature, it
+  // doesn't change what runs.
+  const { breaks, anchorBreak } = await verifyChainIncremental(db as Pool);
   const violations = breaks.map((b) => ({
     rule,
     description:

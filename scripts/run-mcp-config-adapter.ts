@@ -20,7 +20,7 @@
 import { hostname, userInfo } from 'node:os';
 import { createPool } from '../src/db.js';
 import { runMcpConfigAdapter } from '../src/adapters/mcp-config.js';
-import { startRun, finishRun } from '../src/run-history.js';
+import { startRun, finishRun, withAdapterLock } from '../src/run-history.js';
 
 async function main(): Promise<void> {
   const dryRun = process.argv.includes('--dry-run');
@@ -28,43 +28,57 @@ async function main(): Promise<void> {
   const agentExternalId =
     process.env.PRINCIPAL_GRAPH_AGENT_ID ?? `${userInfo().username}@${hostname()}`;
   try {
-    const runId = await startRun(pool, 'mcp-config', { dryRun });
-    try {
-      const result = await runMcpConfigAdapter(pool, {
-        runId,
-        agent: {
-          source: 'mcp-config',
-          externalId: agentExternalId,
-          displayName: `Claude Code (${agentExternalId})`,
-        },
-        dryRun,
-      });
-      if (dryRun) console.log('DRY RUN — nothing below was actually written to grant_edge\n');
-      const verb = dryRun ? 'would grant' : 'granted';
-      console.log(`principal: ${result.principalId} (${agentExternalId})`);
-      console.log(
-        `${verb} (${result.grantedTools.length}): ${result.grantedTools.join(', ') || '(none)'}`,
-      );
-      if (result.revokedTools.length > 0) {
+    const runOnce = async (): Promise<void> => {
+      const runId = await startRun(pool, 'mcp-config', { dryRun });
+      try {
+        const result = await runMcpConfigAdapter(pool, {
+          runId,
+          agent: {
+            source: 'mcp-config',
+            externalId: agentExternalId,
+            displayName: `Claude Code (${agentExternalId})`,
+          },
+          dryRun,
+        });
+        if (dryRun) console.log('DRY RUN — nothing below was actually written to grant_edge\n');
+        const verb = dryRun ? 'would grant' : 'granted';
+        console.log(`principal: ${result.principalId} (${agentExternalId})`);
         console.log(
-          `${dryRun ? 'would revoke' : 'revoked this run'} (${result.revokedTools.length}): ${result.revokedTools.join(', ')}`,
+          `${verb} (${result.grantedTools.length}): ${result.grantedTools.join(', ') || '(none)'}`,
         );
+        if (result.revokedTools.length > 0) {
+          console.log(
+            `${dryRun ? 'would revoke' : 'revoked this run'} (${result.revokedTools.length}): ${result.revokedTools.join(', ')}`,
+          );
+        }
+        if (result.unresolvedEntries.length > 0) {
+          console.log(
+            `unresolved (whole-server wildcard, or a scope-mismatched deny — see src/adapters/mcp-config.ts): ${result.unresolvedEntries.join(', ')}`,
+          );
+        }
+        if (result.askTools.length > 0) {
+          console.log(
+            `requires interactive confirmation on every use, per permissions.ask (not written as a grant): ${result.askTools.join(', ')}`,
+          );
+        }
+        await finishRun(pool, runId, {
+          status: 'success',
+          detail: `${result.grantedTools.length} granted, ${result.revokedTools.length} revoked`,
+        });
+      } catch (err) {
+        await finishRun(pool, runId, {
+          status: 'failure',
+          error: err instanceof Error ? err.message : String(err),
+        });
+        throw err;
       }
-      if (result.unresolvedEntries.length > 0) {
-        console.log(
-          `unresolved (whole-server wildcards, not expanded — see src/adapters/mcp-config.ts): ${result.unresolvedEntries.join(', ')}`,
-        );
-      }
-      await finishRun(pool, runId, {
-        status: 'success',
-        detail: `${result.grantedTools.length} granted, ${result.revokedTools.length} revoked`,
-      });
-    } catch (err) {
-      await finishRun(pool, runId, {
-        status: 'failure',
-        error: err instanceof Error ? err.message : String(err),
-      });
-      throw err;
+    };
+    // See src/run-history.ts's withAdapterLock(): a dry run never writes
+    // to grant_edge, so it skips the lock entirely.
+    if (dryRun) {
+      await runOnce();
+    } else {
+      await withAdapterLock(pool, 'mcp-config', runOnce);
     }
   } finally {
     await pool.end();

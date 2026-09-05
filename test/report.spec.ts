@@ -20,11 +20,23 @@ after(async () => {
   await pool.end();
 });
 
-async function grant(principalId: string, resourceId: string, observedAt?: Date): Promise<void> {
+/**
+ * `firstObservedAt` drives the report's own sort/"unused since" text
+ * (src/policies.ts, src/views/report.ts both read `first_observed_at`,
+ * not `observed_at` — schema/010_grant_edge_observed_split.sql), so it's
+ * set explicitly here alongside observed_at/changed_at rather than left
+ * to its own `default now()`, the same way this helper always has for
+ * observed_at.
+ */
+async function grant(
+  principalId: string,
+  resourceId: string,
+  firstObservedAt?: Date,
+): Promise<void> {
   await pool.query(
-    `insert into grant_edge (principal_id, resource_id, relation, source, observed_at)
-     values ($1, $2, 'can_call', 'manual', coalesce($3, now()))`,
-    [principalId, resourceId, observedAt ?? null],
+    `insert into grant_edge (principal_id, resource_id, relation, source, observed_at, first_observed_at, changed_at)
+     values ($1, $2, 'can_call', 'manual', coalesce($3, now()), coalesce($3, now()), coalesce($3, now()))`,
+    [principalId, resourceId, firstObservedAt ?? null],
   );
 }
 

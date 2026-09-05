@@ -7,11 +7,23 @@
  * agent config file" this repo actually has on hand — layered the way
  * Claude Code itself layers it: a user-level `~/.claude/settings.json`,
  * a project-level `.claude/settings.json`, and a machine-local
- * `.claude/settings.local.json` on top. Each layer's `permissions.allow`
- * entries union together (any layer granting a tool is enough); a `deny`
- * entry in ANY layer wins over an identical `allow` entry, matching how
- * Claude Code's own deny list is meant to behave. Nothing here launches an
- * MCP server or calls it — those files are plain JSON on disk.
+ * `.claude/settings.local.json` on top. Each layer's `permissions.allow`,
+ * `deny`, and `ask` entries all union together the same way (any layer
+ * naming an entry is enough). A `deny` entry cancels an `allow` naming the
+ * same bare tool whenever it's either an exact match or itself unscoped
+ * (no parentheses) — a scopeless deny is authoritative for the whole tool.
+ * A deny and allow that both carry their OWN, different scope for the same
+ * tool (`deny: ["Bash(curl:*)"]` against `allow: ["Bash"]`, say) can't be
+ * resolved to a clean grant-or-no-grant fact without parsing and comparing
+ * the scope strings themselves — this adapter doesn't, so that lands in
+ * `unresolved` alongside whole-server wildcards, not silently one or the
+ * other; see isUnscopedDenyOf() and parseAllowedTools()'s own comments.
+ * `permissions.ask` names tools Claude Code prompts for on every real use
+ * regardless of `allow` — surfaced as ParsedGrants.askTools purely for
+ * visibility, never written into `grant_edge` (see its own doc comment for
+ * why: it's neither a standing grant nor no access, a third state this
+ * schema has no relation for). Nothing here launches an MCP server or
+ * calls it — those files are plain JSON on disk.
  *
  * A `permissions.allow` entry is either:
  *   - a specific MCP tool: `mcp__<server>__<tool>` — becomes a grant for
@@ -72,6 +84,7 @@ interface ClaudeSettings {
   permissions?: {
     allow?: string[];
     deny?: string[];
+    ask?: string[];
   };
 }
 
@@ -104,22 +117,91 @@ export function toolNameFromPermissionEntry(entry: string): string | undefined {
 export interface ParsedGrants {
   /** Tool names resolved to a specific grant, deduplicated. */
   tools: Set<string>;
-  /** allow entries this adapter could not resolve to one tool (whole-server wildcards) — surfaced, never silently dropped. */
+  /**
+   * allow entries this adapter could not resolve to a clean grant-or-no-grant
+   * fact from config alone — surfaced, never silently dropped. Two distinct
+   * causes land here, both for the same underlying reason (see
+   * toolNameFromPermissionEntry() and isUnscopedDenyOf() below):
+   *   - a whole-server wildcard allow (`mcp__<server>` / `mcp__<server>__*`),
+   *     which can't be resolved to one tool name at all without a live
+   *     capability handshake this adapter deliberately never makes;
+   *   - an allow whose bare tool name is also named by a deny entry that
+   *     carries its OWN, different scope (e.g. `deny: ["Bash(curl:*)"]`
+   *     against `allow: ["Bash"]`) — this project has no column to record
+   *     "Bash minus curl", so it isn't recorded as either a clean grant or
+   *     a clean denial.
+   */
   unresolved: string[];
+  /**
+   * Tool names named in `permissions.ask` — Claude Code prompts for
+   * confirmation on every real use of these, which is neither "always
+   * granted" (`grant_edge`'s own relation implies standing access with no
+   * per-call gate) nor "not permitted at all" — a third state this schema
+   * has no column for. Surfaced here for visibility only; runMcpConfigAdapter
+   * never writes these into `grant_edge`. A whole-server wildcard in `ask`
+   * is silently skipped rather than added to `unresolved` too — unlike an
+   * allow entry, an unresolved ask entry names nothing this project would
+   * otherwise claim as a grant, so there's no overclaiming risk to guard
+   * against by surfacing it.
+   */
+  askTools: Set<string>;
+}
+
+/**
+ * True if `denyEntry` has no parenthesized scope of its own — a scopeless
+ * deny is authoritative for every use of the tool it names, so it cancels
+ * ANY allow entry naming that same bare tool, however that allow entry is
+ * itself scoped. A deny that DOES carry its own scope can only be treated
+ * this way when it's identical to the allow entry (an exact match cancels
+ * cleanly, the one case this adapter has always handled) — a different
+ * scope on each side (`Bash(curl:*)` denied, `Bash` or `Bash(npm run *)`
+ * allowed) might carve out all, some, or none of what the allow covers,
+ * and this adapter doesn't parse the scope strings to tell which — same
+ * "don't guess" instinct as leaving a whole-server wildcard unresolved.
+ */
+function isUnscopedDenyOf(denyEntry: string): boolean {
+  return !denyEntry.includes('(');
 }
 
 /** Pure function over an already-merged settings object — see mergeSettings(). */
 export function parseAllowedTools(settings: ClaudeSettings): ParsedGrants {
-  const deny = new Set(settings.permissions?.deny ?? []);
+  const denyEntries = settings.permissions?.deny ?? [];
   const tools = new Set<string>();
   const unresolved: string[] = [];
+
   for (const entry of settings.permissions?.allow ?? []) {
-    if (deny.has(entry)) continue; // exact-match deny wins; no broader precedence rules than that
     const tool = toolNameFromPermissionEntry(entry);
-    if (tool) tools.add(tool);
-    else unresolved.push(entry);
+    if (!tool) {
+      unresolved.push(entry);
+      continue;
+    }
+
+    let denied = false;
+    let ambiguous = false;
+    for (const denyEntry of denyEntries) {
+      if (toolNameFromPermissionEntry(denyEntry) !== tool) continue;
+      if (denyEntry === entry || isUnscopedDenyOf(denyEntry)) {
+        denied = true;
+        break;
+      }
+      ambiguous = true;
+    }
+
+    if (denied) continue;
+    if (ambiguous) {
+      unresolved.push(entry);
+      continue;
+    }
+    tools.add(tool);
   }
-  return { tools, unresolved };
+
+  const askTools = new Set<string>();
+  for (const entry of settings.permissions?.ask ?? []) {
+    const tool = toolNameFromPermissionEntry(entry);
+    if (tool) askTools.add(tool);
+  }
+
+  return { tools, unresolved, askTools };
 }
 
 function readJsonIfExists(path: string): ClaudeSettings | undefined {
@@ -135,15 +217,17 @@ function readJsonIfExists(path: string): ClaudeSettings | undefined {
   }
 }
 
-/** allow entries union across layers (any layer granting a tool is enough); deny entries union too, so a deny anywhere wins — see this file's header. */
+/** allow entries union across layers (any layer granting a tool is enough); deny and ask entries union the same way — see this file's header. */
 function mergeSettings(layers: readonly (ClaudeSettings | undefined)[]): ClaudeSettings {
   const allow = new Set<string>();
   const deny = new Set<string>();
+  const ask = new Set<string>();
   for (const layer of layers) {
     for (const entry of layer?.permissions?.allow ?? []) allow.add(entry);
     for (const entry of layer?.permissions?.deny ?? []) deny.add(entry);
+    for (const entry of layer?.permissions?.ask ?? []) ask.add(entry);
   }
-  return { permissions: { allow: [...allow], deny: [...deny] } };
+  return { permissions: { allow: [...allow], deny: [...deny], ask: [...ask] } };
 }
 
 /**
@@ -192,6 +276,8 @@ export interface McpConfigAdapterResult {
   revokedTools: string[];
   /** allow entries this run couldn't resolve to one tool — see parseAllowedTools(). */
   unresolvedEntries: string[];
+  /** Tool names named in `permissions.ask`, sorted — informational only, never written as a grant. See ParsedGrants.askTools. */
+  askTools: string[];
 }
 
 export async function runMcpConfigAdapter(
@@ -201,7 +287,7 @@ export async function runMcpConfigAdapter(
   const paths = opts.configPaths ?? defaultClaudeCodeConfigPaths();
   const layers = paths.map(readJsonIfExists);
   const merged = mergeSettings(layers);
-  const { tools, unresolved } = parseAllowedTools(merged);
+  const { tools, unresolved, askTools } = parseAllowedTools(merged);
 
   const principalId = await ensurePrincipal(db, { kind: 'agent', ...opts.agent });
 
@@ -229,7 +315,12 @@ export async function runMcpConfigAdapter(
         `insert into grant_edge (principal_id, resource_id, relation, source)
          values ($1, $2, 'can_call', 'mcp-config')
          on conflict (principal_id, resource_id, relation, source) do update
-           set observed_at = now(), revoked_at = null
+           set observed_at = now(),
+               revoked_at = null,
+               -- Bumped only on a real transition (reinstated after being
+               -- revoked), never on a plain re-observation — see
+               -- schema/010_grant_edge_observed_split.sql's own header.
+               changed_at = case when grant_edge.revoked_at is not null then now() else grant_edge.changed_at end
          returning id`,
         [principalId, resourceId],
       );
@@ -289,5 +380,6 @@ export async function runMcpConfigAdapter(
     grantedTools,
     revokedTools: revokedRows.map((r) => r.external_id).sort(compareToolNames),
     unresolvedEntries: unresolved,
+    askTools: [...askTools].sort(compareToolNames),
   };
 }

@@ -60,7 +60,17 @@ export interface UnusedGrantRow {
   resource: string;
   relation: string;
   source: string;
-  observedAt: Date;
+  /**
+   * When this grant (this exact principal/resource/relation/source row)
+   * was first created — never touched by an adapter's later re-observation
+   * of the same grant (schema/010_grant_edge_observed_split.sql). This is
+   * what "unused since" below reads and what the sort tie-breaks on;
+   * before this column existed, both read `observed_at`, which every
+   * adapter run bumps regardless of whether anything actually changed —
+   * a 200-day-old grant re-observed a second ago read "unused since
+   * [just now]".
+   */
+  firstObservedAt: Date;
   /** null when nothing has classified this resource yet (src/capabilities.ts). */
   capabilities: Capability[] | null;
   /** True if `source` has any usage feed at all — see SOURCES_WITH_USAGE_FEED. False means "unused" here only ever means "we never checked," not "verified unused." */
@@ -165,7 +175,7 @@ export async function buildReport(db: Queryable, opts: BuildReportOptions = {}):
       resource_external_id: string;
       relation: string;
       source: string;
-      observed_at: Date;
+      first_observed_at: Date;
       capabilities: Capability[] | null;
       resource_last_seen_at: Date | null;
     }>(
@@ -194,7 +204,7 @@ export async function buildReport(db: Queryable, opts: BuildReportOptions = {}):
       // that's the honest "never checked" state, not an error.
       `select u.principal_kind, u.principal, p.external_id as principal_external_id,
               u.resource, r.external_id as resource_external_id,
-              u.relation, u.source, u.observed_at, u.capabilities::text[] as capabilities,
+              u.relation, u.source, u.first_observed_at, u.capabilities::text[] as capabilities,
               rls.last_seen_at as resource_last_seen_at
          from unused_grant_by_relation u
          join grant_edge g on g.id = u.grant_id
@@ -276,7 +286,7 @@ export async function buildReport(db: Queryable, opts: BuildReportOptions = {}):
       resource: resolveName(r.resource, r.resource_external_id),
       relation: r.relation,
       source: r.source,
-      observedAt: r.observed_at,
+      firstObservedAt: r.first_observed_at,
       capabilities: r.capabilities,
       hasUsageFeed: SOURCES_WITH_USAGE_FEED.has(r.source),
       resourceLastSeenAt: r.resource_last_seen_at,
@@ -284,8 +294,12 @@ export async function buildReport(db: Queryable, opts: BuildReportOptions = {}):
     .sort((a, b) => {
       const byDanger = dangerRankOf(a.capabilities) - dangerRankOf(b.capabilities);
       if (byDanger !== 0) return byDanger;
-      // Tie: the longer a dangerous-enough grant has sat unused, the more it's worth a look.
-      return a.observedAt.getTime() - b.observedAt.getTime();
+      // Tie: the longer a dangerous-enough grant has sat unused, the more
+      // it's worth a look — firstObservedAt, not the (bumped by every
+      // adapter run) observed_at, or this would really be sorting by
+      // which adapter last ran. See UnusedGrantRow.firstObservedAt's own
+      // doc comment.
+      return a.firstObservedAt.getTime() - b.firstObservedAt.getTime();
     });
 
   const trifectaExposure: TrifectaRow[] = trifectaRows.rows
@@ -345,8 +359,8 @@ function formatUnusedGrant(row: UnusedGrantRow): string {
   // hasUsageFeed distinguishes "verified unused" from "never looked" — see
   // SOURCES_WITH_USAGE_FEED's own doc comment for why this matters.
   const status = row.hasUsageFeed
-    ? `unused since ${formatTimestamp(row.observedAt)}`
-    : `unused since ${formatTimestamp(row.observedAt)} — but '${row.source}' has no usage feed, so this only means "never checked," not "verified unused"`;
+    ? `unused since ${formatTimestamp(row.firstObservedAt)}`
+    : `unused since ${formatTimestamp(row.firstObservedAt)} — but '${row.source}' has no usage feed, so this only means "never checked," not "verified unused"`;
   // resourceLastSeenAt: only populated for a resource a liveness-tracking
   // adapter has actually checked (src/resource-liveness.ts) — null for
   // most rows, which is the honest "not tracked for this source" state,

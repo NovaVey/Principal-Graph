@@ -18,7 +18,27 @@ the report (CLI and HTTP, with an optional Slack alert) with three
 default policy checks (no-trifecta, stale-grant, on-behalf-of-escalation)
 plus two opt-in ones (chain-intact, per-adapter freshness), migration
 tracking, adapter run-history, and the export bridge into
-Relationship-Based-Authorization are all implemented and tested. See
+Relationship-Based-Authorization are all implemented and tested.
+
+A second structural review closed six more gaps on top of that: the event
+chain's tamper-evidence now survives someone deleting rows from its tail,
+not just editing one in the middle
+([Usage 13](#13-verify-the-event-chain-hasnt-been-tampered-with));
+`grant_edge`'s "last observed" and "last actually changed" timestamps are
+no longer the same column, fixing the RBA exporter's incremental sync and
+`stale-grant`'s "unused for N days" text; two real invocations of the same
+adapter can no longer overlap and interleave their revoke computations
+([Usage 18](#18-prevent-two-runs-of-the-same-adapter-from-overlapping));
+the AWS adapter now fetches and passes each bucket's own policy for IAM
+user principals and surfaces conditional (MFA/IP-gated) allows instead of
+discarding them; the RBA exporter no longer lets one permanently-failing
+tuple pin its sync watermark forever; and a handful of smaller
+correctness fixes (a misconfigured `DATABASE_URL` now warns loudly instead
+of silently connecting to the wrong database, an adapter policy names but
+that has never actually run is now a violation, an edited already-applied
+migration is now detected, `permissions.ask`/scoped `deny` entries are
+read correctly, and a mass-violation Slack alert can no longer exceed
+Slack's own message-size limit and get silently dropped). See
 [Related projects](#related-projects) for what feeds this repo, what it
 feeds, and what it doesn't do yet.
 
@@ -45,6 +65,7 @@ feeds, and what it doesn't do yet.
   - [15. Guard against runaway revocation](#15-guard-against-runaway-revocation)
   - [16. Answer "which run touched this grant"](#16-answer-which-run-touched-this-grant)
   - [17. Stop treating deleted resources as live forever](#17-stop-treating-deleted-resources-as-live-forever)
+  - [18. Prevent two runs of the same adapter from overlapping](#18-prevent-two-runs-of-the-same-adapter-from-overlapping)
 - [Data model](#data-model)
 - [Project layout](#project-layout)
 - [Development](#development)
@@ -97,15 +118,25 @@ npm test    # DATABASE_URL defaults to postgresql://postgres:devpass@localhost:5
 
 Set `DATABASE_URL` to point at a different instance. Tests run against a real
 Postgres, not a mock — the tamper-evidence property in `src/log.ts` only means
-something proven against a real database.
+something proven against a real database. `createPool()` (`src/db.ts`) falls
+back to the connection string above when `DATABASE_URL` is unset — genuinely
+useful for exactly this quick-start/test path, but it now warns loudly on
+stderr when it does, so a typo'd env var in a real deployment doesn't
+silently run every adapter and policy check against the wrong database (an
+empty one reports a clean "no violations" either way — see
+[Usage 10](#10-check-policy-violations)).
 
 The three `docker exec`/`psql -f` lines above are the fastest path for one
 fresh database, but stop scaling once you're keeping multiple environments
 (a shared dev DB, staging, a teammate's laptop) current across 3+ migration
 files — `npm run migrate` (`scripts/run-migrations.ts`) tracks which have
 already been applied and only runs what's missing, safe to run repeatedly.
-CI uses it too. See that script's own header for how to adopt it on a
-database that already has some migrations applied the old way.
+It also holds an advisory lock for the whole pass (two runners can't
+double-apply the same file) and records a checksum per applied migration,
+so editing one after the fact is a loud error instead of an undetectable
+rewrite of schema history — pointed for a project whose whole thesis is
+tamper evidence. CI uses it too. See that script's own header for how to
+adopt it on a database that already has some migrations applied the old way.
 
 ## Usage
 
@@ -158,6 +189,20 @@ permitted tool. Re-running it revokes (never deletes) a grant whose tool has
 since disappeared from config. `PRINCIPAL_GRAPH_AGENT_ID` overrides the
 agent identity (defaults to `<os user>@<hostname>`).
 
+A `deny` entry cancels an `allow` for the same tool when it's either an
+exact match or itself unscoped (`deny: ["Bash"]` cancels *any* `allow`
+naming `Bash`, scoped or not — a scopeless deny is authoritative for the
+whole tool). A `deny` and `allow` that both carry their own, *different*
+scope for the same tool (`deny: ["Bash(curl:*)"]` against `allow:
+["Bash"]`, say) can't be resolved to a clean grant-or-no-grant fact
+without parsing and comparing the scope strings themselves, which this
+adapter doesn't — that lands in `unresolvedEntries`, surfaced but never
+silently granted (the bug this replaced) or silently denied.
+`permissions.ask` is read too — tools Claude Code prompts for on every
+real use regardless of `allow` — and surfaced on `askTools`, purely for
+visibility; never written into `grant_edge` as a grant, since a per-call
+confirmation gate is neither a standing grant nor no access at all.
+
 Every adapter (this one and the three below) accepts `--dry-run`: it runs
 the exact same computation — reads the same source, resolves the same
 relations — but never writes to `grant_edge`. What it prints is what a
@@ -201,11 +246,24 @@ PRINCIPAL_GRAPH_AWS_PRINCIPAL_ARNS=arn:aws:iam::111:user/alice,arn:aws:iam::111:
 
 Checks each listed IAM principal against each listed bucket using AWS's
 own IAM Policy Simulator (`iam:SimulatePrincipalPolicy`) — not a
-hand-written policy evaluator, since identity policies, resource
-policies, explicit-deny precedence, and condition blocks are genuinely
-subtle to get right, and AWS's simulator is the authoritative
-implementation of that evaluation. Grants `read`/`write`/`admin` per
-(principal, bucket) pair, same relation vocabulary as the GitHub adapter.
+hand-written policy evaluator, since identity policies, explicit-deny
+precedence, and condition blocks are genuinely subtle to get right, and
+AWS's simulator is the authoritative implementation of that evaluation.
+Grants `read`/`write`/`admin` per (principal, bucket) pair, same relation
+vocabulary as the GitHub adapter.
+
+Per AWS's own docs, `SimulatePrincipalPolicy` does **not** evaluate a
+bucket's own resource policy unless it's explicitly passed, and doesn't
+support resource-policy simulation for IAM roles at all — left
+unaddressed, a bucket whose access comes from its own policy (the
+ordinary cross-account case) would silently read as no access. This
+adapter fetches each bucket's policy once per run and passes it for IAM
+**user** principals (there's nothing to fix for roles — that's a real
+limit of AWS's simulator, not this adapter). Separately, an `allow` whose
+simulation reported unevaluated condition keys (MFA presence, source IP,
+...) is surfaced on `AwsGrantResult.conditional` — visible, not resolved;
+this adapter still can't evaluate those conditions itself, but it no
+longer records a conditional allow exactly like an unconditional one.
 
 Unlike the other two adapters, **both** the bucket list and the principal
 list are explicit config, not discovered — GitHub's collaborators API is
@@ -290,12 +348,15 @@ npm run report > report.txt   # or save it
 Four plain-text sections, one command:
 
 1. **Unused grants** — permissions nobody's exercised in 90 days, riskiest
-   first. Only true "safest to delete" for a `source` with a usage feed
-   at all (currently `mcp-config` via the broker sink, and `postgres` via
-   [Usage 14](#14-track-real-postgres-query-activity)) — a row from
-   `github`/`aws`/`workspace` gets an explicit caveat instead, since
-   nothing has ever looked there and "unused" only means "never checked."
-   See `SOURCES_WITH_USAGE_FEED` in `src/views/report.ts`.
+   first, tied off by how long each has genuinely gone unused
+   (`first_observed_at` — set once when a grant is created, never touched
+   by a later re-observation; see [Data model](#data-model)'s note on
+   `grant_edge`'s three timestamp columns). Only true "safest to delete"
+   for a `source` with a usage feed at all (currently `mcp-config` via the
+   broker sink, and `postgres` via [Usage 14](#14-track-real-postgres-query-activity))
+   — a row from `github`/`aws`/`workspace` gets an explicit caveat
+   instead, since nothing has ever looked there and "unused" only means
+   "never checked." See `SOURCES_WITH_USAGE_FEED` in `src/views/report.ts`.
 2. **Trifecta exposure** — which principals can read private data, ingest
    untrusted content, *and* reach the network, all at once.
 3. **Acting on behalf of** — which human each agent's `event.on_behalf_of`
@@ -348,10 +409,25 @@ authz check principal:aws:arn:aws:iam::111:user/alice any_access bucket:aws:my-b
 
 Incremental, not a full resync: RBA's tuple-write API is capped at 20
 requests/minute with no batch-write endpoint, so `rba_export_state` tracks
-a watermark and each run only pushes what changed since the last one. A
-run that fails partway leaves the watermark untouched — every write/delete
-is idempotent, so the same window safely retries next run rather than
-silently dropping whatever failed.
+a watermark and each run only pushes what changed since the last one —
+`changed_at`, specifically (see [Data model](#data-model)), not the
+`observed_at` every adapter run bumps regardless of whether anything
+actually changed; watermarking on the wrong column meant a no-op adapter
+re-run looked like "everything changed" and defeated the whole point of
+being incremental. A run that fails partway leaves the watermark
+untouched — every write/delete is idempotent, so the same window safely
+retries next run rather than silently dropping whatever failed.
+
+That retry story has its own sharp edge: one tuple that fails *every* run
+(an unpublished RBA namespace, a permanently malformed value) used to pin
+the watermark forever, since every later run redid the whole window and
+failed on the same tuple again — advancing nothing for every other grant
+that changed in the meantime too. `rba_export_dead_letter`
+(`schema/011_rba_export_dead_letter.sql`) tracks consecutive failures per
+tuple; below 5 in a row it still blocks the watermark exactly as before,
+but at 5 it graduates to being retried every run directly from that table
+— decoupled from the window, never silently dropped, but no longer
+allowed to hold everything else hostage either.
 
 ### 9. Serve the report over HTTP
 
@@ -415,9 +491,16 @@ different reasons:
   `roleTiers` having no default). Pass your own list to
   `evaluatePolicies()` to add one per adapter you actually schedule — a
   stale or silently-failing real run (`dry_run = false`) beyond your own
-  limit is a violation; a dry-run-only or never-run adapter isn't, same
-  "nothing to report yet" stance as [Usage 11](#11-check-on-scheduled-adapter-runs)'s
-  own `latestRuns()`.
+  limit is a violation, and so is an adapter that's **never** had a real
+  run recorded at all: unlike [Usage 11](#11-check-on-scheduled-adapter-runs)'s
+  own `latestRuns()` (which stays silent about an adapter nobody
+  configured — nothing to report on a dashboard nobody asked to see),
+  this rule is different because the operator named `adapter` explicitly
+  — "never ran" is the single most likely real failure this rule exists
+  to catch (the cron was never installed, the adapter name was typo'd), so
+  it's the one case this rule refuses to stay quiet about. A dry-run-only
+  history is treated the same way, for the same reason — it's not
+  evidence of a real run either.
 - **`chain-intact`** calls `src/log.ts`'s own `verifyChain()`, which pulls
   the *entire* event table into memory on every call (frozen — no
   bounded variant exists without duplicating its hash algorithm outside
@@ -443,7 +526,12 @@ not a heartbeat: nothing is posted when there are no violations, the same
 reasoning that kept [Usage 11](#11-check-on-scheduled-adapter-runs)'s own
 run-history a pull-based check rather than a notification on every run. A
 failed Slack post is logged but never changes the exit code — that still
-reflects policy state alone, not whether Slack heard about it.
+reflects policy state alone, not whether Slack heard about it. The
+message is capped under Slack's documented 40,000-character limit, with a
+"N more not shown" trailer when it's cut — a mass-revocation incident with
+hundreds of violations at once used to build a message past that limit,
+which Slack rejected outright, losing the whole alert exactly when it
+mattered most.
 
 > **Not yet live-verified** against a real Slack workspace (no webhook
 > was available while building it) — same caveat, same reason, as the AWS
@@ -539,6 +627,25 @@ every `policy-check` tick. `chain-intact` ([Usage 10](#10-check-policy-violation
 calls the exact same function for anyone who wants it folded into one
 report instead — deliberately not in `policy-check`'s own default set,
 for that same cost reason.
+
+**`verifyChain()` alone has a real blind spot**: it only ever walks rows
+that currently exist, so deleting the chain's *tail* — or every row in it
+— leaves a shorter chain that still links up perfectly; a hash chain has
+no way to notice something is *missing*, only that something *present*
+was altered. Confirmed live: write 4 events, delete the 2 newest, then
+delete all 4 — `verifyChain()` reports "no breaks found" after every
+single step. This script (and the `chain-intact` policy rule) now call
+`verifyChainAnchored()` (`src/chain-checkpoint.ts`) instead, which
+compares the current chain against `chain_checkpoint`
+(`schema/009_chain_checkpoint.sql`) — an append-only table, external to
+`event`, recording the last verified tail (seq, hash, row count) every
+time a run comes back clean. Deleting the tail, or the whole table, now
+fails this check even though `verifyChain()` alone would call the
+resulting chain "intact." Not unbreakable against an attacker who also
+targets `chain_checkpoint` itself directly — see that file's own header
+for exactly what this does and doesn't protect against, and why closing
+that gap fully means anchoring somewhere the database credential can't
+reach at all.
 
 ### 14. Track real Postgres query activity
 
@@ -692,6 +799,37 @@ this migration existed).
 > liveness annotation together on the same row — see `npm run report`'s
 > own output format in `test/report.spec.ts`.
 
+### 18. Prevent two runs of the same adapter from overlapping
+
+Nothing used to stop two real invocations of the same adapter script from
+running at once — a cron firing twice, or a new run starting before a
+slow previous one finished. [Usage 8](#8-sync-grants-into-rba-for-real-multi-hop-reachability)'s
+own exporter can legitimately run for hours under its own 20-requests/minute
+rate limit, and cron has no idea; two concurrent full-inventory adapter
+runs interleaving their grant/revoke computations was a real, if unlikely,
+risk.
+
+`withAdapterLock()` (`src/run-history.ts`) wraps every real invocation of
+all seven scheduled scripts (the five grant adapters, the usage adapter,
+the RBA exporter) in a Postgres session-level advisory lock keyed on the
+adapter name, held on its own dedicated connection for the run's whole
+duration. Non-blocking (`pg_try_advisory_lock`): a second run is refused
+immediately with a clear error rather than silently queuing for however
+long the first run's own external rate limit takes. A `--dry-run`
+invocation skips the lock entirely — it never writes to `grant_edge`, so
+there's no revoke computation for a concurrent real run to race against.
+
+Not folded into `startRun()`/`finishRun()` themselves (those two are
+called from many places — every test in this repo included — that never
+need this); only the real `scripts/run-*.ts` entry points wrap their
+whole run in it.
+
+> **Live-verified** across two genuinely separate OS processes (not just
+> two calls within one Node process, which wouldn't prove a real,
+> server-side advisory lock is doing the work): the second process is
+> refused immediately with `AdapterAlreadyRunningError` while the first is
+> still running, and completes normally once the first finishes.
+
 ## Data model
 
 Five tables (`schema/001_core.sql`):
@@ -703,6 +841,15 @@ Five tables (`schema/001_core.sql`):
 | `resource_capability` | Which of the five capabilities a resource carries. |
 | `grant_edge` | What's permitted — `principal` → `resource`, a relation, never deleted (`revoked_at` instead). |
 | `event` | What actually happened — hash-chained and append-only; `src/log.ts` is the only supported writer. |
+
+`grant_edge` carries three timestamps that mean three different things
+(the last two added by `schema/010_grant_edge_observed_split.sql` —
+see [Usage 8](#8-sync-grants-into-rba-for-real-multi-hop-reachability)/
+[Usage 7](#7-run-the-report) for why the distinction mattered enough to
+add): `observed_at` — bumped on *every* re-observation, "confirmed still
+live as of this run"; `first_observed_at` — set once at creation, never
+touched again, "held since"; `changed_at` — bumped only on a real
+create/revoke/reinstate transition, "what actually changed."
 
 Two views built on top, read by the report:
 
@@ -734,7 +881,31 @@ third. A seventh, `schema/007_grant_edge_run_history.sql`, adds
 — also internal bookkeeping, not part of the grant graph. An eighth,
 `schema/008_resource_last_seen.sql`, adds `resource_last_seen` — see
 [Usage 17](#17-stop-treating-deleted-resources-as-live-forever) — also
+internal bookkeeping, not part of the grant graph. A ninth,
+`schema/009_chain_checkpoint.sql`, adds `chain_checkpoint` — the external
+anchor against tail truncation, see
+[Usage 13](#13-verify-the-event-chain-hasnt-been-tampered-with) — also
+internal bookkeeping, not part of the grant graph itself (though it does
+exist specifically to strengthen a guarantee about `event`). A tenth,
+`schema/010_grant_edge_observed_split.sql`, adds `first_observed_at` and
+`changed_at` directly onto `grant_edge` (an `alter table`, not a new side
+table — the first migration here to change a frozen table's columns
+rather than only add a new one alongside it) and re-creates
+`unused_grant_by_relation` (`create or replace view`, not an edit to
+`005`'s own already-applied file) with the new column appended — see the
+`grant_edge` note above and [Usage 7](#7-run-the-report)/
+[Usage 8](#8-sync-grants-into-rba-for-real-multi-hop-reachability). An
+eleventh, `schema/011_rba_export_dead_letter.sql`, adds
+`rba_export_dead_letter` — see
+[Usage 8](#8-sync-grants-into-rba-for-real-multi-hop-reachability) — also
 internal bookkeeping, not part of the grant graph.
+
+`schema_migrations` (bootstrapped by `src/migrate.ts` itself, not a
+numbered file — see [Quick start](#quick-start)) also gained a nullable
+`checksum` column along the way: recorded on every future apply, checked
+against the file's current content on every later run, and left `null`
+(never treated as a mismatch) for a row seeded by hand before this column
+existed.
 
 ## Project layout
 
@@ -747,34 +918,38 @@ schema/            SQL migrations — 001_core.sql is the shared core
                      006_on_behalf_of_index.sql adds an index only, no schema change
                      007_grant_edge_run_history.sql adds grant_edge_run
                      008_resource_last_seen.sql adds resource_last_seen
+                     009_chain_checkpoint.sql adds chain_checkpoint, the tail-truncation anchor
+                     010_grant_edge_observed_split.sql adds first_observed_at/changed_at
+                     011_rba_export_dead_letter.sql adds rba_export_dead_letter
 rba/
   principal-graph.authz  RBA's own namespace schema for this project's grant data
 src/
   model.ts          shared types every adapter/view imports from
   log.ts             hash-chained append + chain verifier
+  chain-checkpoint.ts  verifyChainAnchored() — catches tail truncation verifyChain() alone can't
   upsert.ts          ensurePrincipal / ensureResource — how adapters upsert identity
-  migrate.ts          discoverMigrations / runMigrations — schema/*.sql tracking + apply
-  run-history.ts      startRun / finishRun / latestRuns — adapter_run bookkeeping
+  migrate.ts          discoverMigrations / runMigrations — schema/*.sql tracking + apply, locked + checksummed
+  run-history.ts      startRun / finishRun / latestRuns / withAdapterLock — adapter_run bookkeeping + overlap prevention
   grant-run-history.ts  links a grant_edge row to the adapter_run that created/revoked it
   resource-liveness.ts  records the last time a resource was confirmed to still exist
   capabilities.ts    TOOL_CAPABILITIES (hand-written) + how resources get classified
   policies.ts         POLICIES (hand-written) + evaluatePolicies() — "should never happen" rules
   revocation-guard.ts  checkBlastRadius() — caps full-inventory revocation per run
-  notify-slack.ts      posts policy violations to a Slack Incoming Webhook
-  db.ts              Pool construction (reads DATABASE_URL)
+  notify-slack.ts      posts policy violations to a Slack Incoming Webhook, capped under Slack's own message-size limit
+  db.ts              Pool construction (reads DATABASE_URL, warns loudly if unset)
   server.ts          GET /report, /report.json, /health — node:http, no framework
   adapters/
     broker-audit-sink.ts       feeds event from a live taint-tracked-tool-broker session
-    mcp-config.ts              feeds grant_edge from Claude Code's own settings.json
+    mcp-config.ts              feeds grant_edge from Claude Code's own settings.json (permissions.allow/deny/ask)
     github-collaborators.ts  feeds grant_edge from a repo's GitHub collaborators
-    aws-s3.ts                    feeds grant_edge from IAM Policy Simulator results on S3 buckets
+    aws-s3.ts                    feeds grant_edge from IAM Policy Simulator results on S3 buckets, plus each bucket's own policy for IAM users
     workspace-groups.ts           feeds grant_edge from a Google Group's resolved membership
     postgres-roles.ts               feeds grant_edge from a target database's own tier-role membership
     postgres-usage.ts                feeds event from pg_stat_activity — a usage adapter, not a grant one
   views/
     report.ts         buildReport()/formatReport() — the four-section report
   exporters/
-    rba.ts             feeds RBA relationship tuples from grant_edge (the reverse of an adapter)
+    rba.ts             feeds RBA relationship tuples from grant_edge (the reverse of an adapter), dead-lettering a tuple that keeps failing
 scripts/
   run-mcp-config-adapter.ts  npm run adapter:mcp-config
   run-github-adapter.ts      npm run adapter:github

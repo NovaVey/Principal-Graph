@@ -23,7 +23,7 @@ import type { Pool } from 'pg';
 import type { Queryable } from './upsert.js';
 import type { Relation } from './model.js';
 import { resolveName } from './views/report.js';
-import { verifyChain } from './log.js';
+import { verifyChainAnchored } from './chain-checkpoint.js';
 import type { AdapterName } from './run-history.js';
 
 export type PolicyRule =
@@ -120,11 +120,17 @@ async function checkStaleGrant(
     resource: string | null;
     resource_external_id: string;
     relation: string;
-    observed_at: Date;
+    first_observed_at: Date;
   }>(
+    // first_observed_at (schema/010_grant_edge_observed_split.sql), not
+    // observed_at: observed_at is bumped by every adapter run that merely
+    // confirms this grant is still live, so a 200-day-old grant
+    // re-observed a second ago would read "unused for 0 day(s)" —
+    // self-contradicting text on a genuine violation. first_observed_at
+    // is set once and never touched again.
     `select p.display_name as principal, p.external_id as principal_external_id,
             r.display_name as resource, r.external_id as resource_external_id,
-            g.relation, g.observed_at
+            g.relation, g.first_observed_at
        from grant_edge g
        join principal p on p.id = g.principal_id
        join resource  r on r.id = g.resource_id
@@ -163,7 +169,9 @@ async function checkStaleGrant(
   return rows.map((r) => {
     const who = resolveName(r.principal, r.principal_external_id);
     const what = resolveName(r.resource, r.resource_external_id);
-    const unusedDays = Math.floor((Date.now() - r.observed_at.getTime()) / (24 * 60 * 60 * 1000));
+    const unusedDays = Math.floor(
+      (Date.now() - r.first_observed_at.getTime()) / (24 * 60 * 60 * 1000),
+    );
     return {
       rule,
       description: `"${who}" holds a '${r.relation}' grant on ${what}, unused for ${unusedDays} day(s) — beyond this policy's ${rule.maxUnusedDays}-day limit.`,
@@ -173,20 +181,35 @@ async function checkStaleGrant(
 
 async function checkChainIntact(db: Queryable): Promise<PolicyViolation[]> {
   const rule: PolicyRule = { kind: 'chain-intact' };
-  // verifyChain() (src/log.ts, frozen) is typed against a real `Pool`
-  // specifically, but only ever calls `.query()` on it — the one method
-  // Queryable's PoolClient branch also has. Every actual caller of
+  // verifyChainAnchored() (src/chain-checkpoint.ts) itself calls
+  // verifyChain() (src/log.ts, frozen), which is typed against a real
+  // `Pool` specifically but only ever calls `.query()` on it — the one
+  // method Queryable's PoolClient branch also has. Every actual caller of
   // evaluatePolicies (scripts/run-policy-check.ts, this file's own tests)
   // passes a real Pool regardless; this cast just satisfies the frozen
   // signature, it doesn't change what runs.
-  const breaks = await verifyChain(db as Pool);
-  return breaks.map((b) => ({
+  const { breaks, anchorBreak } = await verifyChainAnchored(db as Pool);
+  const violations = breaks.map((b) => ({
     rule,
     description:
       b.reason === 'hash_mismatch'
         ? `Event chain broken at seq ${b.seq} (event ${b.eventId}): its hash no longer matches its own recorded content — the row was edited directly.`
         : `Event chain broken at seq ${b.seq} (event ${b.eventId}): it no longer links to the row before it — a row was deleted or inserted directly.`,
   }));
+  // Catches what verifyChain() structurally cannot: deleting rows from the
+  // TAIL (or the whole table), which leaves behind a shorter chain that
+  // still links up perfectly on its own — see src/chain-checkpoint.ts's
+  // own header.
+  if (anchorBreak) {
+    violations.push({
+      rule,
+      description:
+        anchorBreak.reason === 'truncated'
+          ? `Event chain truncated: a checkpoint taken at ${anchorBreak.checkpoint.checkedAt.toISOString()} saw the chain reach seq ${anchorBreak.checkpoint.seq}, but its current max seq is ${anchorBreak.currentMaxSeq ?? '(the table is now empty)'} — rows were deleted from the tail and nothing has replaced them.`
+          : `Event chain anchor mismatch: a checkpoint taken at ${anchorBreak.checkpoint.checkedAt.toISOString()} recorded seq ${anchorBreak.checkpoint.seq} with a specific hash, but that row no longer has that hash — the chain was altered at or before that point.`,
+    });
+  }
+  return violations;
 }
 
 async function checkOnBehalfOfEscalation(db: Queryable): Promise<PolicyViolation[]> {
@@ -265,11 +288,22 @@ async function checkAdapterFreshness(
     [rule.adapter],
   );
   const latest = rows[0];
-  // Never run for real at all — the same "nothing to report yet" stance
-  // as latestRuns() (src/run-history.ts): an adapter this deployment has
-  // simply never configured to run for real isn't this rule's problem to
-  // guess at.
-  if (!latest) return [];
+  // Unlike latestRuns() (src/run-history.ts), which stays silent about an
+  // adapter nobody configured (nothing to report on a dashboard nobody
+  // asked to see), this rule is different: the operator named `rule.adapter`
+  // explicitly, which is a claim that it's supposed to be running. "Never
+  // ran for real" is the single most likely real-world failure this rule
+  // exists to catch (the cron was never installed, the wrong adapter name
+  // was typed, the container never got its credentials) — silence here is
+  // silence on exactly the case that matters most.
+  if (!latest) {
+    return [
+      {
+        rule,
+        description: `The '${rule.adapter}' adapter has never had a real run recorded at all — this policy names it explicitly, so either it's misconfigured (wrong adapter name, cron never installed) or it genuinely has never run.`,
+      },
+    ];
+  }
 
   if (!latest.finished_at) {
     const ageHours = (Date.now() - latest.started_at.getTime()) / 3_600_000;

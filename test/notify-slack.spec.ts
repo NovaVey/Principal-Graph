@@ -69,6 +69,34 @@ void test('notifySlackOfViolations never posts when there are no violations — 
   assert.equal(calls.length, 0);
 });
 
+void test("formatViolationsForSlack caps the message under Slack's 40k limit, with a trailer naming what was cut", () => {
+  // Each description is ~300 chars; a few thousand of them would otherwise
+  // build a message many times past Slack's documented 40,000-character
+  // limit for an Incoming Webhook's `text` field.
+  const longDescription = 'x'.repeat(300);
+  const violations = Array.from({ length: 500 }, () => violation(longDescription));
+
+  const message = formatViolationsForSlack(violations);
+
+  assert.ok(message.length <= 40_000, `message was ${message.length} chars, over Slack's limit`);
+  assert.match(message, /more violation\(s\) not shown/);
+  // Confirms this isn't just an early bail-out on the first violation —
+  // real ones actually made it in before the cap kicked in.
+  assert.ok(message.split('\n').length > 10);
+});
+
+void test('formatViolationsForSlack under the cap is unaffected — no trailer, every violation present', () => {
+  const violations = [
+    violation('Alice holds trifecta access.'),
+    violation('Bob holds a stale admin grant.'),
+  ];
+  const message = formatViolationsForSlack(violations);
+  assert.doesNotMatch(message, /not shown/);
+  assert.equal(message, formatViolationsForSlack(violations));
+  assert.ok(message.includes('Alice holds trifecta access.'));
+  assert.ok(message.includes('Bob holds a stale admin grant.'));
+});
+
 void test('notifySlackOfViolations propagates a post failure rather than swallowing it', async () => {
   const failing: PostSlackMessage = async () => {
     throw new Error('slack notify: POST failed: 404 Not Found — no_service');

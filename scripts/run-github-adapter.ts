@@ -22,7 +22,7 @@
 
 import { createPool } from '../src/db.js';
 import { runGithubAdapter } from '../src/adapters/github-collaborators.js';
-import { startRun, finishRun } from '../src/run-history.js';
+import { startRun, finishRun, withAdapterLock } from '../src/run-history.js';
 
 function parseRepoList(raw: string | undefined): string[] {
   return (raw ?? '')
@@ -48,36 +48,46 @@ async function main(): Promise<void> {
   const dryRun = process.argv.includes('--dry-run');
   const pool = createPool();
   try {
-    const runId = await startRun(pool, 'github', { dryRun });
-    try {
-      const results = await runGithubAdapter(pool, { repos, token, dryRun, runId });
-      if (dryRun) console.log('DRY RUN — nothing below was actually written to grant_edge\n');
-      let totalGrants = 0;
-      let totalRevoked = 0;
-      for (const result of results) {
-        const logins = Object.keys(result.grants);
-        totalGrants += logins.length;
-        totalRevoked += result.revoked.length;
-        console.log(`${result.repo}: ${logins.length} collaborator(s)`);
-        for (const login of logins) {
-          console.log(`  ${login}: ${result.grants[login]}`);
+    const runOnce = async (): Promise<void> => {
+      const runId = await startRun(pool, 'github', { dryRun });
+      try {
+        const results = await runGithubAdapter(pool, { repos, token, dryRun, runId });
+        if (dryRun) console.log('DRY RUN — nothing below was actually written to grant_edge\n');
+        let totalGrants = 0;
+        let totalRevoked = 0;
+        for (const result of results) {
+          const logins = Object.keys(result.grants);
+          totalGrants += logins.length;
+          totalRevoked += result.revoked.length;
+          console.log(`${result.repo}: ${logins.length} collaborator(s)`);
+          for (const login of logins) {
+            console.log(`  ${login}: ${result.grants[login]}`);
+          }
+          if (result.revoked.length > 0) {
+            console.log(
+              `  ${dryRun ? 'would revoke' : 'revoked this run'}: ${result.revoked.join(', ')}`,
+            );
+          }
         }
-        if (result.revoked.length > 0) {
-          console.log(
-            `  ${dryRun ? 'would revoke' : 'revoked this run'}: ${result.revoked.join(', ')}`,
-          );
-        }
+        await finishRun(pool, runId, {
+          status: 'success',
+          detail: `${results.length} repo(s), ${totalGrants} grant(s), ${totalRevoked} revoked`,
+        });
+      } catch (err) {
+        await finishRun(pool, runId, {
+          status: 'failure',
+          error: err instanceof Error ? err.message : String(err),
+        });
+        throw err;
       }
-      await finishRun(pool, runId, {
-        status: 'success',
-        detail: `${results.length} repo(s), ${totalGrants} grant(s), ${totalRevoked} revoked`,
-      });
-    } catch (err) {
-      await finishRun(pool, runId, {
-        status: 'failure',
-        error: err instanceof Error ? err.message : String(err),
-      });
-      throw err;
+    };
+    // A dry run never writes to grant_edge — no revoke computation for a
+    // concurrent real run to race against, so it skips the lock (and never
+    // contends with one either). See src/run-history.ts's withAdapterLock().
+    if (dryRun) {
+      await runOnce();
+    } else {
+      await withAdapterLock(pool, 'github', runOnce);
     }
   } finally {
     await pool.end();

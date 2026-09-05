@@ -6,8 +6,19 @@
  * scripts/run-*-adapter.ts and scripts/run-rba-exporter.ts wraps its main
  * work in startRun()/finishRun() — see each script's own `main()` for the
  * exact pattern.
+ *
+ * withAdapterLock() (below) is a separate, additive concern: preventing
+ * two REAL invocations of the same adapter script from overlapping at
+ * all — a cron firing twice, or a new run starting before a slow previous
+ * one (the RBA exporter can legitimately run for hours under its own
+ * rate limit; cron has no idea) has finished. Deliberately NOT folded
+ * into startRun()/finishRun() themselves: those two are called from many
+ * places that never need or want this (every test in this repo included)
+ * — only the real entry-point scripts wrap their whole run in it. See its
+ * own doc comment for the locking mechanism and why it's non-blocking.
  */
 
+import type { Pool } from 'pg';
 import type { Queryable } from './upsert.js';
 
 /**
@@ -109,4 +120,75 @@ export async function latestRuns(db: Queryable): Promise<LatestRun[]> {
     detail: r.detail,
     dryRun: r.dry_run,
   }));
+}
+
+/** Thrown by withAdapterLock() when another real run of the same adapter already holds its lock. */
+export class AdapterAlreadyRunningError extends Error {
+  constructor(public readonly adapter: AdapterName) {
+    super(
+      `Another real run of the '${adapter}' adapter appears to already be in progress — refusing to start a second one concurrently. If the previous run actually died without releasing its lock (a killed process, a crashed container), the lock releases itself when that process's database connection closes; otherwise wait for it to finish.`,
+    );
+    this.name = 'AdapterAlreadyRunningError';
+  }
+}
+
+/**
+ * Runs `fn` while holding a session-level advisory lock keyed on
+ * `adapter`, for `fn`'s entire duration — the actual overlap this guards
+ * against is two separate PROCESS invocations of the same adapter script
+ * (two cron firings, or a new run started before a slow previous one
+ * finished) racing on the same grant/revoke computation, not anything
+ * happening within one process. Not wired into every internal caller of
+ * an adapter function (this file's own tests, other adapters' tests) —
+ * only the real scripts/run-*.ts entry points wrap their whole run in it.
+ *
+ * The lock itself is held on its own dedicated connection, separate from
+ * whatever connection/pool `fn` uses to do its real work — a plain
+ * `pool.query()` call from inside `fn` still runs perfectly normally
+ * concurrently with the lock being held, since `pg_advisory_lock`/
+ * `pg_advisory_unlock` are scoped to the exact backend session that took
+ * them, never to "the pool" or "the database" as a whole. `fn` is
+ * unaware of the lock entirely — it just doesn't get to run if another
+ * real run of the same adapter already holds it. This also sidesteps
+ * src/adapters/postgres-usage.ts's own requirement of a genuine `Pool`
+ * (not a `PoolClient`) — there is no such connection-sharing constraint
+ * to reconcile. `hashtext()` turns the adapter name into the bigint key
+ * `pg_try_advisory_lock` needs.
+ *
+ * Uses `pg_try_advisory_lock` (non-blocking) rather than the blocking
+ * `pg_advisory_lock`: an operator finding out immediately that the last
+ * run is still going (AdapterAlreadyRunningError) is more useful than a
+ * second run silently queuing for however long the first one takes under
+ * its own external rate limit — the RBA exporter's own 20-requests/minute
+ * ceiling can mean hours.
+ */
+export async function withAdapterLock<T>(
+  pool: Pool,
+  adapter: AdapterName,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const client = await pool.connect();
+  try {
+    const { rows } = await client.query<{ locked: boolean }>(
+      `select pg_try_advisory_lock(hashtext($1)) as locked`,
+      [adapter],
+    );
+    if (!rows[0]?.locked) {
+      throw new AdapterAlreadyRunningError(adapter);
+    }
+    try {
+      return await fn();
+    } finally {
+      // Not optional: releasing `client` back to the pool below returns
+      // the underlying connection for RE-USE, it does not close it — an
+      // advisory lock stays held by that same backend session regardless
+      // of which logical caller borrows the connection next, until this
+      // unlock call actually runs (or the connection eventually closes
+      // for good). Best-effort (caught, not rethrown) purely so a failure
+      // here can never mask fn's own real result or error.
+      await client.query(`select pg_advisory_unlock(hashtext($1))`, [adapter]).catch(() => {});
+    }
+  } finally {
+    client.release();
+  }
 }

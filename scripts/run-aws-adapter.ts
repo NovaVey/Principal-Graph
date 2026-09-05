@@ -26,7 +26,7 @@
 
 import { createPool } from '../src/db.js';
 import { runAwsAdapter } from '../src/adapters/aws-s3.js';
-import { startRun, finishRun } from '../src/run-history.js';
+import { startRun, finishRun, withAdapterLock } from '../src/run-history.js';
 
 function parseList(raw: string | undefined): string[] {
   return (raw ?? '')
@@ -52,42 +52,57 @@ async function main(): Promise<void> {
   const dryRun = process.argv.includes('--dry-run');
   const pool = createPool();
   try {
-    const runId = await startRun(pool, 'aws', { dryRun });
-    try {
-      const results = await runAwsAdapter(pool, {
-        buckets,
-        principalArns,
-        region: process.env.AWS_REGION,
-        dryRun,
-        runId,
-      });
-      if (dryRun) console.log('DRY RUN — nothing below was actually written to grant_edge\n');
-      let totalGrants = 0;
-      let totalRevoked = 0;
-      for (const result of results) {
-        const arns = Object.keys(result.grants);
-        totalGrants += arns.length;
-        totalRevoked += result.revoked.length;
-        console.log(`${result.bucket}: ${arns.length} principal(s) with access`);
-        for (const arn of arns) {
-          console.log(`  ${arn}: ${result.grants[arn]?.join(', ')}`);
+    const runOnce = async (): Promise<void> => {
+      const runId = await startRun(pool, 'aws', { dryRun });
+      try {
+        const results = await runAwsAdapter(pool, {
+          buckets,
+          principalArns,
+          region: process.env.AWS_REGION,
+          dryRun,
+          runId,
+        });
+        if (dryRun) console.log('DRY RUN — nothing below was actually written to grant_edge\n');
+        let totalGrants = 0;
+        let totalRevoked = 0;
+        for (const result of results) {
+          const arns = Object.keys(result.grants);
+          totalGrants += arns.length;
+          totalRevoked += result.revoked.length;
+          console.log(`${result.bucket}: ${arns.length} principal(s) with access`);
+          for (const arn of arns) {
+            console.log(`  ${arn}: ${result.grants[arn]?.join(', ')}`);
+            const conditionalRelations = result.conditional[arn];
+            if (conditionalRelations && conditionalRelations.length > 0) {
+              console.log(
+                `    conditional (unevaluated context — MFA, source IP, ...; may not hold at runtime): ${conditionalRelations.join(', ')}`,
+              );
+            }
+          }
+          if (result.revoked.length > 0) {
+            console.log(
+              `  ${dryRun ? 'would revoke' : 'revoked this run'}: ${result.revoked.join(', ')}`,
+            );
+          }
         }
-        if (result.revoked.length > 0) {
-          console.log(
-            `  ${dryRun ? 'would revoke' : 'revoked this run'}: ${result.revoked.join(', ')}`,
-          );
-        }
+        await finishRun(pool, runId, {
+          status: 'success',
+          detail: `${results.length} bucket(s), ${totalGrants} principal-relation(s), ${totalRevoked} revoked`,
+        });
+      } catch (err) {
+        await finishRun(pool, runId, {
+          status: 'failure',
+          error: err instanceof Error ? err.message : String(err),
+        });
+        throw err;
       }
-      await finishRun(pool, runId, {
-        status: 'success',
-        detail: `${results.length} bucket(s), ${totalGrants} principal-relation(s), ${totalRevoked} revoked`,
-      });
-    } catch (err) {
-      await finishRun(pool, runId, {
-        status: 'failure',
-        error: err instanceof Error ? err.message : String(err),
-      });
-      throw err;
+    };
+    // See run-github-adapter.ts's own comment on the same line: a dry run
+    // never writes to grant_edge, so it skips the lock entirely.
+    if (dryRun) {
+      await runOnce();
+    } else {
+      await withAdapterLock(pool, 'aws', runOnce);
     }
   } finally {
     await pool.end();

@@ -508,6 +508,18 @@ but at 5 it graduates to being retried every run directly from that table
 — decoupled from the window, never silently dropped, but no longer
 allowed to hold everything else hostage either.
 
+**On RBA subject sets (nested-group multi-hop) — a closed question, not
+an open one.** A codebase review flagged "nothing here models multi-hop
+reachability through nested group membership" as worth a decision. It
+already has one: `rba/principal-graph.authz`'s `group` namespace declares
+every relation's subject as plain `principal`, never a subject set
+(`principal | group#member`), because Google's own
+`includeDerivedMembership` already flattens nested groups into real users
+before `workspace-groups.ts` ever sees them — this project never actually
+has group-nesting data to express as a subject-set rewrite, and this
+exporter is one-way (nothing here ever queries RBA back for a transitive
+result). See that namespace's own comment for the full reasoning.
+
 ### 9. Serve the report over HTTP
 
 ```bash

@@ -146,6 +146,51 @@ void test('runGithubAdapter grants from collaborator permissions and revokes wha
   assert.ok(bobsRow?.revoked_at, "bob's grant should now be revoked — no longer a collaborator");
 });
 
+void test('dryRun previews grants and revokes accurately without writing to grant_edge', async () => {
+  const repo = 'novavey/dry-run-example';
+  const fetcher = fakeFetcher({
+    [repo]: [{ login: 'alice', type: 'User', permissions: { admin: true, pull: true } }],
+  });
+
+  const dry = await runGithubAdapter(pool, {
+    repos: [repo],
+    token: 'unused-with-a-fake-fetcher',
+    fetchCollaborators: fetcher,
+    dryRun: true,
+  });
+  assert.deepEqual(dry[0]?.grants, { alice: 'admin' });
+  assert.deepEqual(dry[0]?.revoked, []);
+
+  const { rows: afterDryRun } = await pool.query<{ count: string }>(
+    `select count(*)::text from grant_edge`,
+  );
+  assert.equal(afterDryRun[0]?.count, '0');
+
+  // A real run afterward proves the dry run left no residue.
+  const real = await runGithubAdapter(pool, {
+    repos: [repo],
+    token: 'unused-with-a-fake-fetcher',
+    fetchCollaborators: fetcher,
+  });
+  assert.deepEqual(real[0]?.grants, { alice: 'admin' });
+
+  // Now preview a revoke: alice is gone. dryRun must report it without
+  // actually touching the live row.
+  const dryRevoke = await runGithubAdapter(pool, {
+    repos: [repo],
+    token: 'unused-with-a-fake-fetcher',
+    fetchCollaborators: fakeFetcher({ [repo]: [] }),
+    dryRun: true,
+  });
+  assert.deepEqual(dryRevoke[0]?.revoked, ['alice (was: admin)']);
+
+  const { rows: stillLive } = await pool.query<{ revoked_at: Date | null }>(
+    `select revoked_at from grant_edge where resource_id = $1`,
+    [real[0]?.resourceId],
+  );
+  assert.equal(stillLive[0]?.revoked_at, null, 'the previewed revoke must not actually apply');
+});
+
 void test('runGithubAdapter with no collaborators revokes every prior grant on that repo', async () => {
   const repo = 'novavey/example-empty';
   await runGithubAdapter(pool, {

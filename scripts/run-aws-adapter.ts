@@ -13,10 +13,20 @@
  * ~/.aws/credentials, an instance/task role, ...) — same as the AWS CLI.
  * The credential this runs under needs `iam:SimulatePrincipalPolicy`,
  * nothing more.
+ *
+ * Pass --dry-run to preview what this run would grant/revoke without
+ * writing to grant_edge at all (the simulator calls themselves still run —
+ * they're read-only against AWS) — see AwsAdapterOptions.dryRun in
+ * src/adapters/aws-s3.ts for exactly what that does and doesn't skip.
+ *
+ * Records every run (success or failure) in adapter_run — requires
+ * schema/004_adapter_runs.sql applied (npm run migrate). See
+ * src/run-history.ts and scripts/run-adapter-status.ts.
  */
 
 import { createPool } from '../src/db.js';
 import { runAwsAdapter } from '../src/adapters/aws-s3.js';
+import { startRun, finishRun } from '../src/run-history.js';
 
 function parseList(raw: string | undefined): string[] {
   return (raw ?? '')
@@ -39,22 +49,44 @@ async function main(): Promise<void> {
     );
   }
 
+  const dryRun = process.argv.includes('--dry-run');
   const pool = createPool();
   try {
-    const results = await runAwsAdapter(pool, {
-      buckets,
-      principalArns,
-      region: process.env.AWS_REGION,
-    });
-    for (const result of results) {
-      const arns = Object.keys(result.grants);
-      console.log(`${result.bucket}: ${arns.length} principal(s) with access`);
-      for (const arn of arns) {
-        console.log(`  ${arn}: ${result.grants[arn]?.join(', ')}`);
+    const runId = await startRun(pool, 'aws', { dryRun });
+    try {
+      const results = await runAwsAdapter(pool, {
+        buckets,
+        principalArns,
+        region: process.env.AWS_REGION,
+        dryRun,
+      });
+      if (dryRun) console.log('DRY RUN — nothing below was actually written to grant_edge\n');
+      let totalGrants = 0;
+      let totalRevoked = 0;
+      for (const result of results) {
+        const arns = Object.keys(result.grants);
+        totalGrants += arns.length;
+        totalRevoked += result.revoked.length;
+        console.log(`${result.bucket}: ${arns.length} principal(s) with access`);
+        for (const arn of arns) {
+          console.log(`  ${arn}: ${result.grants[arn]?.join(', ')}`);
+        }
+        if (result.revoked.length > 0) {
+          console.log(
+            `  ${dryRun ? 'would revoke' : 'revoked this run'}: ${result.revoked.join(', ')}`,
+          );
+        }
       }
-      if (result.revoked.length > 0) {
-        console.log(`  revoked this run: ${result.revoked.join(', ')}`);
-      }
+      await finishRun(pool, runId, {
+        status: 'success',
+        detail: `${results.length} bucket(s), ${totalGrants} principal-relation(s), ${totalRevoked} revoked`,
+      });
+    } catch (err) {
+      await finishRun(pool, runId, {
+        status: 'failure',
+        error: err instanceof Error ? err.message : String(err),
+      });
+      throw err;
     }
   } finally {
     await pool.end();

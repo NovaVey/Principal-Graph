@@ -42,7 +42,10 @@ export interface PolicyViolation {
  *     matching allow event) but with a configurable window and relation
  *     filter — `unused_grant`'s own 90-day window is hardcoded (see
  *     src/views/report.ts's own comment on it), so this rule runs its
- *     own parameterized query instead of reusing that view.
+ *     own parameterized query instead of reusing that view. It also fixes
+ *     a gap the view still has (frozen, so unfixable there): matching an
+ *     allow event to a grant by relation, not just (principal, resource) —
+ *     see checkStaleGrant's own comment.
  */
 export const POLICIES: readonly PolicyRule[] = [
   { kind: 'no-trifecta' },
@@ -93,6 +96,24 @@ async function checkStaleGrant(
              and e.resource_id  = g.resource_id
              and e.decision     = 'allow'
              and e.occurred_at  > now() - ($2::text || ' days')::interval
+             -- A resource can carry several simultaneous relations for the
+             -- same principal (e.g. the AWS adapter granting read+write+
+             -- admin on one bucket at once) — matching on (principal,
+             -- resource) alone, the way schema/001_core.sql's own
+             -- unused_grant view does (frozen, can't be fixed there), would
+             -- let one allow event mask every relation on that resource,
+             -- not just the one actually exercised. event.action carries
+             -- no dedicated relation column (schema/001_core.sql and
+             -- src/log.ts are both frozen too), so this is the workaround:
+             -- an event's action either IS the relation it exercised
+             -- ('read', 'write', 'owner', ...) and is matched exactly, or
+             -- it's 'call' — src/adapters/broker-audit-sink.ts's own
+             -- constant, the only event producer this repo ships today,
+             -- always against a 'tool' resource whose one relation
+             -- (can_call) has no multiplicity to disambiguate — which
+             -- keeps counting as evidence for every relation on that
+             -- resource, exactly like before this fix.
+             and (e.action = 'call' or e.action = g.relation)
         )`,
     [rule.relations, String(rule.maxUnusedDays)],
   );

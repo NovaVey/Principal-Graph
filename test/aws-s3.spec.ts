@@ -150,6 +150,57 @@ void test('a second run revokes exactly the relations no longer allowed, for the
   );
 });
 
+void test('dryRun previews grants and revokes accurately without writing to grant_edge', async () => {
+  const first = fakeSimulate({ [ALICE]: ['s3:GetObject', 's3:PutObject'] });
+  const dry = await runAwsAdapter(pool, {
+    buckets: ['my-bucket'],
+    principalArns: [ALICE],
+    simulate: first.simulate,
+    dryRun: true,
+  });
+  assert.deepEqual(new Set(dry[0]?.grants[ALICE]), new Set(['read', 'write']));
+  assert.deepEqual(dry[0]?.revoked, []);
+
+  const { rows: afterDryRun } = await pool.query<{ count: string }>(
+    `select count(*)::text from grant_edge`,
+  );
+  assert.equal(afterDryRun[0]?.count, '0');
+
+  // A real run afterward proves the dry run left no residue.
+  const real = (
+    await runAwsAdapter(pool, {
+      buckets: ['my-bucket'],
+      principalArns: [ALICE],
+      simulate: first.simulate,
+    })
+  )[0];
+  assert.deepEqual(new Set(real?.grants[ALICE]), new Set(['read', 'write']));
+
+  // Now preview a revoke: alice loses write. dryRun must report it
+  // without actually touching the live row.
+  const second = fakeSimulate({ [ALICE]: ['s3:GetObject'] });
+  const dryRevoke = await runAwsAdapter(pool, {
+    buckets: ['my-bucket'],
+    principalArns: [ALICE],
+    simulate: second.simulate,
+    dryRun: true,
+  });
+  assert.deepEqual(dryRevoke[0]?.revoked, [`${ALICE} (was: write)`]);
+
+  const { rows: stillLive } = await pool.query<{ relation: string }>(
+    `select g.relation
+       from grant_edge g
+       join principal p on p.id = g.principal_id
+      where p.external_id = $1 and g.revoked_at is null`,
+    [ALICE],
+  );
+  assert.deepEqual(
+    new Set(stillLive.map((r) => r.relation)),
+    new Set(['read', 'write']),
+    'the previewed revoke must not actually apply — write is still live',
+  );
+});
+
 void test("a run with a smaller principal list never touches a principal outside this run's config", async () => {
   const both = fakeSimulate({
     [ALICE]: ['s3:GetObject'],

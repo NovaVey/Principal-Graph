@@ -140,6 +140,58 @@ void test('runMcpConfigAdapter grants from merged config layers and revokes what
   }
 });
 
+void test('dryRun previews grants and revokes accurately without writing to grant_edge', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'principal-graph-test-'));
+  const settingsPath = join(dir, 'settings.json');
+  try {
+    writeFileSync(settingsPath, JSON.stringify({ permissions: { allow: ['Read'] } }));
+    const agent = { source: 'manual', externalId: 'dry-run-agent' };
+
+    const dry = await runMcpConfigAdapter(pool, {
+      agent,
+      configPaths: [settingsPath],
+      dryRun: true,
+    });
+    assert.deepEqual(dry.grantedTools, ['Read']);
+    assert.deepEqual(dry.revokedTools, []);
+
+    // Nothing written at all — not even a resource row for the tool the
+    // preview reported, since only principal/resource identity upserts
+    // happen in dry-run mode, and this tool was never seen before.
+    const { rows: afterDryRun } = await pool.query<{ count: string }>(
+      `select count(*)::text from grant_edge`,
+    );
+    assert.equal(afterDryRun[0]?.count, '0');
+
+    // A real run afterward proves the dry run left no residue: it grants
+    // exactly as if the dry run never happened.
+    const real = await runMcpConfigAdapter(pool, { agent, configPaths: [settingsPath] });
+    assert.deepEqual(real.grantedTools, ['Read']);
+    const { rows: liveAfterReal } = await pool.query<{ count: string }>(
+      `select count(*)::text from grant_edge where revoked_at is null`,
+    );
+    assert.equal(liveAfterReal[0]?.count, '1');
+
+    // Now preview a revoke: config no longer grants Read. dryRun must
+    // report it as revoked without actually touching the live row.
+    writeFileSync(settingsPath, JSON.stringify({ permissions: { allow: [] } }));
+    const dryRevoke = await runMcpConfigAdapter(pool, {
+      agent,
+      configPaths: [settingsPath],
+      dryRun: true,
+    });
+    assert.deepEqual(dryRevoke.revokedTools, ['Read']);
+
+    const { rows: stillLive } = await pool.query<{ revoked_at: Date | null }>(
+      `select revoked_at from grant_edge where principal_id = $1`,
+      [real.principalId],
+    );
+    assert.equal(stillLive[0]?.revoked_at, null, 'the previewed revoke must not actually apply');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 void test("a config file that doesn't exist is skipped, not an error", async () => {
   const dir = mkdtempSync(join(tmpdir(), 'principal-graph-test-'));
   try {

@@ -117,6 +117,16 @@ export interface AwsAdapterOptions {
   /** Overridable for testing; defaults to a real call against AWS's IAM API. */
   simulate?: SimulateAction;
   region?: string;
+  /**
+   * Preview only — never writes to `grant_edge`. `grants`/`revoked` report
+   * exactly what a real run would do (the simulator calls themselves still
+   * happen — they're read-only against AWS), but the actual insert/update
+   * never executes. `ensurePrincipal`/`ensureResource` still run normally —
+   * identity bookkeeping, not a permission change, and what lets a dry run
+   * compare against real current state. See
+   * scripts/run-aws-adapter.ts's `--dry-run` flag.
+   */
+  dryRun?: boolean;
 }
 
 export interface AwsGrantResult {
@@ -151,22 +161,34 @@ export async function runAwsAdapter(
         externalId: principalArn,
       });
 
+      // The three relation checks below are independent reads against the
+      // same principal+bucket (see RELATION_CHECKS's own doc comment on why
+      // there's exactly one per tier) — run them concurrently rather than
+      // one round-trip at a time, same as ensurePrincipal/ensureResource
+      // above already do for their own independent lookups.
       const allowedRelations: Relation[] = [];
       const notAllowedRelations: Relation[] = [];
-      for (const relation of CHECKED_RELATIONS) {
-        const { action, objectLevel } = RELATION_CHECKS[relation];
-        const allowed = await simulate(principalArn, action, resourceArnFor(bucket, objectLevel));
+      const checks = await Promise.all(
+        CHECKED_RELATIONS.map(async (relation) => {
+          const { action, objectLevel } = RELATION_CHECKS[relation];
+          const allowed = await simulate(principalArn, action, resourceArnFor(bucket, objectLevel));
+          return { relation, allowed };
+        }),
+      );
+      for (const { relation, allowed } of checks) {
         (allowed ? allowedRelations : notAllowedRelations).push(relation);
       }
 
-      for (const relation of allowedRelations) {
-        await db.query(
-          `insert into grant_edge (principal_id, resource_id, relation, source)
-           values ($1, $2, $3, 'aws')
-           on conflict (principal_id, resource_id, relation, source) do update
-             set observed_at = now(), revoked_at = null`,
-          [principalId, resourceId, relation],
-        );
+      if (!opts.dryRun) {
+        for (const relation of allowedRelations) {
+          await db.query(
+            `insert into grant_edge (principal_id, resource_id, relation, source)
+             values ($1, $2, $3, 'aws')
+             on conflict (principal_id, resource_id, relation, source) do update
+               set observed_at = now(), revoked_at = null`,
+            [principalId, resourceId, relation],
+          );
+        }
       }
       if (allowedRelations.length > 0) grants[principalArn] = allowedRelations;
 
@@ -174,18 +196,30 @@ export async function runAwsAdapter(
       // relations this run actually checked — never "every live relation
       // not just granted," and never any principal/bucket outside this
       // run's explicit config. See this file's header.
+      //
+      // In dry-run mode this is the exact same WHERE clause as a plain
+      // SELECT instead of an UPDATE — see AwsAdapterOptions.dryRun.
       if (notAllowedRelations.length > 0) {
-        const { rows: revokedRows } = await db.query<{ relation: string }>(
-          `update grant_edge
-              set revoked_at = now()
-            where principal_id = $1
-              and resource_id = $2
-              and source = 'aws'
-              and revoked_at is null
-              and relation = any($3::text[])
-            returning relation`,
-          [principalId, resourceId, notAllowedRelations],
-        );
+        const revokeQuery = opts.dryRun
+          ? `select relation from grant_edge
+              where principal_id = $1
+                and resource_id = $2
+                and source = 'aws'
+                and revoked_at is null
+                and relation = any($3::text[])`
+          : `update grant_edge
+                set revoked_at = now()
+              where principal_id = $1
+                and resource_id = $2
+                and source = 'aws'
+                and revoked_at is null
+                and relation = any($3::text[])
+              returning relation`;
+        const { rows: revokedRows } = await db.query<{ relation: string }>(revokeQuery, [
+          principalId,
+          resourceId,
+          notAllowedRelations,
+        ]);
         for (const row of revokedRows) revoked.push(`${principalArn} (was: ${row.relation})`);
       }
     }

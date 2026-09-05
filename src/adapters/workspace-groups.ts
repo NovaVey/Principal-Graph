@@ -152,6 +152,15 @@ export interface WorkspaceAdapterOptions {
   fetchMembers?: FetchGroupMembers;
   credentials?: ServiceAccountCredentials;
   adminEmail?: string;
+  /**
+   * Preview only — never writes to `grant_edge`. `grants`/`revoked` report
+   * exactly what a real run would do, but the actual insert/update never
+   * executes. `ensurePrincipal`/`ensureResource` still run normally —
+   * identity bookkeeping, not a permission change, and what lets a dry run
+   * compare against real current state. See
+   * scripts/run-workspace-adapter.ts's `--dry-run` flag.
+   */
+  dryRun?: boolean;
 }
 
 export interface WorkspaceGrantResult {
@@ -200,13 +209,15 @@ export async function runWorkspaceAdapter(
         source: 'workspace',
         externalId: member.email,
       });
-      await db.query(
-        `insert into grant_edge (principal_id, resource_id, relation, source)
-         values ($1, $2, $3, 'workspace')
-         on conflict (principal_id, resource_id, relation, source) do update
-           set observed_at = now(), revoked_at = null`,
-        [principalId, resourceId, relation],
-      );
+      if (!opts.dryRun) {
+        await db.query(
+          `insert into grant_edge (principal_id, resource_id, relation, source)
+           values ($1, $2, $3, 'workspace')
+           on conflict (principal_id, resource_id, relation, source) do update
+             set observed_at = now(), revoked_at = null`,
+          [principalId, resourceId, relation],
+        );
+      }
       principalIds.push(principalId);
       relations.push(relation);
       grants[member.email] = relation;
@@ -220,19 +231,34 @@ export async function runWorkspaceAdapter(
     // full-inventory revoke (not the AWS adapter's narrower scoping)
     // since Google's resolved membership list IS authoritative for this
     // group.
+    //
+    // In dry-run mode this is the exact same WHERE clause as a plain
+    // SELECT instead of an UPDATE — see WorkspaceAdapterOptions.dryRun.
+    const revokeQuery = opts.dryRun
+      ? `select p.external_id, g.relation
+           from grant_edge g
+           join principal p on p.id = g.principal_id
+          where g.resource_id = $1
+            and g.source = 'workspace'
+            and g.revoked_at is null
+            and not exists (
+              select 1 from unnest($2::uuid[], $3::text[]) as cur(principal_id, relation)
+               where cur.principal_id = g.principal_id and cur.relation = g.relation
+            )`
+      : `update grant_edge g
+            set revoked_at = now()
+           from principal p
+          where g.principal_id = p.id
+            and g.resource_id = $1
+            and g.source = 'workspace'
+            and g.revoked_at is null
+            and not exists (
+              select 1 from unnest($2::uuid[], $3::text[]) as cur(principal_id, relation)
+               where cur.principal_id = g.principal_id and cur.relation = g.relation
+            )
+          returning p.external_id, g.relation`;
     const { rows: revokedRows } = await db.query<{ external_id: string; relation: string }>(
-      `update grant_edge g
-          set revoked_at = now()
-         from principal p
-        where g.principal_id = p.id
-          and g.resource_id = $1
-          and g.source = 'workspace'
-          and g.revoked_at is null
-          and not exists (
-            select 1 from unnest($2::uuid[], $3::text[]) as cur(principal_id, relation)
-             where cur.principal_id = g.principal_id and cur.relation = g.relation
-          )
-        returning p.external_id, g.relation`,
+      revokeQuery,
       [resourceId, principalIds, relations],
     );
 

@@ -55,3 +55,26 @@ namespace bucket {
 
   permission any_access = read | write | admin
 }
+
+// Produced by src/adapters/workspace-groups.ts. Google's own three
+// membership roles, lowercased — see relationFromRole() in
+// src/adapters/workspace-groups.ts.
+namespace group {
+  relation owner: principal
+  relation manager: principal
+  relation member: principal
+
+  permission any_access = owner | manager | member
+}
+
+// Produced by src/adapters/postgres-roles.ts. A target database's own
+// tier-role membership (read/write/admin), checked via pg_has_role() —
+// see that file's own header on why there's no auto-detected human/
+// service distinction here the way an AWS ARN or a GitHub Bot type has.
+namespace db {
+  relation read: principal
+  relation write: principal
+  relation admin: principal
+
+  permission any_access = read | write | admin
+}

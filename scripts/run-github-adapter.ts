@@ -9,10 +9,20 @@
  *
  * Unlike the mcp-config adapter, this one necessarily talks to a live API —
  * see src/adapters/github-collaborators.ts's own header for why.
+ *
+ * Pass --dry-run to preview what this run would grant/revoke without
+ * writing to grant_edge at all — see GithubAdapterOptions.dryRun in
+ * src/adapters/github-collaborators.ts for exactly what that does and
+ * doesn't skip.
+ *
+ * Records every run (success or failure) in adapter_run — requires
+ * schema/004_adapter_runs.sql applied (npm run migrate). See
+ * src/run-history.ts and scripts/run-adapter-status.ts.
  */
 
 import { createPool } from '../src/db.js';
 import { runGithubAdapter } from '../src/adapters/github-collaborators.js';
+import { startRun, finishRun } from '../src/run-history.js';
 
 function parseRepoList(raw: string | undefined): string[] {
   return (raw ?? '')
@@ -35,18 +45,39 @@ async function main(): Promise<void> {
     );
   }
 
+  const dryRun = process.argv.includes('--dry-run');
   const pool = createPool();
   try {
-    const results = await runGithubAdapter(pool, { repos, token });
-    for (const result of results) {
-      const logins = Object.keys(result.grants);
-      console.log(`${result.repo}: ${logins.length} collaborator(s)`);
-      for (const login of logins) {
-        console.log(`  ${login}: ${result.grants[login]}`);
+    const runId = await startRun(pool, 'github', { dryRun });
+    try {
+      const results = await runGithubAdapter(pool, { repos, token, dryRun });
+      if (dryRun) console.log('DRY RUN — nothing below was actually written to grant_edge\n');
+      let totalGrants = 0;
+      let totalRevoked = 0;
+      for (const result of results) {
+        const logins = Object.keys(result.grants);
+        totalGrants += logins.length;
+        totalRevoked += result.revoked.length;
+        console.log(`${result.repo}: ${logins.length} collaborator(s)`);
+        for (const login of logins) {
+          console.log(`  ${login}: ${result.grants[login]}`);
+        }
+        if (result.revoked.length > 0) {
+          console.log(
+            `  ${dryRun ? 'would revoke' : 'revoked this run'}: ${result.revoked.join(', ')}`,
+          );
+        }
       }
-      if (result.revoked.length > 0) {
-        console.log(`  revoked this run: ${result.revoked.join(', ')}`);
-      }
+      await finishRun(pool, runId, {
+        status: 'success',
+        detail: `${results.length} repo(s), ${totalGrants} grant(s), ${totalRevoked} revoked`,
+      });
+    } catch (err) {
+      await finishRun(pool, runId, {
+        status: 'failure',
+        error: err instanceof Error ? err.message : String(err),
+      });
+      throw err;
     }
   } finally {
     await pool.end();

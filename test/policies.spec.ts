@@ -157,6 +157,54 @@ void test('stale-grant: a violation for an old, unused grant on a checked relati
   assert.ok(violations[0]?.description.includes('30-day'));
 });
 
+void test('stale-grant: an event tagged with one relation only covers that relation, not every relation on the same resource', async () => {
+  // Same shape as the AWS adapter granting read+write+admin on one bucket
+  // at once (src/adapters/aws-s3.ts) — two simultaneous relations for the
+  // same principal on the same resource, only one of them ever exercised.
+  const agent = await ensurePrincipal(pool, {
+    kind: 'agent',
+    source: 'manual',
+    externalId: 'a1',
+    displayName: 'Bucket Agent',
+  });
+  const bucket = await ensureResource(pool, {
+    kind: 'bucket',
+    source: 'manual',
+    externalId: 'b1',
+    displayName: 'Some Bucket',
+  });
+  await grant(agent, bucket, 'write', new Date('2020-01-01T00:00:00Z'));
+  await grant(agent, bucket, 'admin', new Date('2020-01-01T00:00:00Z'));
+
+  // Only 'write' was actually exercised — the event's action names exactly
+  // that relation, not the generic 'call' a tool invocation would use.
+  await appendEvent(pool, {
+    occurredAt: new Date(),
+    principalId: agent,
+    onBehalfOf: null,
+    resourceId: bucket,
+    action: 'write',
+    decision: 'allow',
+    denyReason: null,
+    taintLabels: [],
+    reversible: false,
+    requestDigest: null,
+  });
+
+  const rule: PolicyRule = {
+    kind: 'stale-grant',
+    relations: ['write', 'admin'],
+    maxUnusedDays: 30,
+  };
+  const violations = await evaluatePolicies(pool, [rule]);
+
+  // 'write' is covered by the matching event; 'admin' is still genuinely
+  // unused and must still be flagged — not masked by write's usage.
+  assert.equal(violations.length, 1);
+  assert.ok(violations[0]?.description.includes("'admin'"));
+  assert.ok(!violations[0]?.description.includes("'write'"));
+});
+
 void test('stale-grant: an empty relations list checks nothing', async () => {
   const agent = await ensurePrincipal(pool, { kind: 'agent', source: 'manual', externalId: 'a1' });
   const resource = await ensureResource(pool, { kind: 'repo', source: 'manual', externalId: 'r1' });

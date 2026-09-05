@@ -11,11 +11,12 @@ hand — a grant graph plus a tamper-evident event log, for companies too small
 to have a security team.
 
 **v1.0.0.** The event log, the broker integration that feeds it, capability
-classification, four grant-source adapters (MCP config, GitHub, AWS,
-Google Workspace), the report (CLI and HTTP) with policy checks, and the
-export bridge into Relationship-Based-Authorization are all implemented
-and tested. See [Related projects](#related-projects) for what feeds this
-repo, what it feeds, and what it doesn't do yet.
+classification, five grant-source adapters (MCP config, GitHub, AWS,
+Google Workspace, Postgres), the report (CLI and HTTP) with policy
+checks, migration tracking, adapter run-history, and the export bridge
+into Relationship-Based-Authorization are all implemented and tested. See
+[Related projects](#related-projects) for what feeds this repo, what it
+feeds, and what it doesn't do yet.
 
 ## Contents
 
@@ -33,6 +34,8 @@ repo, what it feeds, and what it doesn't do yet.
   - [8. Sync grants into RBA for real multi-hop reachability](#8-sync-grants-into-rba-for-real-multi-hop-reachability)
   - [9. Serve the report over HTTP](#9-serve-the-report-over-http)
   - [10. Check policy violations](#10-check-policy-violations)
+  - [11. Check on scheduled adapter runs](#11-check-on-scheduled-adapter-runs)
+  - [12. Populate grants from Postgres role membership](#12-populate-grants-from-postgres-role-membership)
 - [Data model](#data-model)
 - [Project layout](#project-layout)
 - [Development](#development)
@@ -77,6 +80,7 @@ docker run --name pg-principal -e POSTGRES_PASSWORD=devpass -p 5432:5432 -d post
 docker exec -it pg-principal psql -U postgres -c "create database principalgraph"
 docker exec -i pg-principal psql -U postgres -d principalgraph < schema/001_core.sql
 docker exec -i pg-principal psql -U postgres -d principalgraph < schema/002_rba_export_state.sql
+docker exec -i pg-principal psql -U postgres -d principalgraph < schema/003_performance_indexes.sql
 
 npm install
 npm test    # DATABASE_URL defaults to postgresql://postgres:devpass@localhost:5432/principalgraph
@@ -85,6 +89,14 @@ npm test    # DATABASE_URL defaults to postgresql://postgres:devpass@localhost:5
 Set `DATABASE_URL` to point at a different instance. Tests run against a real
 Postgres, not a mock — the tamper-evidence property in `src/log.ts` only means
 something proven against a real database.
+
+The three `docker exec`/`psql -f` lines above are the fastest path for one
+fresh database, but stop scaling once you're keeping multiple environments
+(a shared dev DB, staging, a teammate's laptop) current across 3+ migration
+files — `npm run migrate` (`scripts/run-migrations.ts`) tracks which have
+already been applied and only runs what's missing, safe to run repeatedly.
+CI uses it too. See that script's own header for how to adopt it on a
+database that already has some migrations applied the old way.
 
 ## Usage
 
@@ -137,6 +149,18 @@ permitted tool. Re-running it revokes (never deletes) a grant whose tool has
 since disappeared from config. `PRINCIPAL_GRAPH_AGENT_ID` overrides the
 agent identity (defaults to `<os user>@<hostname>`).
 
+Every adapter (this one and the three below) accepts `--dry-run`: it runs
+the exact same computation — reads the same source, resolves the same
+relations — but never writes to `grant_edge`. What it prints is what a
+real run *would* grant/revoke; `principal`/`resource` identity rows still
+get upserted normally (that's bookkeeping, not a permission change, and
+it's what lets the preview compare against real current state), but the
+actual insert/update/revoke never executes. Worth reaching for before the
+first real run against a config you're not fully sure of — a misconfigured
+repo list, an expired token, or a truncated API response would otherwise
+have every adapter's revoke step (deliberately full-inventory for this one
+— see below) read as "everyone else lost access."
+
 ### 3. Populate grants from GitHub repo collaborators
 
 ```bash
@@ -156,6 +180,7 @@ collaborator who's gone, *and* the old grant of one whose permission level
 changed (a fresh grant at the new level is written in its place) — never
 deletes either. The repo list is entirely explicit
 (`PRINCIPAL_GRAPH_GITHUB_REPOS`); nothing here discovers repos on its own.
+Accepts `--dry-run` — see [Usage 2](#2-populate-grants-from-your-agents-config)'s note on it.
 
 ### 4. Populate grants from AWS S3 bucket access
 
@@ -183,6 +208,9 @@ re-checked and found no longer allowed — a smaller `PRINCIPAL_GRAPH_AWS_PRINCI
 list on one run is a smaller check, never a claim that everyone else lost
 access. AWS credentials come from the SDK's own default provider chain
 (same as the AWS CLI); the credential needs only `iam:SimulatePrincipalPolicy`.
+Accepts `--dry-run` — see [Usage 2](#2-populate-grants-from-your-agents-config)'s
+note on it (the simulator calls themselves still run in dry-run mode; only the
+`grant_edge` write is skipped).
 
 > **Not yet live-verified.** This adapter's actual `iam:SimulatePrincipalPolicy`
 > call has never been exercised against a real AWS account (none was
@@ -225,7 +253,7 @@ above). Re-running it revokes a member who's left the group, *and* the
 old grant of one whose role changed — same relation-pair-aware revoke
 logic as the GitHub adapter. The group list is entirely explicit
 (`PRINCIPAL_GRAPH_WORKSPACE_GROUPS`); nothing here discovers groups on
-its own.
+its own. Accepts `--dry-run` — see [Usage 2](#2-populate-grants-from-your-agents-config)'s note on it.
 
 > **Not yet live-verified.** This adapter's actual Directory API call has
 > never been exercised against a real Workspace domain (none was
@@ -358,6 +386,72 @@ a weaker echo of that, not a complement to it. Add a rule by adding a
 `PolicyRule` variant and a matching case in `evaluatePolicies()`'s switch
 — TypeScript won't let you add the variant without also handling it.
 
+### 11. Check on scheduled adapter runs
+
+```bash
+npm run adapter-status
+```
+
+Every adapter script above, plus `export:rba`, records each run (success
+or failure, dry-run or real) in `adapter_run`
+(`schema/004_adapter_runs.sql`) — `startRun()`/`finishRun()` in
+`src/run-history.ts` wrap each script's own `main()`. This closes a real
+gap: without it, a cron/CI-scheduled adapter that silently stopped
+running, or started failing every time, was only noticeable by grepping
+logs after the fact. `npm run adapter-status` prints the most recent
+recorded run per adapter — when it ran, whether it succeeded, and a short
+detail line (or the error, on a failure). An adapter that's never run at
+all simply doesn't appear, rather than reading as a false "never ran."
+
+Requires `schema/004_adapter_runs.sql` applied (`npm run migrate`).
+
+### 12. Populate grants from Postgres role membership
+
+```bash
+PRINCIPAL_GRAPH_PG_TARGETS='[{"label":"prod","connectionString":"postgresql://readonly_audit@prod-host/app"}]' \
+PRINCIPAL_GRAPH_PG_READ_ROLE=app_read                                                                         \
+PRINCIPAL_GRAPH_PG_WRITE_ROLE=app_write                                                                       \
+PRINCIPAL_GRAPH_PG_ADMIN_ROLE=app_admin                                                                       \
+  npm run adapter:postgres
+```
+
+The fifth grant-source adapter, and the one that finally populates
+`'db'` — `model.ts`'s `ResourceKind` has listed it since day one,
+alongside `'tool' | 'repo' | 'bucket'`, with nothing writing it until now.
+Checks each target's own role catalog with Postgres's own `pg_has_role()`
+— the authoritative, recursion- and inheritance-aware membership
+function, not a hand-rolled walk of `pg_auth_members` — for membership in
+three tier roles you name (`PRINCIPAL_GRAPH_PG_READ_ROLE`/`_WRITE_ROLE`/
+`_ADMIN_ROLE`; no default, since Postgres role-naming has no universal
+convention the way AWS's fixed S3 action names do). Only `rolcanlogin`
+roles become principals (a role that can't log in is a pure group
+abstraction, not a real actor — same distinction as the Workspace
+adapter skipping `type: 'GROUP'`), and superuser rows are excluded
+outright: Postgres documents `pg_has_role()` as always true for a
+superuser regardless of real membership, so without that filter every
+superuser would falsely show up as a member of every tier.
+
+Unlike AWS, there's no explicit principal list — a target's own role
+catalog IS a complete, authoritative membership list for its tier roles,
+the same "the source already resolves this" property that makes GitHub's
+collaborators endpoint and Workspace's resolved group membership the
+right shape to build on, so revocation here is full-inventory too (a
+role losing tier membership, or changing tiers, is revoked the same
+relation-pair-aware way as those two). `label` (never the connection
+string, which carries a password) is what identifies a target everywhere
+in Principal-Graph; the credential each `connectionString` carries only
+needs read access to `pg_roles`/`pg_auth_members` — never a superuser.
+Accepts `--dry-run` — see [Usage 2](#2-populate-grants-from-your-agents-config)'s note on it.
+
+> **Live-verified**, unlike the AWS and Workspace adapters above (no
+> credentials were ever available for those in this project's build
+> environment): this one was run for real — a genuine non-superuser
+> read-only credential, real Postgres roles, a real grant and a real
+> revoke, checked with `npm run adapter-status` afterward. The
+> `not rolsuper` filter above exists because this real run caught it: the
+> first version of this adapter reported its own connecting credential as
+> a member of every tier, before that fix.
+
 ## Data model
 
 Five tables (`schema/001_core.sql`):
@@ -378,19 +472,29 @@ Two views built on top, read by the report:
 
 A second migration, `schema/002_rba_export_state.sql`, adds one small table
 (`rba_export_state`) holding nothing but the RBA exporter's own sync
-watermark — internal bookkeeping, not part of the grant graph itself.
+watermark — internal bookkeeping, not part of the grant graph itself. A
+third, `schema/003_performance_indexes.sql`, adds one composite index
+serving `unused_grant` and `checkStaleGrant`'s shared query shape — no new
+tables, nothing that changes what any query returns. A fourth,
+`schema/004_adapter_runs.sql`, adds `adapter_run` — run-history for the
+scheduled write side (see [Usage 11](#11-check-on-scheduled-adapter-runs)) —
+also internal bookkeeping, not part of the grant graph.
 
 ## Project layout
 
 ```
 schema/            SQL migrations — 001_core.sql is the shared core
                      002_rba_export_state.sql adds the RBA exporter's own sync state
+                     003_performance_indexes.sql adds indexes only, no schema change
+                     004_adapter_runs.sql adds adapter_run, scheduled-run history
 rba/
   principal-graph.authz  RBA's own namespace schema for this project's grant data
 src/
   model.ts          shared types every adapter/view imports from
   log.ts             hash-chained append + chain verifier
   upsert.ts          ensurePrincipal / ensureResource — how adapters upsert identity
+  migrate.ts          discoverMigrations / runMigrations — schema/*.sql tracking + apply
+  run-history.ts      startRun / finishRun / latestRuns — adapter_run bookkeeping
   capabilities.ts    TOOL_CAPABILITIES (hand-written) + how resources get classified
   policies.ts         POLICIES (hand-written) + evaluatePolicies() — "should never happen" rules
   db.ts              Pool construction (reads DATABASE_URL)
@@ -401,6 +505,7 @@ src/
     github-collaborators.ts  feeds grant_edge from a repo's GitHub collaborators
     aws-s3.ts                    feeds grant_edge from IAM Policy Simulator results on S3 buckets
     workspace-groups.ts           feeds grant_edge from a Google Group's resolved membership
+    postgres-roles.ts               feeds grant_edge from a target database's own tier-role membership
   views/
     report.ts         buildReport()/formatReport() — the three-section report
   exporters/
@@ -411,6 +516,9 @@ scripts/
   run-aws-adapter.ts         npm run adapter:aws
   run-workspace-adapter.ts    npm run adapter:workspace
   run-rba-exporter.ts        npm run export:rba
+  run-migrations.ts          npm run migrate
+  run-adapter-status.ts       npm run adapter-status
+  run-postgres-adapter.ts     npm run adapter:postgres
   run-server.ts               npm run serve
   run-policy-check.ts          npm run policy-check
   report.ts                  npm run report
@@ -425,6 +533,12 @@ reads Principal-Graph and writes to an external system, never the reverse.
 ## Development
 
 ```bash
+npm run verify   # typecheck, build, test, lint, format:check — same order CI runs
+```
+
+or individually:
+
+```bash
 npm run typecheck
 npm run build
 npm test
@@ -432,12 +546,18 @@ npm run lint
 npm run format:check
 ```
 
-CI (`.github/workflows/ci.yml`) runs all of the above on every push/PR,
-across Node 20/22/24, against a `postgres:16` service container.
-`schema/001_core.sql`, `src/model.ts`, and `src/log.ts` are specified
-byte-for-byte by this project's build brief and are excluded from
-`format`/`format:check` — see `.prettierignore` and `eslint.config.js`'s own
-comments before "fixing" a lint/format finding in either by editing them.
+`npm run test:coverage` runs the same suite under Node's own
+`--experimental-test-coverage` (no new dependency) for a coverage report.
+
+CI (`.github/workflows/ci.yml`) runs the `verify` sequence on every push/PR,
+across Node 20/22/24, against a `postgres:16` service container, plus a
+`gitleaks` secret-scan job. `schema/001_core.sql`, `src/model.ts`, and
+`src/log.ts` are specified byte-for-byte by this project's build brief and
+are excluded from `format`/`format:check` — see `.prettierignore` and
+`eslint.config.js`'s own comments before "fixing" a lint/format finding in
+either by editing them. See [CONTRIBUTING.md](CONTRIBUTING.md) for the
+full set of conventions (adapter shape, revocation-model choice,
+dependency discipline) before opening a PR.
 
 ## Related projects
 

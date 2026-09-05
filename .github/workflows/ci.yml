@@ -69,6 +69,16 @@ jobs:
     # environments) has ordinary internet access to pull node:20-alpine
     # and postgres:16, so this is real, not simulated.
     runs-on: ubuntu-latest
+    env:
+      # docker-compose.yml's `app` service requires this (see its own
+      # `:?` guard) — `docker compose` validates variable interpolation
+      # for the WHOLE file before running any command, even one that
+      # only ever targets a different service (`postgres`, `migrate`),
+      # so this has to be set for every step in this job that invokes
+      # `docker compose` at all, not just the one that starts `app`.
+      # Caught live: the very first `docker compose up -d postgres` call
+      # failed on this before it was job-level.
+      PRINCIPAL_GRAPH_REPORT_API_KEY: ci-smoke-test-key
     steps:
       - uses: actions/checkout@v7
       - name: Build the image
@@ -78,8 +88,6 @@ jobs:
           docker compose up -d postgres
           docker compose run --rm migrate
       - name: Start the report server and confirm it actually serves
-        env:
-          PRINCIPAL_GRAPH_REPORT_API_KEY: ci-smoke-test-key
         run: |
           docker compose up -d app
           for i in $(seq 1 30); do

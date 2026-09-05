@@ -7,15 +7,23 @@
  * log.spec.ts covers on its own.
  */
 
-import { before, after, test } from 'node:test';
+import { before, beforeEach, after, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createBroker, ToolCallBlockedError, type ToolExecutor } from 'taint-tracked-tool-broker';
+import {
+  createBroker,
+  ToolCallBlockedError,
+  type AuditEvent,
+  type ToolExecutor,
+} from 'taint-tracked-tool-broker';
 
 import { createPrincipalGraphAuditSink } from '../src/adapters/broker-audit-sink.js';
 import { verifyChain } from '../src/log.js';
+import { evaluatePolicies } from '../src/policies.js';
+import { ensurePrincipal, ensureResource } from '../src/upsert.js';
 import { pool, resetDatabase } from './helpers.js';
 
 before(resetDatabase);
+beforeEach(resetDatabase);
 after(async () => {
   await pool.end();
 });
@@ -119,4 +127,107 @@ void test('broker calls, gated or not, land in the event log as a verified chain
     'select distinct on_behalf_of from event',
   );
   assert.ok(onBehalfRows.every((r) => r.on_behalf_of !== null));
+});
+
+/** A minimal, valid AuditEvent — record()'s own public contract, not something only the broker's internal dispatch can construct. */
+function fakeAuditEvent(overrides: Partial<AuditEvent> = {}): AuditEvent {
+  return {
+    verdict: { action: 'ALLOW' },
+    call: { id: 'fake-call-1', toolName: 'fetch_url', args: {}, sessionId: 'clamp-test-session' },
+    taint: {
+      matchedRecords: [],
+      scopeLevel: 'CLEAN',
+      argFingerprintFloor: 'CLEAN',
+      privateDataSeen: false,
+      sinkClass: 'NONE',
+    },
+    at: Date.now(),
+    executed: true,
+    ...overrides,
+  };
+}
+
+void test('a future-dated event.at is clamped to now(), not trusted — closes the stale-grant/unused-grant evasion', async () => {
+  const sink = createPrincipalGraphAuditSink({
+    pool,
+    agent: { source: 'manual', externalId: 'clamp-test-agent' },
+  });
+
+  const farFuture = Date.now() + 365 * 24 * 60 * 60 * 1000; // one year out
+  const before = Date.now();
+
+  // record() is a public method on the returned sink, independent of the
+  // broker's own internal dispatch path — anything holding a reference to
+  // the sink can call it directly with an arbitrary event, exactly the
+  // vector this test exercises rather than assumes.
+  sink.record(fakeAuditEvent({ at: farFuture }));
+  await sink.flush();
+
+  const after = Date.now();
+
+  const { rows } = await pool.query<{ occurred_at: Date }>(
+    `select e.occurred_at
+       from event e
+       join resource r on r.id = e.resource_id
+      where r.external_id = 'fetch_url'`,
+  );
+  assert.equal(rows.length, 1);
+  const occurredAtMs = rows[0].occurred_at.getTime();
+  assert.ok(
+    occurredAtMs >= before && occurredAtMs <= after,
+    `expected occurred_at clamped to roughly now(), got ${rows[0].occurred_at.toISOString()}`,
+  );
+  assert.ok(occurredAtMs < farFuture, 'must not have stored the caller-supplied future timestamp');
+
+  // Why this matters, concretely: checkStaleGrant/unused_grant_by_relation
+  // only ask "is there an allow event within the last N days" — an event
+  // genuinely dated "now" correctly reads as real, current use (no
+  // violation today, honestly). The evasion an unclamped occurred_at opens
+  // is about what happens as real time passes: a stored `farFuture` value
+  // would stay "within the window" for as long as that future date is
+  // still ahead of `now()` — potentially years, an effectively permanent
+  // mask. A value bounded to real `now()` at write time ages out of any
+  // lookback window exactly like every other honest event does — proven
+  // directly below, by comparing what the SAME malicious `at` produces
+  // through the sink (bounded) versus written by hand (unbounded).
+  const directFutureEvent = {
+    occurredAt: new Date(farFuture),
+    principalId: await ensurePrincipal(pool, {
+      kind: 'agent',
+      source: 'manual',
+      externalId: 'clamp-test-agent-direct',
+    }),
+    onBehalfOf: null,
+    resourceId: await ensureResource(pool, {
+      kind: 'tool',
+      source: 'manual',
+      externalId: 'direct-future-tool',
+    }),
+    action: 'call',
+    decision: 'allow' as const,
+    denyReason: null,
+    taintLabels: [],
+    reversible: true,
+    requestDigest: null,
+  };
+  const { appendEvent } = await import('../src/log.js');
+  await appendEvent(pool, directFutureEvent);
+  await pool.query(
+    `insert into grant_edge (principal_id, resource_id, relation, source, observed_at, first_observed_at, changed_at)
+     values ($1, $2, 'can_call', 'manual', now(), now() - interval '200 days', now() - interval '200 days')`,
+    [directFutureEvent.principalId, directFutureEvent.resourceId],
+  );
+  // Even a hand-inserted event dated hundreds of days in the future
+  // reads as "within the last 30 days" today, and will keep reading that
+  // way for as long as that future date remains ahead of now() — the
+  // permanent-mask shape this fix exists to keep out of the sink's own
+  // write path (event.at is fully caller-controlled there, unlike a
+  // direct appendEvent() call an integrator writes by hand).
+  const directViolations = await evaluatePolicies(pool, [
+    { kind: 'stale-grant', relations: ['can_call'], maxUnusedDays: 30 },
+  ]);
+  assert.ok(
+    !directViolations.some((v) => v.description.includes('direct-future-tool')),
+    "a future-dated allow event masks a 200-day-stale grant — the exact shape event.at's clamp keeps out of the sink",
+  );
 });

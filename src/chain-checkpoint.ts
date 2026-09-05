@@ -47,6 +47,7 @@
 
 import type { Pool } from 'pg';
 import { verifyChain, type ChainBreak } from './log.js';
+import { hashOf } from './chain-hash.js';
 
 export interface ChainCheckpointRow {
   id: string;
@@ -139,6 +140,41 @@ export interface AnchoredVerifyResult {
 }
 
 /**
+ * The anchor comparison itself, factored out so `verifyChainAnchored()`
+ * (full replay) and `verifyChainIncremental()` (below) run the exact same
+ * check rather than two copies that could quietly diverge. `checkpoint`
+ * must have a non-null `seq` — callers only reach here after already
+ * confirming that (see both callers below).
+ */
+async function anchorBreakFor(
+  pool: Pool,
+  checkpoint: ChainCheckpointRow,
+  seq: bigint,
+  hash: string | null,
+): Promise<ChainAnchorBreak | null> {
+  const { rows } = await pool.query<{
+    max_seq: string | null;
+    hash_at_checkpoint: string | null;
+  }>(
+    `select
+       (select max(seq)::text from event) as max_seq,
+       (select hash from event where seq = $1) as hash_at_checkpoint`,
+    [seq.toString()],
+  );
+  const maxSeqText = rows[0]?.max_seq ?? null;
+  const currentMaxSeq = maxSeqText === null ? null : BigInt(maxSeqText);
+  const hashAtCheckpoint = rows[0]?.hash_at_checkpoint ?? null;
+
+  if (currentMaxSeq === null || currentMaxSeq < seq) {
+    return { reason: 'truncated', checkpoint, currentMaxSeq };
+  }
+  if (hashAtCheckpoint !== hash) {
+    return { reason: 'tampered', checkpoint, currentMaxSeq };
+  }
+  return null;
+}
+
+/**
  * verifyChain() plus the external-anchor check described in this file's
  * own header. Always calls verifyChain() first — a mid-chain edit is
  * still exactly what it's for, and it's frequently what actually catches
@@ -149,34 +185,167 @@ export async function verifyChainAnchored(pool: Pool): Promise<AnchoredVerifyRes
   const breaks = await verifyChain(pool);
   const checkpoint = await latestCheckpoint(pool);
 
-  let anchorBreak: ChainAnchorBreak | null = null;
   // A checkpoint with a null seq was taken against an empty chain — there's
   // nothing recorded to anchor against yet.
-  if (checkpoint && checkpoint.seq !== null) {
-    const { rows } = await pool.query<{
-      max_seq: string | null;
-      hash_at_checkpoint: string | null;
-    }>(
-      `select
-         (select max(seq)::text from event) as max_seq,
-         (select hash from event where seq = $1) as hash_at_checkpoint`,
-      [checkpoint.seq.toString()],
-    );
-    const maxSeqText = rows[0]?.max_seq ?? null;
-    const currentMaxSeq = maxSeqText === null ? null : BigInt(maxSeqText);
-    const hashAtCheckpoint = rows[0]?.hash_at_checkpoint ?? null;
-
-    if (currentMaxSeq === null || currentMaxSeq < checkpoint.seq) {
-      anchorBreak = { reason: 'truncated', checkpoint, currentMaxSeq };
-    } else if (hashAtCheckpoint !== checkpoint.hash) {
-      anchorBreak = { reason: 'tampered', checkpoint, currentMaxSeq };
-    }
-  }
+  const anchorBreak =
+    checkpoint && checkpoint.seq !== null
+      ? await anchorBreakFor(pool, checkpoint, checkpoint.seq, checkpoint.hash)
+      : null;
 
   const clean = breaks.length === 0 && anchorBreak === null;
   return {
     breaks,
     anchorBreak,
     checkpoint: clean ? await recordCheckpoint(pool) : null,
+  };
+}
+
+/**
+ * Re-hashes only the `event` rows added since the last checkpoint,
+ * instead of the whole table — the fix for what used to be `chain-intact`'s
+ * (src/policies.ts) own cost: a full `verifyChain()` replay pulls every
+ * row this deployment has EVER recorded into memory on every single call,
+ * measured at 1.2s / 100MB+ RSS at 100k events and climbing linearly
+ * forever. On a routine `policy-check` cadence that cost is paid on every
+ * tick for no new information past the first run.
+ *
+ * The mechanism: `chain_checkpoint` already records a (seq, hash) proven
+ * clean by whatever run last recorded it. Once that exact row is
+ * reconfirmed unchanged (the same anchor comparison `verifyChainAnchored()`
+ * itself runs), every row at or before it was ALREADY proven intact —
+ * walking it again finds nothing new. So this only fetches rows with
+ * `seq` strictly greater than the checkpoint and re-hashes forward from
+ * the checkpoint's own recorded hash, the same way `verifyChain()`
+ * (src/log.ts) chains forward from `null` at seq 1.
+ *
+ * **The trade-off, stated plainly** — same discipline as this file's own
+ * header on what the tail-truncation anchor does and doesn't cover: a row
+ * at or before the last checkpoint that gets edited directly, without
+ * anything AFTER it ever changing, is invisible to this function forever
+ * — nothing past the tampered row changed, so nothing here re-walks back
+ * to notice. That's exactly why this is a *routine-check* optimization,
+ * not a replacement: `scripts/run-verify-chain.ts` still runs the real,
+ * full, unbounded `verifyChainAnchored()` as its own periodic job (see
+ * that script's own header — it already called itself "a full audit, not
+ * a per-run check" before this function existed), and stays the only
+ * thing that catches tampering older than the last incremental
+ * checkpoint. `chain-intact` uses this function specifically so *that*
+ * cadence — every `policy-check` tick — stays cheap; the periodic full
+ * job is what actually closes the gap this trades away.
+ *
+ * If the checkpoint itself no longer checks out (`anchorBreak` fires),
+ * there is no trustworthy point left to walk forward from — this run
+ * pays the cost of a full replay once instead of silently trusting a
+ * compromised starting point, rather than reporting a shorter, less
+ * complete `breaks[]` than a full run would have found.
+ *
+ * Necessarily duplicates src/log.ts's private hashing format — see
+ * src/chain-hash.ts's own header for why that's safe here specifically
+ * (src/log.ts is frozen, so there is no future version of that format
+ * for this copy to drift from) and how it's cross-checked
+ * (test/chain-hash.spec.ts). test/chain-checkpoint.spec.ts's own
+ * incremental tests confirm this function and bare verifyChain() agree
+ * on every tamper shape within the incremental window.
+ */
+export interface IncrementalVerifyResult extends AnchoredVerifyResult {
+  /** How many `event` rows this run actually walked and re-hashed. */
+  eventsChecked: number;
+  /** True when this run had no usable checkpoint to build on (first run, or a compromised one) and replayed the whole chain instead. */
+  fullReplay: boolean;
+}
+
+async function fullReplayResult(
+  pool: Pool,
+  knownAnchorBreak: ChainAnchorBreak | null = null,
+): Promise<IncrementalVerifyResult> {
+  const breaks = await verifyChain(pool);
+  const { rows } = await pool.query<{ c: string }>('select count(*)::text as c from event');
+  const eventsChecked = Number(rows[0]?.c ?? '0');
+  const clean = breaks.length === 0 && knownAnchorBreak === null;
+  return {
+    breaks,
+    anchorBreak: knownAnchorBreak,
+    checkpoint: clean ? await recordCheckpoint(pool) : null,
+    eventsChecked,
+    fullReplay: true,
+  };
+}
+
+export async function verifyChainIncremental(pool: Pool): Promise<IncrementalVerifyResult> {
+  const checkpoint = await latestCheckpoint(pool);
+
+  // Nothing to build forward from yet — same first-run shape
+  // verifyChainAnchored() itself has always had.
+  if (!checkpoint || checkpoint.seq === null || checkpoint.hash === null) {
+    return fullReplayResult(pool);
+  }
+
+  const anchorBreak = await anchorBreakFor(pool, checkpoint, checkpoint.seq, checkpoint.hash);
+  if (anchorBreak) {
+    return fullReplayResult(pool, anchorBreak);
+  }
+
+  const { rows } = await pool.query<{
+    id: string;
+    seq: string;
+    occurred_at: Date;
+    principal_id: string;
+    on_behalf_of: string | null;
+    resource_id: string;
+    action: string;
+    decision: 'allow' | 'deny';
+    deny_reason: string | null;
+    taint_labels: string[];
+    reversible: boolean | null;
+    request_digest: string | null;
+    prev_hash: string | null;
+    hash: string;
+  }>(
+    `select id, seq, occurred_at, principal_id, on_behalf_of, resource_id,
+            action, decision, deny_reason, taint_labels, reversible,
+            request_digest, prev_hash, hash
+       from event where seq > $1 order by seq asc`,
+    [checkpoint.seq.toString()],
+  );
+
+  const breaks: ChainBreak[] = [];
+  let expectedPrev: string | null = checkpoint.hash;
+
+  for (const r of rows) {
+    if (r.prev_hash !== expectedPrev) {
+      breaks.push({ seq: BigInt(r.seq), eventId: r.id, reason: 'prev_hash_mismatch' });
+    }
+
+    const recomputed = hashOf(
+      r.id,
+      {
+        occurredAt: r.occurred_at,
+        principalId: r.principal_id,
+        onBehalfOf: r.on_behalf_of,
+        resourceId: r.resource_id,
+        action: r.action,
+        decision: r.decision,
+        denyReason: r.deny_reason,
+        taintLabels: r.taint_labels,
+        reversible: r.reversible,
+        requestDigest: r.request_digest,
+      },
+      r.prev_hash,
+    );
+
+    if (recomputed !== r.hash) {
+      breaks.push({ seq: BigInt(r.seq), eventId: r.id, reason: 'hash_mismatch' });
+    }
+
+    expectedPrev = r.hash;
+  }
+
+  const clean = breaks.length === 0;
+  return {
+    breaks,
+    anchorBreak: null,
+    checkpoint: clean ? await recordCheckpoint(pool) : null,
+    eventsChecked: rows.length,
+    fullReplay: false,
   };
 }

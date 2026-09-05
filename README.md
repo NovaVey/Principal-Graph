@@ -177,6 +177,20 @@ const broker = createBroker({ auditSink: sink });
 await sink.flush();
 ```
 
+Writes are batched under the hood (`src/event-batch.ts`) — every call
+whose principal/resource lookups resolve within the same event-loop tick
+lands in one transaction under one advisory-lock hold instead of one
+transaction per event, the fix for a measured ~1,100 events/sec ceiling
+on the naive per-event path. Nothing here changes: `record()`/`flush()`
+behave exactly as above regardless of load.
+
+`event.at` (when the call happened, per the broker) is clamped to `now()`
+if it's ever in the future — never trusted outright, since it's plain
+caller-supplied data and a manufactured future timestamp would otherwise
+permanently mask a stale grant from [Usage 10](#10-check-policy-violations)'s
+`stale-grant` rule (or from the unused-grants section of
+[Usage 7](#7-run-the-report)'s report).
+
 ### 2. Populate grants from your agent's config
 
 ```bash
@@ -371,6 +385,20 @@ Four plain-text sections, one command:
 override the denials section's window (default 30 days) and row cap
 (default 50) — see `src/views/report.ts`.
 
+Unused grants and trifecta exposure are capped too
+(`PRINCIPAL_GRAPH_REPORT_UNUSED_GRANT_LIMIT` /
+`PRINCIPAL_GRAPH_REPORT_TRIFECTA_LIMIT`, both default 50, same shape as
+the denial cap above) — a real deployment with 18k live grants used to
+print all 18,091 of them, the exact thing "reads in two minutes" exists
+to prevent. Both sections are already sorted most-actionable-first before
+the cap applies (unused grants by danger, ties broken by how long they've
+sat unused; trifecta alphabetically, since two fully-exposed principals
+carry the same risk), so cutting the tail keeps exactly the rows worth
+reading first — a truncated section prints an `... N more` line rather
+than silently dropping rows, and `Report.unusedGrantsTruncated` /
+`Report.trifectaTruncated` carry the same signal to `/report.json`
+([Usage 9](#9-serve-the-report-over-http)).
+
 ### 8. Sync grants into RBA for real multi-hop reachability
 
 Principal-Graph's own grant model is deliberately one hop (`principal` →
@@ -451,6 +479,18 @@ project's report says exactly who can reach what, so serving it wide open
 by way of a forgotten env var is the one failure mode worth refusing
 outright rather than defaulting around.
 
+This process never writes — every route above only ever reads. Until now
+it shared the exact same credential as every adapter (which genuinely
+does need full read/write), so the one component of this project an
+internet-facing process actually runs held write access to the complete
+map of who can reach what, for no reason. `PRINCIPAL_GRAPH_REPORT_DATABASE_URL`,
+if set, is what this server connects with *instead of* `DATABASE_URL` —
+point it at a credential granted only `principalgraph_report_reader`
+(`schema/012_report_reader_role.sql` — that file's own header has the
+exact two commands to run once, since the role itself is `NOLOGIN` by
+design). Falls back to `DATABASE_URL` when unset, same as every other
+script here — opt-in, not a breaking change.
+
 ### 10. Check policy violations
 
 ```bash
@@ -501,15 +541,18 @@ different reasons:
   it's the one case this rule refuses to stay quiet about. A dry-run-only
   history is treated the same way, for the same reason — it's not
   evidence of a real run either.
-- **`chain-intact`** calls `src/log.ts`'s own `verifyChain()`, which pulls
-  the *entire* event table into memory on every call (frozen — no
-  bounded variant exists without duplicating its hash algorithm outside
-  its one source of truth, a risk not worth taking for what this
-  property exists to guarantee). In the default set, a routine
-  `policy-check` cron would get slower forever as the log grows. Run it
-  on its own periodic cadence instead — see [Usage 13](#13-verify-the-event-chain-hasnt-been-tampered-with)
-  — or pass `[...POLICIES, { kind: 'chain-intact' }]` yourself if you
-  want it folded into one report anyway.
+- **`chain-intact`** calls `verifyChainIncremental()`
+  (`src/chain-checkpoint.ts`), which re-hashes only the `event` rows
+  added since the last checkpoint instead of the whole table on every
+  call — see [Usage 13](#13-verify-the-event-chain-hasnt-been-tampered-with)
+  for the full mechanism and its one real trade-off. Still kept out of
+  the default set: the incremental path trusts everything at or before
+  the last checkpoint, so it's not the thing that catches tampering
+  *older* than that — `npm run verify-chain`, on its own periodic
+  cadence, is. Fully usable from `evaluatePolicies()` too — pass
+  `[...POLICIES, { kind: 'chain-intact' }]` yourself if you want it
+  folded into one report anyway; it's cheap enough now to run on every
+  tick.
 
 Same shape as `TOOL_CAPABILITIES` — a plain, hand-written TypeScript
 array, not a parsed text format. `Relationship-Based-Authorization`
@@ -622,11 +665,23 @@ matches its own content, or it no longer links to the row before it —
 someone edited or deleted an `event` row directly), and exits nonzero if
 it finds one. Run this on its own periodic cadence (a full audit, not a
 per-invocation check) — it's an unbounded full-table scan by design
-(replaying the *whole* chain is the property), so it shouldn't run on
-every `policy-check` tick. `chain-intact` ([Usage 10](#10-check-policy-violations))
-calls the exact same function for anyone who wants it folded into one
-report instead — deliberately not in `policy-check`'s own default set,
-for that same cost reason.
+(replaying the *whole* chain is the property), and stays that way here on
+purpose: this is the job that has to see everything, ever, not just what
+changed recently.
+
+`chain-intact` ([Usage 10](#10-check-policy-violations)) used to call
+this exact same function, which meant folding it into a routine
+`policy-check` cron got slower forever as the log grew — confirmed with
+`EXPLAIN ANALYZE` at 100k rows: 1.2s and 100MB+ RSS, all of it spent
+re-hashing rows nothing had touched since the last run. It now calls
+`verifyChainIncremental()` (`src/chain-checkpoint.ts`) instead, which
+only re-walks and re-hashes `event` rows added since the last checkpoint
+— routine and cheap, at the cost of one real, deliberately-accepted gap:
+a row edited *before* the last checkpoint, with nothing after it ever
+touched, is invisible to it forever (nothing past it changed, so nothing
+re-walks back to notice). That's exactly why this script keeps doing the
+full, unbounded replay on its own cadence — it's the only thing left that
+still catches tampering older than the last incremental checkpoint.
 
 **`verifyChain()` alone has a real blind spot**: it only ever walks rows
 that currently exist, so deleting the chain's *tail* — or every row in it
@@ -634,9 +689,9 @@ that currently exist, so deleting the chain's *tail* — or every row in it
 no way to notice something is *missing*, only that something *present*
 was altered. Confirmed live: write 4 events, delete the 2 newest, then
 delete all 4 — `verifyChain()` reports "no breaks found" after every
-single step. This script (and the `chain-intact` policy rule) now call
-`verifyChainAnchored()` (`src/chain-checkpoint.ts`) instead, which
-compares the current chain against `chain_checkpoint`
+single step. This script calls `verifyChainAnchored()`
+(`src/chain-checkpoint.ts`, the full-replay path) instead, which compares
+the current chain against `chain_checkpoint`
 (`schema/009_chain_checkpoint.sql`) — an append-only table, external to
 `event`, recording the last verified tail (seq, hash, row count) every
 time a run comes back clean. Deleting the tail, or the whole table, now
@@ -898,7 +953,13 @@ rather than only add a new one alongside it) and re-creates
 eleventh, `schema/011_rba_export_dead_letter.sql`, adds
 `rba_export_dead_letter` — see
 [Usage 8](#8-sync-grants-into-rba-for-real-multi-hop-reachability) — also
-internal bookkeeping, not part of the grant graph.
+internal bookkeeping, not part of the grant graph. A twelfth,
+`schema/012_report_reader_role.sql`, adds no table at all — a
+cluster-wide, `NOLOGIN` Postgres role (`principalgraph_report_reader`)
+carrying read-only grants, for the report server to run under instead of
+a full-access credential — see
+[Usage 9](#9-serve-the-report-over-http) and that migration's own header
+for the two commands that give it a real login credential.
 
 `schema_migrations` (bootstrapped by `src/migrate.ts` itself, not a
 numbered file — see [Quick start](#quick-start)) also gained a nullable
@@ -921,12 +982,15 @@ schema/            SQL migrations — 001_core.sql is the shared core
                      009_chain_checkpoint.sql adds chain_checkpoint, the tail-truncation anchor
                      010_grant_edge_observed_split.sql adds first_observed_at/changed_at
                      011_rba_export_dead_letter.sql adds rba_export_dead_letter
+                     012_report_reader_role.sql adds a read-only NOLOGIN role, no tables
 rba/
   principal-graph.authz  RBA's own namespace schema for this project's grant data
 src/
   model.ts          shared types every adapter/view imports from
   log.ts             hash-chained append + chain verifier
-  chain-checkpoint.ts  verifyChainAnchored() — catches tail truncation verifyChain() alone can't
+  chain-hash.ts       log.ts's own hash format, duplicated for code that can't touch that frozen file
+  event-batch.ts      appendEventBatch()/EventBatcher — batches event appends under one lock hold
+  chain-checkpoint.ts  verifyChainAnchored() (full replay) / verifyChainIncremental() (routine-check) — catches tail truncation verifyChain() alone can't
   upsert.ts          ensurePrincipal / ensureResource — how adapters upsert identity
   migrate.ts          discoverMigrations / runMigrations — schema/*.sql tracking + apply, locked + checksummed
   run-history.ts      startRun / finishRun / latestRuns / withAdapterLock — adapter_run bookkeeping + overlap prevention

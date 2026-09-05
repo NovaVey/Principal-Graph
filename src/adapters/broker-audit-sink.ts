@@ -5,7 +5,10 @@
  * is called at the broker's decision point: every gated call's verdict
  * (ALLOW / ALLOW_WITH_WARNING / REQUIRE_APPROVAL / BLOCK / QUARANTINE_AND_RETRY),
  * executed or not. `createPrincipalGraphAuditSink()` builds one that turns
- * each `AuditEvent` into a row in `event` via `appendEvent()`. Nothing here
+ * each `AuditEvent` into a row in `event`, via `EventBatcher`
+ * (`src/event-batch.ts`) coalescing concurrent calls into batched writes
+ * rather than one `appendEvent()` transaction per event — this sink is
+ * the hottest real path into that table under load. Nothing here
  * touches the broker's own repo — this is the documented integrator side of
  * a public interface (see taint-tracked-tool-broker's examples/audit-sqlite.ts
  * and examples/audit-prometheus.ts for the same pattern against other sinks).
@@ -23,7 +26,7 @@
 import { createHash } from 'node:crypto';
 import type { Pool } from 'pg';
 import type { AuditEvent, AuditSink, PolicyDecision } from 'taint-tracked-tool-broker';
-import { appendEvent } from '../log.js';
+import { EventBatcher } from '../event-batch.js';
 import { ensurePrincipal, ensureResource } from '../upsert.js';
 import { classifyKnownTool } from '../capabilities.js';
 import type { Decision } from '../model.js';
@@ -99,6 +102,34 @@ function reversibleOf(event: AuditEvent): boolean {
   return event.taint.sinkClass === 'NONE';
 }
 
+/**
+ * `event.at` is caller-supplied — nothing upstream of this sink validates
+ * it (it's a plain `number`, epoch millis, on the broker's own public
+ * `AuditEvent` type), and `record()` is a public entry point on the
+ * object this file returns, independent of the broker's own internal
+ * call path: anything holding a reference to the sink can call
+ * `.record()` directly with an arbitrary event, `at` included.
+ *
+ * A future-dated `occurredAt` is a real, live evasion, not a theoretical
+ * one: `unused_grant_by_relation` and src/policies.ts's `checkStaleGrant`
+ * both only count an `allow` event as "recent" if `event.occurred_at`
+ * falls within their lookback window — a single event dated far enough
+ * in the future stays "in the window" forever, permanently suppressing
+ * both checks for that (principal, resource) pair. Unlike an adapter's
+ * `observed_at` (a snapshot of when something was checked, genuinely
+ * sometimes backdated by the source system), a live tool-call audit
+ * event is never legitimately dated later than "now" — so anything later
+ * is clamped down to `now()` instead of trusted. Clamped, not rejected:
+ * `record()`'s own contract (see its doc comment below) never throws
+ * back into the broker, and a thrown validation error here would just
+ * turn into a silently dropped event on a write failure — a full audit
+ * gap for what's likely simple clock skew, worse than recording it
+ * slightly wrong.
+ */
+function clampOccurredAt(atMillis: number): Date {
+  return new Date(Math.min(atMillis, Date.now()));
+}
+
 /** sha256 of the call arguments. Never the arguments themselves — see EventInput.requestDigest. */
 function digestOf(args: unknown): string | null {
   try {
@@ -118,6 +149,15 @@ export function createPrincipalGraphAuditSink(
 ): PrincipalGraphAuditSink {
   const { pool } = opts;
   const pending = new Set<Promise<void>>();
+  // One batcher per sink instance — same "one sink instance, one broker
+  // instance" granularity this file already uses for identity resolution.
+  // See src/event-batch.ts's own header for why this exists: appendEvent()
+  // (src/log.ts, frozen) is one transaction plus one advisory-lock
+  // acquisition per call, a hard ~1,100 events/sec ceiling under
+  // sustained load; batcher.append() below chains everything that becomes
+  // ready to write within the same event-loop tick into one transaction
+  // instead.
+  const batcher = new EventBatcher(pool);
 
   // Each identity is upserted at most once per sink instance, not once per
   // event — every AuditEvent this sink ever records shares the same agent
@@ -162,8 +202,8 @@ export function createPrincipalGraphAuditSink(
     // allow/deny this schema tracks without re-deriving that logic here.
     const decision: Decision = event.executed ? 'allow' : 'deny';
 
-    await appendEvent(pool, {
-      occurredAt: new Date(event.at),
+    await batcher.append({
+      occurredAt: clampOccurredAt(event.at),
       principalId,
       onBehalfOf,
       resourceId,

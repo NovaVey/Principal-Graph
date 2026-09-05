@@ -59,6 +59,49 @@ jobs:
       - run: npm run lint
       - run: npm run format:check
 
+  docker:
+    # Builds the real Dockerfile/docker-compose.yml this repo ships (see
+    # README's Quick Start) and smoke-tests the actual compiled image —
+    # not just that `npm run build` succeeds (the `test` job above
+    # already proves that), but that the image built FROM that output
+    # actually serves the report and runs `npm run sync`'s own
+    # equivalent. Runner-provided Docker (unlike some sandboxed dev
+    # environments) has ordinary internet access to pull node:20-alpine
+    # and postgres:16, so this is real, not simulated.
+    runs-on: ubuntu-latest
+    env:
+      # docker-compose.yml's `app` service requires this (see its own
+      # `:?` guard) — `docker compose` validates variable interpolation
+      # for the WHOLE file before running any command, even one that
+      # only ever targets a different service (`postgres`, `migrate`),
+      # so this has to be set for every step in this job that invokes
+      # `docker compose` at all, not just the one that starts `app`.
+      # Caught live: the very first `docker compose up -d postgres` call
+      # failed on this before it was job-level.
+      PRINCIPAL_GRAPH_REPORT_API_KEY: ci-smoke-test-key
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build the image
+        run: docker build -t principal-graph:ci .
+      - name: Bring up postgres, then migrate
+        run: |
+          docker compose up -d postgres
+          docker compose run --rm migrate
+      - name: Start the report server and confirm it actually serves
+        run: |
+          docker compose up -d app
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8080/health && break
+            sleep 1
+          done
+          curl -sf http://localhost:8080/health
+          curl -sf -H "Authorization: Bearer $PRINCIPAL_GRAPH_REPORT_API_KEY" http://localhost:8080/report | head -5
+      - name: npm run sync equivalent — nothing configured but mcp-config, must still exit 0
+        run: docker compose run --rm sync
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
   secrets:
     # Adapters routinely handle a GitHub PAT, AWS credentials, and a Google
     # service-account key read straight off disk (see README's Usage

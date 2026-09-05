@@ -74,6 +74,19 @@ means something proven against a real database, not an in-memory
 stand-in that can't reproduce a direct `UPDATE`) — don't mock `pg` in a
 new test.
 
+An adapter's real HTTP call (e.g. `fetchCollaboratorsFromApi` in
+`github-collaborators.ts`, `createHttpRbaClient` in `exporters/rba.ts`)
+is a different story: every real adapter test already injects a fake
+(`FetchCollaborators`, `QueryTargetRoles`, ...) instead of hitting a
+live API, which is correct for exercising the adapter's own grant/revoke
+logic but leaves the real fetch call itself — pagination, headers, the
+non-ok error path — uncovered. Close that gap by stubbing
+`globalThis.fetch` directly (see `test/github-collaborators-http.spec.ts`,
+`test/rba-http-client.spec.ts`) rather than adding an HTTP-mocking
+dependency — the adapters already use bare `fetch`, so this is the same
+shape of test double, not a new one. Save and restore the real
+`globalThis.fetch` in `before`/`after`.
+
 Run `npm run test:coverage` for a coverage report (Node's own
 `--experimental-test-coverage`, no new dependency) when you want to see
 what a new test actually exercises.

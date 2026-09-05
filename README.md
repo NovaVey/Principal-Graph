@@ -54,7 +54,16 @@ trifecta-exposure sections are capped the same way denials already were,
 instead of printing thousands of rows unbounded ([Usage 7](#7-run-the-report));
 and the report server now runs under its own read-only Postgres role
 instead of sharing every adapter's full-access credential
-([Usage 9](#9-serve-the-report-over-http)). See
+([Usage 9](#9-serve-the-report-over-http)).
+
+That same review flagged a real gap this project had no answer for at
+all: a "right to erasure" request against the actual PII it stores (a
+human's email/name in `principal`). `npm run erase-identity` now answers
+it — a reactive, per-request anonymization that's provably safe against
+the hash chain, with its one honest limitation (a source system that
+still lists the person will recreate them on its next sync) stated
+plainly rather than glossed over
+([Usage 19](#19-erase-a-principals-identity)). See
 [Related projects](#related-projects) for what feeds this repo, what it
 feeds, and what it doesn't do yet.
 
@@ -82,6 +91,7 @@ feeds, and what it doesn't do yet.
   - [16. Answer "which run touched this grant"](#16-answer-which-run-touched-this-grant)
   - [17. Stop treating deleted resources as live forever](#17-stop-treating-deleted-resources-as-live-forever)
   - [18. Prevent two runs of the same adapter from overlapping](#18-prevent-two-runs-of-the-same-adapter-from-overlapping)
+  - [19. Erase a principal's identity](#19-erase-a-principals-identity)
 - [Data model](#data-model)
 - [Project layout](#project-layout)
 - [Development](#development)
@@ -901,6 +911,55 @@ whole run in it.
 > refused immediately with `AdapterAlreadyRunningError` while the first is
 > still running, and completes normally once the first finishes.
 
+### 19. Erase a principal's identity
+
+The only real PII this project stores lives in two `principal` columns:
+`external_id` (a real email, for a human `source: 'workspace'`/`'manual'`
+row) and `display_name` (often a real name). Nothing previously let an
+operator honor a "forget this person" request against that.
+
+`erasePrincipalIdentity()` (`src/erasure.ts`) is deliberately **reactive**
+— it overwrites one principal's `external_id`/`display_name` with an
+anonymized placeholder on request — not the proactive "hash every
+identity up front" shape sometimes suggested for this kind of gap. The
+proactive version would mean changing how every adapter's own
+upsert-by-`external_id` matching works, for sources that were never a PII
+concern to begin with (a GitHub login, a tool name, an AWS ARN). Reactive
+erasure needs no schema change and touches nothing about how any adapter
+already works.
+
+This is safe against the hash chain because `principal` isn't part of it:
+`event.principal_id`/`event.on_behalf_of` and `grant_edge.principal_id`
+are stable UUID foreign keys, and `src/log.ts`'s own `canonicalBytes()`
+hashes that UUID, never anything from the `principal` row it points at.
+Erasing `external_id`/`display_name` changes no event's hash, and
+`verifyChain()` never re-derives anything from `principal` in the first
+place — confirmed live in `test/erasure.spec.ts` against a principal
+referenced by real events and a real grant, chain re-verified clean
+immediately after.
+
+Run it from the command line, naming the principal either by its own id
+or — the way an erasure request actually arrives — by the `(source,
+external_id)` pair every adapter upserts on. It defaults to a dry run
+that prints what would change without writing anything; add `--yes` once
+you've read that and mean it, since overwriting these columns can't be
+undone:
+
+```
+DATABASE_URL=... npm run erase-identity -- --source workspace --external-id jane@example.com
+DATABASE_URL=... npm run erase-identity -- --source workspace --external-id jane@example.com --yes
+```
+
+**The one real limitation, stated plainly**: this erases the current
+snapshot. If the source system this principal came from still actively
+lists them, the next scheduled run of that adapter observes them again
+and `ensurePrincipal()` creates a fresh row with their real `external_id`
+— the same as it would for anyone genuinely new. This satisfies the
+common real case (someone who has left — the source adapter's own
+full-inventory revocation already stops re-observing them the moment
+they're gone) but not "erase them here while they remain a live member of
+the source system," which the source system itself has to honor.
+
 ## Data model
 
 Five tables (`schema/001_core.sql`):
@@ -1017,6 +1076,7 @@ src/
   policies.ts         POLICIES (hand-written) + evaluatePolicies() — "should never happen" rules
   revocation-guard.ts  checkBlastRadius() — caps full-inventory revocation per run
   notify-slack.ts      posts policy violations to a Slack Incoming Webhook, capped under Slack's own message-size limit
+  erasure.ts          erasePrincipalIdentity()/previewPrincipalErasure() — reactive "right to erasure" against principal's external_id/display_name
   db.ts              Pool construction (reads DATABASE_URL, warns loudly if unset)
   server.ts          GET /report, /report.json, /health — node:http, no framework
   adapters/
@@ -1044,6 +1104,7 @@ scripts/
   run-verify-chain.ts          npm run verify-chain
   run-server.ts               npm run serve
   run-policy-check.ts          npm run policy-check
+  run-erasure.ts               npm run erase-identity
   report.ts                  npm run report
 test/                one *.spec.ts per module, run against a real Postgres
 ```

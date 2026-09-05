@@ -28,6 +28,7 @@ import { ensurePrincipal, ensureResource, type Queryable } from '../upsert.js';
 import type { PrincipalKind, Relation } from '../model.js';
 import { checkBlastRadius, type RevocationGuardOptions } from '../revocation-guard.js';
 import { recordGrantCreated, recordGrantRevoked } from '../grant-run-history.js';
+import { recordResourceSeen } from '../resource-liveness.js';
 
 const GITHUB_API_BASE = 'https://api.github.com';
 const COLLABORATORS_PAGE_SIZE = 100;
@@ -150,6 +151,10 @@ export async function runGithubAdapter(
       source: 'github',
       externalId: repo,
     });
+    // fetchCollaborators() above already succeeded — the repo is
+    // confirmed to still exist and be reachable this run. See
+    // src/resource-liveness.ts's own header on why this matters.
+    await recordResourceSeen(db, resourceId, opts.runId);
 
     // Captured BEFORE this run writes anything — see postgres-roles.ts's
     // own comment on the same line for why (the blast-radius check needs

@@ -65,6 +65,8 @@ export interface UnusedGrantRow {
   capabilities: Capability[] | null;
   /** True if `source` has any usage feed at all — see SOURCES_WITH_USAGE_FEED. False means "unused" here only ever means "we never checked," not "verified unused." */
   hasUsageFeed: boolean;
+  /** When this resource was last confirmed to still exist (schema/008_resource_last_seen.sql, src/resource-liveness.ts) — null if it's never been checked by a liveness-tracking adapter (mcp-config/aws resources, or a resource seen only before this migration existed). */
+  resourceLastSeenAt: Date | null;
 }
 
 export interface TrifectaRow {
@@ -165,6 +167,7 @@ export async function buildReport(db: Queryable, opts: BuildReportOptions = {}):
       source: string;
       observed_at: Date;
       capabilities: Capability[] | null;
+      resource_last_seen_at: Date | null;
     }>(
       // Joined back through grant_edge (the view's own grant_id) to
       // principal/resource for external_id, so a null display_name has a
@@ -185,13 +188,19 @@ export async function buildReport(db: Queryable, opts: BuildReportOptions = {}):
       // principal holds on the same resource; this one matches by
       // relation too, the same fix src/policies.ts's checkStaleGrant
       // already has.
+      // Left-joined: resource_last_seen (schema/008) only has a row for
+      // resources a liveness-tracking adapter has actually checked
+      // (src/resource-liveness.ts) — most rows won't have one yet, and
+      // that's the honest "never checked" state, not an error.
       `select u.principal_kind, u.principal, p.external_id as principal_external_id,
               u.resource, r.external_id as resource_external_id,
-              u.relation, u.source, u.observed_at, u.capabilities::text[] as capabilities
+              u.relation, u.source, u.observed_at, u.capabilities::text[] as capabilities,
+              rls.last_seen_at as resource_last_seen_at
          from unused_grant_by_relation u
          join grant_edge g on g.id = u.grant_id
          join principal  p on p.id = g.principal_id
-         join resource   r on r.id = g.resource_id`,
+         join resource   r on r.id = g.resource_id
+         left join resource_last_seen rls on rls.resource_id = r.id`,
     ),
     db.query<{
       id: string;
@@ -270,6 +279,7 @@ export async function buildReport(db: Queryable, opts: BuildReportOptions = {}):
       observedAt: r.observed_at,
       capabilities: r.capabilities,
       hasUsageFeed: SOURCES_WITH_USAGE_FEED.has(r.source),
+      resourceLastSeenAt: r.resource_last_seen_at,
     }))
     .sort((a, b) => {
       const byDanger = dangerRankOf(a.capabilities) - dangerRankOf(b.capabilities);
@@ -337,7 +347,14 @@ function formatUnusedGrant(row: UnusedGrantRow): string {
   const status = row.hasUsageFeed
     ? `unused since ${formatTimestamp(row.observedAt)}`
     : `unused since ${formatTimestamp(row.observedAt)} — but '${row.source}' has no usage feed, so this only means "never checked," not "verified unused"`;
-  return `  [${tags}] ${row.resource} — granted to "${row.principal}" (${row.principalKind}) via ${row.source}, ${status}`;
+  // resourceLastSeenAt: only populated for a resource a liveness-tracking
+  // adapter has actually checked (src/resource-liveness.ts) — null for
+  // most rows, which is the honest "not tracked for this source" state,
+  // not worth a caveat of its own the way hasUsageFeed's is.
+  const liveness = row.resourceLastSeenAt
+    ? ` (resource last confirmed present: ${formatTimestamp(row.resourceLastSeenAt)})`
+    : '';
+  return `  [${tags}] ${row.resource} — granted to "${row.principal}" (${row.principalKind}) via ${row.source}, ${status}${liveness}`;
 }
 
 function formatTrifectaRow(row: TrifectaRow): string {

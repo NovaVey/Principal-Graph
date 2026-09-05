@@ -44,6 +44,7 @@ feeds, and what it doesn't do yet.
   - [14. Track real Postgres query activity](#14-track-real-postgres-query-activity)
   - [15. Guard against runaway revocation](#15-guard-against-runaway-revocation)
   - [16. Answer "which run touched this grant"](#16-answer-which-run-touched-this-grant)
+  - [17. Stop treating deleted resources as live forever](#17-stop-treating-deleted-resources-as-live-forever)
 - [Data model](#data-model)
 - [Project layout](#project-layout)
 - [Development](#development)
@@ -658,6 +659,39 @@ This is also what makes [Usage 15](#15-guard-against-runaway-revocation)'s
 own guard auditable after the fact — not just "was a revocation blocked
 right now" but "which run tried it, and did it retry and succeed later."
 
+### 17. Stop treating deleted resources as live forever
+
+`resource` (frozen) has no `last_seen`, unlike `principal`, which does
+(bumped by `ensurePrincipal()` on every sighting). A deleted S3 bucket or
+an archived GitHub repo keeps every grant it ever had, live, forever —
+indistinguishable in the report from a resource that's still there.
+
+`schema/008_resource_last_seen.sql` adds `resource_last_seen` — the same
+side-table workaround as `005`/`006`/`007`. Wired into exactly three
+adapters — [GitHub](#3-populate-grants-from-github-repo-collaborators),
+[Workspace](#5-populate-grants-from-google-workspace-group-membership),
+[Postgres roles](#12-populate-grants-from-postgres-role-membership) —
+right after the call that proves the resource is genuinely still
+reachable this run (each adapter's own fetch/query call throws before
+recording anything if the target is gone). Deliberately **not** wired
+into `mcp-config` (a tool "resource" has no independent existence beyond
+being in the config file this run just read — already fully captured by
+the grant itself) or `aws-s3` (`SimulatePrincipalPolicy` evaluates a
+policy against a resource ARN; it never confirms that resource actually
+exists, so there's no genuine signal to record there — see
+`src/resource-liveness.ts`'s own header for the full reasoning on both).
+
+The report's UNUSED GRANTS section ([Usage 7](#7-run-the-report)) now
+shows "resource last confirmed present: `<timestamp>`" for a row with any
+recorded liveness data — silent, not a caveat, for a row without any
+(most rows, from a source this isn't wired into, or seen only before
+this migration existed).
+
+> **Live-verified**: a real `runGithubAdapter()` call, real report,
+> confirmed showing both the "no usage feed" caveat and the resource
+> liveness annotation together on the same row — see `npm run report`'s
+> own output format in `test/report.spec.ts`.
+
 ## Data model
 
 Five tables (`schema/001_core.sql`):
@@ -697,7 +731,10 @@ this is what `report.ts` actually reads now. A sixth,
 `on-behalf-of-escalation`'s own query shape — indexes only, same as the
 third. A seventh, `schema/007_grant_edge_run_history.sql`, adds
 `grant_edge_run` — see [Usage 16](#16-answer-which-run-touched-this-grant)
-— also internal bookkeeping, not part of the grant graph.
+— also internal bookkeeping, not part of the grant graph. An eighth,
+`schema/008_resource_last_seen.sql`, adds `resource_last_seen` — see
+[Usage 17](#17-stop-treating-deleted-resources-as-live-forever) — also
+internal bookkeeping, not part of the grant graph.
 
 ## Project layout
 
@@ -709,6 +746,7 @@ schema/            SQL migrations — 001_core.sql is the shared core
                      005_unused_grant_relation_fix.sql adds unused_grant_by_relation
                      006_on_behalf_of_index.sql adds an index only, no schema change
                      007_grant_edge_run_history.sql adds grant_edge_run
+                     008_resource_last_seen.sql adds resource_last_seen
 rba/
   principal-graph.authz  RBA's own namespace schema for this project's grant data
 src/
@@ -718,6 +756,7 @@ src/
   migrate.ts          discoverMigrations / runMigrations — schema/*.sql tracking + apply
   run-history.ts      startRun / finishRun / latestRuns — adapter_run bookkeeping
   grant-run-history.ts  links a grant_edge row to the adapter_run that created/revoked it
+  resource-liveness.ts  records the last time a resource was confirmed to still exist
   capabilities.ts    TOOL_CAPABILITIES (hand-written) + how resources get classified
   policies.ts         POLICIES (hand-written) + evaluatePolicies() — "should never happen" rules
   revocation-guard.ts  checkBlastRadius() — caps full-inventory revocation per run

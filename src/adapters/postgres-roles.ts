@@ -53,6 +53,7 @@ import { ensurePrincipal, ensureResource, type Queryable } from '../upsert.js';
 import type { Relation } from '../model.js';
 import { checkBlastRadius, type RevocationGuardOptions } from '../revocation-guard.js';
 import { recordGrantCreated, recordGrantRevoked } from '../grant-run-history.js';
+import { recordResourceSeen } from '../resource-liveness.js';
 
 export interface RoleTiers {
   read: string;
@@ -178,6 +179,9 @@ export async function runPostgresAdapter(
       source: 'postgres',
       externalId: target.label,
     });
+    // queryTargetRoles() above already succeeded — the target is
+    // confirmed reachable this run. See src/resource-liveness.ts's own header.
+    await recordResourceSeen(db, resourceId, opts.runId);
 
     // Captured BEFORE this run writes anything — the blast-radius check
     // below needs the count as it stood prior to this run, not inflated

@@ -17,6 +17,7 @@ import {
   type FetchCollaborators,
 } from '../src/adapters/github-collaborators.js';
 import { BlastRadiusExceededError } from '../src/revocation-guard.js';
+import { getResourceLastSeen } from '../src/resource-liveness.js';
 import { pool, resetDatabase } from './helpers.js';
 
 before(resetDatabase);
@@ -55,6 +56,7 @@ function fakeFetcher(byRepo: Record<string, GithubCollaborator[]>): FetchCollabo
 
 void test('runGithubAdapter grants from collaborator permissions and revokes what disappears or downgrades', async () => {
   const repo = 'novavey/example';
+  const beforeRun = new Date();
   const first = await runGithubAdapter(pool, {
     repos: [repo],
     token: 'unused-with-a-fake-fetcher',
@@ -66,6 +68,11 @@ void test('runGithubAdapter grants from collaborator permissions and revokes wha
       ],
     }),
   });
+
+  // A successful fetchCollaborators() call means the repo is confirmed
+  // reachable this run — see src/resource-liveness.ts's own header.
+  const lastSeen = await getResourceLastSeen(pool, first[0].resourceId);
+  assert.ok(lastSeen && lastSeen.getTime() >= beforeRun.getTime() - 1000);
 
   assert.equal(first.length, 1);
   assert.deepEqual(first[0]?.grants, { alice: 'admin', bob: 'write', 'dependabot[bot]': 'read' });

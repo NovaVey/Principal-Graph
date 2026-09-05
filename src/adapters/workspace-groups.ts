@@ -39,6 +39,7 @@ import { ensurePrincipal, ensureResource, type Queryable } from '../upsert.js';
 import type { Relation } from '../model.js';
 import { checkBlastRadius, type RevocationGuardOptions } from '../revocation-guard.js';
 import { recordGrantCreated, recordGrantRevoked } from '../grant-run-history.js';
+import { recordResourceSeen } from '../resource-liveness.js';
 
 const DIRECTORY_API_BASE = 'https://admin.googleapis.com/admin/directory/v1';
 const TOKEN_URL = 'https://oauth2.googleapis.com/token';
@@ -200,6 +201,9 @@ export async function runWorkspaceAdapter(
       source: 'workspace',
       externalId: group,
     });
+    // fetchMembers() above already succeeded — the group is confirmed to
+    // still exist this run. See src/resource-liveness.ts's own header.
+    await recordResourceSeen(db, resourceId, opts.runId);
 
     // Captured BEFORE this run writes anything — see postgres-roles.ts's
     // own comment on the same line for why.

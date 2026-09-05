@@ -12,7 +12,9 @@ import { startRun, finishRun, latestRuns } from '../src/run-history.js';
 import { pool } from './helpers.js';
 
 async function resetAdapterRuns(): Promise<void> {
-  await pool.query(`truncate table adapter_run`);
+  // cascade: schema/007's own grant_edge_run references adapter_run, so a
+  // plain truncate of adapter_run alone is refused.
+  await pool.query(`truncate table adapter_run cascade`);
 }
 
 before(resetAdapterRuns);

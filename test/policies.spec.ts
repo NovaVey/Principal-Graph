@@ -22,16 +22,18 @@ import { pool, resetDatabase } from './helpers.js';
  * test/run-history.spec.ts otherwise owns resetting it. The
  * adapter-freshness tests below write to it directly, so this file resets
  * it too, the same way run-history.spec.ts's own resetAdapterRuns() does.
+ * `cascade`: schema/007's own grant_edge_run references adapter_run, so a
+ * plain truncate of adapter_run alone is refused.
  */
 async function resetForPoliciesTests(): Promise<void> {
   await resetDatabase();
-  await pool.query('truncate table adapter_run');
+  await pool.query('truncate table adapter_run cascade');
 }
 
 before(resetForPoliciesTests);
 beforeEach(resetForPoliciesTests);
 after(async () => {
-  await pool.query('truncate table adapter_run');
+  await pool.query('truncate table adapter_run cascade');
   await pool.end();
 });
 

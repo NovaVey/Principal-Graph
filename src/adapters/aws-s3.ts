@@ -54,6 +54,7 @@
 import { IAMClient, SimulatePrincipalPolicyCommand } from '@aws-sdk/client-iam';
 import { ensurePrincipal, ensureResource, type Queryable } from '../upsert.js';
 import type { PrincipalKind, Relation } from '../model.js';
+import { recordGrantCreated, recordGrantRevoked } from '../grant-run-history.js';
 
 export type SimulateAction = (
   principalArn: string,
@@ -127,6 +128,8 @@ export interface AwsAdapterOptions {
    * scripts/run-aws-adapter.ts's `--dry-run` flag.
    */
   dryRun?: boolean;
+  /** The adapter_run id this invocation is running under — see src/adapters/mcp-config.ts's McpConfigAdapterOptions.runId's own doc comment. */
+  runId?: string;
 }
 
 export interface AwsGrantResult {
@@ -181,13 +184,15 @@ export async function runAwsAdapter(
 
       if (!opts.dryRun) {
         for (const relation of allowedRelations) {
-          await db.query(
+          const { rows } = await db.query<{ id: string }>(
             `insert into grant_edge (principal_id, resource_id, relation, source)
              values ($1, $2, $3, 'aws')
              on conflict (principal_id, resource_id, relation, source) do update
-               set observed_at = now(), revoked_at = null`,
+               set observed_at = now(), revoked_at = null
+             returning id`,
             [principalId, resourceId, relation],
           );
+          if (rows[0]) await recordGrantCreated(db, rows[0].id, opts.runId);
         }
       }
       if (allowedRelations.length > 0) grants[principalArn] = allowedRelations;
@@ -201,7 +206,7 @@ export async function runAwsAdapter(
       // SELECT instead of an UPDATE — see AwsAdapterOptions.dryRun.
       if (notAllowedRelations.length > 0) {
         const revokeQuery = opts.dryRun
-          ? `select relation from grant_edge
+          ? `select id, relation from grant_edge
               where principal_id = $1
                 and resource_id = $2
                 and source = 'aws'
@@ -214,13 +219,15 @@ export async function runAwsAdapter(
                 and source = 'aws'
                 and revoked_at is null
                 and relation = any($3::text[])
-              returning relation`;
-        const { rows: revokedRows } = await db.query<{ relation: string }>(revokeQuery, [
-          principalId,
-          resourceId,
-          notAllowedRelations,
-        ]);
-        for (const row of revokedRows) revoked.push(`${principalArn} (was: ${row.relation})`);
+              returning id, relation`;
+        const { rows: revokedRows } = await db.query<{ id: string; relation: string }>(
+          revokeQuery,
+          [principalId, resourceId, notAllowedRelations],
+        );
+        for (const row of revokedRows) {
+          revoked.push(`${principalArn} (was: ${row.relation})`);
+          if (!opts.dryRun) await recordGrantRevoked(db, row.id, opts.runId);
+        }
       }
     }
 

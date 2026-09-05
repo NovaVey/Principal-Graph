@@ -27,6 +27,32 @@ import type { Capability } from '../model.js';
 
 export type Queryable = Pool | PoolClient;
 
+/**
+ * Which `grant_edge.source` values have ANY usage feed at all — i.e. some
+ * adapter in this repo can write an `allow` event against a resource from
+ * that source, so "unused" there can mean "verified unused." A source
+ * absent from this set can never show up as used no matter what actually
+ * happened, because nothing ever looks — "unused" there only ever means
+ * "we never checked." A reader can't tell those two apart from the
+ * `unused_grant_by_relation` row alone, and the section's own prose used
+ * to claim both are "the safest to delete," which is only true for the
+ * first kind.
+ *
+ * Hand-written, not introspected — same shape and reasoning as
+ * src/capabilities.ts's own `TOOL_CAPABILITIES`: this is a fact about
+ * which adapters this repo ships a usage feed for, not something
+ * derivable from data, and guessing wrong here is worse than a short
+ * manual list.
+ *
+ *   - 'mcp-config': via src/adapters/broker-audit-sink.ts, when its
+ *     `resourceSource` is pointed at 'mcp-config' — see that file's own
+ *     header and BrokerAuditSinkOptions.resourceSource's doc comment.
+ *   - 'postgres': via src/adapters/postgres-usage.ts.
+ *   - 'github' / 'aws' / 'workspace' have no usage feed at all yet — see
+ *     README's own note on this being the next structural gap to close.
+ */
+export const SOURCES_WITH_USAGE_FEED: ReadonlySet<string> = new Set(['mcp-config', 'postgres']);
+
 export interface UnusedGrantRow {
   principalKind: string;
   /** display_name if set, else external_id — a reader always gets a real identifier, never a placeholder. */
@@ -37,6 +63,8 @@ export interface UnusedGrantRow {
   observedAt: Date;
   /** null when nothing has classified this resource yet (src/capabilities.ts). */
   capabilities: Capability[] | null;
+  /** True if `source` has any usage feed at all — see SOURCES_WITH_USAGE_FEED. False means "unused" here only ever means "we never checked," not "verified unused." */
+  hasUsageFeed: boolean;
 }
 
 export interface TrifectaRow {
@@ -241,6 +269,7 @@ export async function buildReport(db: Queryable, opts: BuildReportOptions = {}):
       source: r.source,
       observedAt: r.observed_at,
       capabilities: r.capabilities,
+      hasUsageFeed: SOURCES_WITH_USAGE_FEED.has(r.source),
     }))
     .sort((a, b) => {
       const byDanger = dangerRankOf(a.capabilities) - dangerRankOf(b.capabilities);
@@ -303,7 +332,12 @@ function formatUnusedGrant(row: UnusedGrantRow): string {
     row.capabilities && row.capabilities.length > 0
       ? row.capabilities.join(', ')
       : 'not yet classified';
-  return `  [${tags}] ${row.resource} — granted to "${row.principal}" (${row.principalKind}) via ${row.source}, unused since ${formatTimestamp(row.observedAt)}`;
+  // hasUsageFeed distinguishes "verified unused" from "never looked" — see
+  // SOURCES_WITH_USAGE_FEED's own doc comment for why this matters.
+  const status = row.hasUsageFeed
+    ? `unused since ${formatTimestamp(row.observedAt)}`
+    : `unused since ${formatTimestamp(row.observedAt)} — but '${row.source}' has no usage feed, so this only means "never checked," not "verified unused"`;
+  return `  [${tags}] ${row.resource} — granted to "${row.principal}" (${row.principalKind}) via ${row.source}, ${status}`;
 }
 
 function formatTrifectaRow(row: TrifectaRow): string {
@@ -330,7 +364,7 @@ export function formatReport(report: Report): string {
   lines.push('UNUSED GRANTS');
   lines.push(RULE);
   lines.push(
-    `Permissions that are still live but haven't been exercised in the last ${report.unusedGrantWindowDays} days. Sorted with the riskiest ones first — these are the safest to delete, because nothing has used them recently.`,
+    `Permissions that are still live but haven't been exercised in the last ${report.unusedGrantWindowDays} days. Sorted with the riskiest ones first — the safest to delete, because nothing has used them recently, ONLY for rows without the "no usage feed" caveat below; the rest have simply never been checked either way.`,
   );
   lines.push('');
   if (report.unusedGrants.length === 0) {

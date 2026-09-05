@@ -40,6 +40,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { ensurePrincipal, ensureResource, type Queryable } from '../upsert.js';
 import { checkBlastRadius, type RevocationGuardOptions } from '../revocation-guard.js';
+import { recordGrantCreated, recordGrantRevoked } from '../grant-run-history.js';
 
 /**
  * A plain, explicit UTF-16-code-unit string comparator for `grantedTools`/
@@ -175,6 +176,8 @@ export interface McpConfigAdapterOptions extends RevocationGuardOptions {
    * scripts/run-mcp-config-adapter.ts's `--dry-run` flag.
    */
   dryRun?: boolean;
+  /** The adapter_run id this invocation is running under (src/run-history.ts's startRun()) — links each grant to the run that (re)created or revoked it. See src/grant-run-history.ts. Optional; omitted, nothing is linked. */
+  runId?: string;
 }
 
 export interface McpConfigAdapterResult {
@@ -222,13 +225,15 @@ export async function runMcpConfigAdapter(
       externalId: toolName,
     });
     if (!opts.dryRun) {
-      await db.query(
+      const { rows } = await db.query<{ id: string }>(
         `insert into grant_edge (principal_id, resource_id, relation, source)
          values ($1, $2, 'can_call', 'mcp-config')
          on conflict (principal_id, resource_id, relation, source) do update
-           set observed_at = now(), revoked_at = null`,
+           set observed_at = now(), revoked_at = null
+         returning id`,
         [principalId, resourceId],
       );
+      if (rows[0]) await recordGrantCreated(db, rows[0].id, opts.runId);
     }
     grantedTools.push(toolName);
     resourceIds.push(resourceId);
@@ -262,7 +267,7 @@ export async function runMcpConfigAdapter(
   if (!opts.dryRun) {
     checkBlastRadius(opts.agent.externalId, priorLiveCount, candidateRows.length, opts);
 
-    const { rows } = await db.query<{ external_id: string }>(
+    const { rows } = await db.query<{ id: string; external_id: string }>(
       `update grant_edge g
           set revoked_at = now()
          from resource r
@@ -272,9 +277,10 @@ export async function runMcpConfigAdapter(
           and g.relation = 'can_call'
           and g.revoked_at is null
           and not (g.resource_id = any($2::uuid[]))
-        returning r.external_id`,
+        returning g.id, r.external_id`,
       [principalId, resourceIds],
     );
+    for (const row of rows) await recordGrantRevoked(db, row.id, opts.runId);
     revokedRows = rows;
   }
 

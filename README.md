@@ -43,6 +43,7 @@ feeds, and what it doesn't do yet.
   - [13. Verify the event chain hasn't been tampered with](#13-verify-the-event-chain-hasnt-been-tampered-with)
   - [14. Track real Postgres query activity](#14-track-real-postgres-query-activity)
   - [15. Guard against runaway revocation](#15-guard-against-runaway-revocation)
+  - [16. Answer "which run touched this grant"](#16-answer-which-run-touched-this-grant)
 - [Data model](#data-model)
 - [Project layout](#project-layout)
 - [Development](#development)
@@ -288,7 +289,12 @@ npm run report > report.txt   # or save it
 Four plain-text sections, one command:
 
 1. **Unused grants** — permissions nobody's exercised in 90 days, riskiest
-   first.
+   first. Only true "safest to delete" for a `source` with a usage feed
+   at all (currently `mcp-config` via the broker sink, and `postgres` via
+   [Usage 14](#14-track-real-postgres-query-activity)) — a row from
+   `github`/`aws`/`workspace` gets an explicit caveat instead, since
+   nothing has ever looked there and "unused" only means "never checked."
+   See `SOURCES_WITH_USAGE_FEED` in `src/views/report.ts`.
 2. **Trifecta exposure** — which principals can read private data, ingest
    untrusted content, *and* reach the network, all at once.
 3. **Acting on behalf of** — which human each agent's `event.on_behalf_of`
@@ -623,6 +629,35 @@ effects, so it always shows the full candidate list, alarming or not.
 > upserted, undercounting what actually changed — fixed by capturing the
 > count before any write happens, in every adapter.
 
+### 16. Answer "which run touched this grant"
+
+`adapter_run` (schema/004) records that a run happened; `grant_edge`
+(frozen) records `source` and `observed_at`, but nothing connected the
+two — "which run created Alice's admin grant, which run revoked it, and
+did that run succeed" was only answerable by grepping logs and eyeballing
+timestamps.
+
+`schema/007_grant_edge_run_history.sql` adds `grant_edge_run`, a side
+table keyed on `grant_edge.id` (frozen — this can't be two new columns
+on it directly, same workaround shape as `005`/`006`) — all five grant
+adapters now take an optional `runId` (the id `startRun()` already
+returns, threaded straight through by each `scripts/run-*-adapter.ts`)
+and record it every time they create/refresh or revoke a grant. Omitted
+entirely, nothing is linked — no fabricated history for a grant written
+before this migration existed, or by a caller (a test, an ad hoc script)
+that never wired up `startRun()`/`finishRun()` around its call.
+
+```ts
+import { getGrantRunHistory } from './src/grant-run-history.js';
+
+const { createdByRun, revokedByRun } = await getGrantRunHistory(pool, grantEdgeId);
+// createdByRun?.status / revokedByRun?.status — did that run actually succeed?
+```
+
+This is also what makes [Usage 15](#15-guard-against-runaway-revocation)'s
+own guard auditable after the fact — not just "was a revocation blocked
+right now" but "which run tried it, and did it retry and succeed later."
+
 ## Data model
 
 Five tables (`schema/001_core.sql`):
@@ -657,7 +692,12 @@ scheduled write side (see [Usage 11](#11-check-on-scheduled-adapter-runs)) —
 also internal bookkeeping, not part of the grant graph. A fifth,
 `schema/005_unused_grant_relation_fix.sql`, adds `unused_grant_by_relation`
 — `unused_grant`'s own query with the relation-matching fix above applied;
-this is what `report.ts` actually reads now.
+this is what `report.ts` actually reads now. A sixth,
+`schema/006_on_behalf_of_index.sql`, adds one partial index serving
+`on-behalf-of-escalation`'s own query shape — indexes only, same as the
+third. A seventh, `schema/007_grant_edge_run_history.sql`, adds
+`grant_edge_run` — see [Usage 16](#16-answer-which-run-touched-this-grant)
+— also internal bookkeeping, not part of the grant graph.
 
 ## Project layout
 
@@ -668,6 +708,7 @@ schema/            SQL migrations — 001_core.sql is the shared core
                      004_adapter_runs.sql adds adapter_run, scheduled-run history
                      005_unused_grant_relation_fix.sql adds unused_grant_by_relation
                      006_on_behalf_of_index.sql adds an index only, no schema change
+                     007_grant_edge_run_history.sql adds grant_edge_run
 rba/
   principal-graph.authz  RBA's own namespace schema for this project's grant data
 src/
@@ -676,6 +717,7 @@ src/
   upsert.ts          ensurePrincipal / ensureResource — how adapters upsert identity
   migrate.ts          discoverMigrations / runMigrations — schema/*.sql tracking + apply
   run-history.ts      startRun / finishRun / latestRuns — adapter_run bookkeeping
+  grant-run-history.ts  links a grant_edge row to the adapter_run that created/revoked it
   capabilities.ts    TOOL_CAPABILITIES (hand-written) + how resources get classified
   policies.ts         POLICIES (hand-written) + evaluatePolicies() — "should never happen" rules
   revocation-guard.ts  checkBlastRadius() — caps full-inventory revocation per run

@@ -27,6 +27,7 @@
 import { ensurePrincipal, ensureResource, type Queryable } from '../upsert.js';
 import type { PrincipalKind, Relation } from '../model.js';
 import { checkBlastRadius, type RevocationGuardOptions } from '../revocation-guard.js';
+import { recordGrantCreated, recordGrantRevoked } from '../grant-run-history.js';
 
 const GITHUB_API_BASE = 'https://api.github.com';
 const COLLABORATORS_PAGE_SIZE = 100;
@@ -116,6 +117,8 @@ export interface GithubAdapterOptions extends RevocationGuardOptions {
    * scripts/run-github-adapter.ts's `--dry-run` flag.
    */
   dryRun?: boolean;
+  /** The adapter_run id this invocation is running under — see McpConfigAdapterOptions.runId's own doc comment. */
+  runId?: string;
 }
 
 export interface GithubRepoGrantResult {
@@ -177,13 +180,15 @@ export async function runGithubAdapter(
         externalId: collaborator.login,
       });
       if (!opts.dryRun) {
-        await db.query(
+        const { rows } = await db.query<{ id: string }>(
           `insert into grant_edge (principal_id, resource_id, relation, source)
            values ($1, $2, $3, 'github')
            on conflict (principal_id, resource_id, relation, source) do update
-             set observed_at = now(), revoked_at = null`,
+             set observed_at = now(), revoked_at = null
+           returning id`,
           [principalId, resourceId, relation],
         );
+        if (rows[0]) await recordGrantCreated(db, rows[0].id, opts.runId);
       }
       principalIds.push(principalId);
       relations.push(relation);
@@ -224,7 +229,7 @@ export async function runGithubAdapter(
     if (!opts.dryRun) {
       checkBlastRadius(repo, priorLiveCount, candidateRows.length, opts);
 
-      const { rows } = await db.query<{ external_id: string; relation: string }>(
+      const { rows } = await db.query<{ id: string; external_id: string; relation: string }>(
         `update grant_edge g
             set revoked_at = now()
            from principal p
@@ -236,9 +241,10 @@ export async function runGithubAdapter(
               select 1 from unnest($2::uuid[], $3::text[]) as cur(principal_id, relation)
                where cur.principal_id = g.principal_id and cur.relation = g.relation
             )
-          returning p.external_id, g.relation`,
+          returning g.id, p.external_id, g.relation`,
         [resourceId, principalIds, relations],
       );
+      for (const row of rows) await recordGrantRevoked(db, row.id, opts.runId);
       revokedRows = rows;
     }
 

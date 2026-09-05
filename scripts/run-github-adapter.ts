@@ -50,7 +50,7 @@ async function main(): Promise<void> {
   try {
     const runId = await startRun(pool, 'github', { dryRun });
     try {
-      const results = await runGithubAdapter(pool, { repos, token, dryRun });
+      const results = await runGithubAdapter(pool, { repos, token, dryRun, runId });
       if (dryRun) console.log('DRY RUN — nothing below was actually written to grant_edge\n');
       let totalGrants = 0;
       let totalRevoked = 0;

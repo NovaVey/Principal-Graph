@@ -52,6 +52,7 @@ import { Client } from 'pg';
 import { ensurePrincipal, ensureResource, type Queryable } from '../upsert.js';
 import type { Relation } from '../model.js';
 import { checkBlastRadius, type RevocationGuardOptions } from '../revocation-guard.js';
+import { recordGrantCreated, recordGrantRevoked } from '../grant-run-history.js';
 
 export interface RoleTiers {
   read: string;
@@ -143,6 +144,8 @@ export interface PostgresAdapterOptions extends RevocationGuardOptions {
    * the revoke write becomes the same `WHERE` clause as a plain `SELECT`.
    */
   dryRun?: boolean;
+  /** The adapter_run id this invocation is running under — see McpConfigAdapterOptions.runId's own doc comment. */
+  runId?: string;
 }
 
 export interface PostgresGrantResult {
@@ -201,13 +204,15 @@ export async function runPostgresAdapter(
           externalId: roleName,
         });
         if (!opts.dryRun) {
-          await db.query(
+          const { rows } = await db.query<{ id: string }>(
             `insert into grant_edge (principal_id, resource_id, relation, source)
              values ($1, $2, $3, 'postgres')
              on conflict (principal_id, resource_id, relation, source) do update
-               set observed_at = now(), revoked_at = null`,
+               set observed_at = now(), revoked_at = null
+             returning id`,
             [principalId, resourceId, tier],
           );
+          if (rows[0]) await recordGrantCreated(db, rows[0].id, opts.runId);
         }
         principalIds.push(principalId);
         relations.push(tier);
@@ -246,7 +251,7 @@ export async function runPostgresAdapter(
     if (!opts.dryRun) {
       checkBlastRadius(target.label, priorLiveCount, candidateRows.length, opts);
 
-      const { rows } = await db.query<{ external_id: string; relation: string }>(
+      const { rows } = await db.query<{ id: string; external_id: string; relation: string }>(
         `update grant_edge g
             set revoked_at = now()
            from principal p
@@ -258,9 +263,10 @@ export async function runPostgresAdapter(
               select 1 from unnest($2::uuid[], $3::text[]) as cur(principal_id, relation)
                where cur.principal_id = g.principal_id and cur.relation = g.relation
             )
-          returning p.external_id, g.relation`,
+          returning g.id, p.external_id, g.relation`,
         [resourceId, principalIds, relations],
       );
+      for (const row of rows) await recordGrantRevoked(db, row.id, opts.runId);
       revokedRows = rows;
     }
 

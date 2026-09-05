@@ -67,7 +67,13 @@ async function main(): Promise<void> {
   try {
     const runId = await startRun(pool, 'workspace', { dryRun });
     try {
-      const results = await runWorkspaceAdapter(pool, { groups, credentials, adminEmail, dryRun });
+      const results = await runWorkspaceAdapter(pool, {
+        groups,
+        credentials,
+        adminEmail,
+        dryRun,
+        runId,
+      });
       if (dryRun) console.log('DRY RUN — nothing below was actually written to grant_edge\n');
       let totalGrants = 0;
       let totalRevoked = 0;

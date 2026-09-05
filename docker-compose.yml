@@ -7,8 +7,9 @@
 # — nothing here guesses which of your sources are actually configured
 # the way `npm run sync` (scripts/run-sync.ts) already does for you.
 #
-#   docker compose up            # postgres + migrate + the report server
-#   docker compose run --rm sync # everything npm run sync would run, configured via .env
+#   docker compose up              # postgres + migrate + the report server
+#   docker compose run --rm sync   # everything npm run sync would run, configured via .env
+#   docker compose run --rm doctor # read-only pre-flight — npm run doctor, packaged
 
 services:
   postgres:
@@ -70,6 +71,20 @@ services:
       DATABASE_URL: postgresql://postgres:devpass@postgres:5432/principalgraph
     profiles: ['tools']
     command: ['node', 'dist/scripts/run-sync.js']
+
+  # `docker compose run --rm doctor` — a read-only pre-flight: database
+  # reachable, every schema/*.sql migration applied, the event chain
+  # intact, and which `sync` steps are configured. See
+  # scripts/run-doctor.ts's own header.
+  doctor:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:devpass@postgres:5432/principalgraph
+    profiles: ['tools']
+    command: ['node', 'dist/scripts/run-doctor.js']
 
 volumes:
   principalgraph-data:

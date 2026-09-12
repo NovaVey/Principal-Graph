@@ -355,7 +355,7 @@ npm run report                # prints to stdout
 npm run report > report.txt   # or save it
 ```
 
-Four plain-text sections, one command:
+Five plain-text sections, one command:
 
 1. **Unused grants** — permissions nobody's exercised in 90 days, riskiest
    first, tied off by how long each has genuinely gone unused
@@ -376,10 +376,29 @@ Four plain-text sections, one command:
    [Usage 10](#10-check-policy-violations)), not this report's.
 4. **Denials** — what the broker actually blocked recently, with the taint
    labels that show why.
+5. **Revocations** — how many grants were marked revoked in the last 30
+   days, grouped by source, with the one caveat that matters most:
+   revoking a grant here only ever sets `grant_edge.revoked_at` — a local
+   flag. This project weighed real source-system enforcement for this
+   exact question (act on a finding at the source, confirm it took
+   effect, record it) and deliberately didn't build it — two independent
+   design-and-adversarial-review passes each found a new critical bug
+   before any code shipped, and a harder question underneath both: for
+   the three full-inventory adapters, a "revocation" only ever fires once
+   the source's own fresh read already shows the access gone, so the real
+   call would mostly be confirming a fact already established, not new
+   enforcement. Rather than ship something that quietly claims a
+   guarantee it can't back, this section makes the real state of things
+   visible instead — see `src/views/report.ts`'s own header and
+   [CONTRIBUTING.md](CONTRIBUTING.md)'s "Pick a revocation model
+   deliberately."
 
 `PRINCIPAL_GRAPH_REPORT_DENIAL_DAYS` / `PRINCIPAL_GRAPH_REPORT_DENIAL_LIMIT`
 override the denials section's window (default 30 days) and row cap
-(default 50) — see `src/views/report.ts`.
+(default 50) — see `src/views/report.ts`. `PRINCIPAL_GRAPH_REPORT_REVOCATION_DAYS`
+does the same for the revocations section's window (also default 30
+days) — it has no row-cap env var to match, since it's grouped counts
+only, never a per-row list.
 
 Unused grants and trifecta exposure are capped too
 (`PRINCIPAL_GRAPH_REPORT_UNUSED_GRANT_LIMIT` /
@@ -859,6 +878,12 @@ effects, so it always shows the full candidate list, alarming or not.
 > "prior" live count *after* this run's own grants had already been
 > upserted, undercounting what actually changed — fixed by capturing the
 > count before any write happens, in every adapter.
+
+Every revocation this guard lets through is still local-only — see
+[Usage 7](#7-run-the-report)'s new REVOCATIONS section, and
+[CONTRIBUTING.md](CONTRIBUTING.md)'s "Pick a revocation model
+deliberately," for why this project stops there rather than calling back
+to the source to confirm the access is actually gone.
 
 ### 16. Answer "which run touched this grant"
 

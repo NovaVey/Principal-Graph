@@ -1,6 +1,6 @@
 /**
  * The one report this milestone exists to produce. It only reads (views/
- * read from the core, adapters write) — four sections:
+ * read from the core, adapters write) — five sections:
  *
  *   1. Unused grants   — the `unused_grant_by_relation` view
  *      (schema/005_unused_grant_relation_fix.sql) — the corrected
@@ -13,6 +13,13 @@
  *      for a human who holds no grant on the resource at all) is the
  *      `on-behalf-of-escalation` policy (src/policies.ts).
  *   4. Denials          — recent `event` rows where decision = 'deny'.
+ *   5. Revocations      — how many grants were marked revoked recently, by
+ *      source, with the one caveat that matters most: `revoked_at` is
+ *      local bookkeeping only. See that section's own doc comment below
+ *      for why this exists rather than something that tries to close the
+ *      gap instead — this project weighed real source-system enforcement
+ *      for this exact question and deliberately didn't build it (see
+ *      CONTRIBUTING.md's "Pick a revocation model deliberately").
  *
  * The bar (build brief, Task 4): a competent generalist engineer reads this
  * in two minutes and knows what to delete. No capability-model vocabulary
@@ -109,6 +116,11 @@ export interface DenialRow {
   taintLabels: string[];
 }
 
+export interface RevokedBySourceRow {
+  source: string;
+  count: number;
+}
+
 export interface Report {
   generatedAt: Date;
   /** Matches unused_grant_by_relation's own hardcoded window (schema/005_unused_grant_relation_fix.sql) — not configurable here, since the view isn't. */
@@ -125,6 +137,12 @@ export interface Report {
   unusedGrantsTruncated: boolean;
   /** True if there were more trifecta-exposed principals than trifectaLimit returned. */
   trifectaTruncated: boolean;
+  /** How far back the revocations section looked. */
+  revocationWindowDays: number;
+  /** How many grant_edge rows were marked revoked in the window, by source — never truncated, since this is a handful of grouped counts, never a per-row list. */
+  revokedBySource: RevokedBySourceRow[];
+  /** Sum of revokedBySource — convenience for a caller that just wants the one number, without summing the array itself. */
+  revokedTotal: number;
 }
 
 /**
@@ -175,6 +193,8 @@ const DEFAULT_DENIAL_LIMIT = 50;
  */
 const DEFAULT_UNUSED_GRANT_LIMIT = 50;
 const DEFAULT_TRIFECTA_LIMIT = 50;
+/** Same default window as denials — recent activity worth noticing, not a full history dump. */
+const DEFAULT_REVOCATION_WINDOW_DAYS = 30;
 
 export interface BuildReportOptions {
   /** How many days of `event` history the denials section covers. Default 30. */
@@ -185,6 +205,8 @@ export interface BuildReportOptions {
   unusedGrantLimit?: number;
   /** Caps how many trifecta-exposure rows are returned. Default 50. */
   trifectaLimit?: number;
+  /** How many days of grant_edge.revoked_at history the revocations section covers. Default 30. */
+  revocationWindowDays?: number;
 }
 
 export async function buildReport(db: Queryable, opts: BuildReportOptions = {}): Promise<Report> {
@@ -192,44 +214,46 @@ export async function buildReport(db: Queryable, opts: BuildReportOptions = {}):
   const denialLimit = opts.denialLimit ?? DEFAULT_DENIAL_LIMIT;
   const unusedGrantLimit = opts.unusedGrantLimit ?? DEFAULT_UNUSED_GRANT_LIMIT;
   const trifectaLimit = opts.trifectaLimit ?? DEFAULT_TRIFECTA_LIMIT;
+  const revocationWindowDays = opts.revocationWindowDays ?? DEFAULT_REVOCATION_WINDOW_DAYS;
 
-  const [unusedGrantRows, trifectaRows, onBehalfOfRows, denialRows] = await Promise.all([
-    db.query<{
-      principal_kind: string;
-      principal: string | null;
-      principal_external_id: string;
-      resource: string | null;
-      resource_external_id: string;
-      relation: string;
-      source: string;
-      first_observed_at: Date;
-      capabilities: Capability[] | null;
-      resource_last_seen_at: Date | null;
-    }>(
-      // Joined back through grant_edge (the view's own grant_id) to
-      // principal/resource for external_id, so a null display_name has a
-      // real identifier to fall back to instead of a placeholder — see
-      // resolveName() below. capabilities::text[]: the view's own
-      // `capabilities` column is `capability[]` (a custom enum array);
-      // `pg` only auto-parses well-known builtin array types like text[]
-      // into a real JS array, so an uncast `capability[]` comes back as
-      // the raw Postgres array literal string ("{write_irreversible}")
-      // instead. Both casts/joins are done here rather than touching the
-      // view (schema/005_unused_grant_relation_fix.sql — additive, so
-      // editing it directly would be fine, but keeping the same shape as
-      // every other query here is simpler than a one-off exception).
-      // unused_grant_by_relation, not 001_core.sql's own unused_grant —
-      // see schema/005_unused_grant_relation_fix.sql's own header for why:
-      // that view matches an allow event to a grant by (principal,
-      // resource) alone, so one allow event masks every relation a
-      // principal holds on the same resource; this one matches by
-      // relation too, the same fix src/policies.ts's checkStaleGrant
-      // already has.
-      // Left-joined: resource_last_seen (schema/008) only has a row for
-      // resources a liveness-tracking adapter has actually checked
-      // (src/resource-liveness.ts) — most rows won't have one yet, and
-      // that's the honest "never checked" state, not an error.
-      `select u.principal_kind, u.principal, p.external_id as principal_external_id,
+  const [unusedGrantRows, trifectaRows, onBehalfOfRows, denialRows, revocationRows] =
+    await Promise.all([
+      db.query<{
+        principal_kind: string;
+        principal: string | null;
+        principal_external_id: string;
+        resource: string | null;
+        resource_external_id: string;
+        relation: string;
+        source: string;
+        first_observed_at: Date;
+        capabilities: Capability[] | null;
+        resource_last_seen_at: Date | null;
+      }>(
+        // Joined back through grant_edge (the view's own grant_id) to
+        // principal/resource for external_id, so a null display_name has a
+        // real identifier to fall back to instead of a placeholder — see
+        // resolveName() below. capabilities::text[]: the view's own
+        // `capabilities` column is `capability[]` (a custom enum array);
+        // `pg` only auto-parses well-known builtin array types like text[]
+        // into a real JS array, so an uncast `capability[]` comes back as
+        // the raw Postgres array literal string ("{write_irreversible}")
+        // instead. Both casts/joins are done here rather than touching the
+        // view (schema/005_unused_grant_relation_fix.sql — additive, so
+        // editing it directly would be fine, but keeping the same shape as
+        // every other query here is simpler than a one-off exception).
+        // unused_grant_by_relation, not 001_core.sql's own unused_grant —
+        // see schema/005_unused_grant_relation_fix.sql's own header for why:
+        // that view matches an allow event to a grant by (principal,
+        // resource) alone, so one allow event masks every relation a
+        // principal holds on the same resource; this one matches by
+        // relation too, the same fix src/policies.ts's checkStaleGrant
+        // already has.
+        // Left-joined: resource_last_seen (schema/008) only has a row for
+        // resources a liveness-tracking adapter has actually checked
+        // (src/resource-liveness.ts) — most rows won't have one yet, and
+        // that's the honest "never checked" state, not an error.
+        `select u.principal_kind, u.principal, p.external_id as principal_external_id,
               u.resource, r.external_id as resource_external_id,
               u.relation, u.source, u.first_observed_at, u.capabilities::text[] as capabilities,
               rls.last_seen_at as resource_last_seen_at
@@ -238,36 +262,36 @@ export async function buildReport(db: Queryable, opts: BuildReportOptions = {}):
          join principal  p on p.id = g.principal_id
          join resource   r on r.id = g.resource_id
          left join resource_last_seen rls on rls.resource_id = r.id`,
-    ),
-    db.query<{
-      id: string;
-      kind: string;
-      display_name: string | null;
-      external_id: string;
-      capabilities: Capability[];
-    }>(
-      `select t.id, t.kind, t.display_name, p.external_id, t.capabilities::text[] as capabilities
+      ),
+      db.query<{
+        id: string;
+        kind: string;
+        display_name: string | null;
+        external_id: string;
+        capabilities: Capability[];
+      }>(
+        `select t.id, t.kind, t.display_name, p.external_id, t.capabilities::text[] as capabilities
          from trifecta_exposure t
          join principal p on p.id = t.id`,
-    ),
-    db.query<{
-      agent_kind: string;
-      agent: string | null;
-      agent_external_id: string;
-      human: string | null;
-      human_external_id: string;
-      resource: string | null;
-      resource_external_id: string;
-      last_occurred_at: Date;
-    }>(
-      // One row per (agent, human, resource) triple ever seen — not per
-      // event — with the most recent allow event's timestamp. Purely
-      // descriptive (no "should this be allowed" judgment; that's
-      // src/policies.ts's on-behalf-of-escalation rule's job), so this
-      // reads every acting-on-behalf-of relationship there is, not just
-      // a recent window — same "state, not a lookback period" choice
-      // that rule makes, for the same reason.
-      `select ap.kind as agent_kind, ap.display_name as agent, ap.external_id as agent_external_id,
+      ),
+      db.query<{
+        agent_kind: string;
+        agent: string | null;
+        agent_external_id: string;
+        human: string | null;
+        human_external_id: string;
+        resource: string | null;
+        resource_external_id: string;
+        last_occurred_at: Date;
+      }>(
+        // One row per (agent, human, resource) triple ever seen — not per
+        // event — with the most recent allow event's timestamp. Purely
+        // descriptive (no "should this be allowed" judgment; that's
+        // src/policies.ts's on-behalf-of-escalation rule's job), so this
+        // reads every acting-on-behalf-of relationship there is, not just
+        // a recent window — same "state, not a lookback period" choice
+        // that rule makes, for the same reason.
+        `select ap.kind as agent_kind, ap.display_name as agent, ap.external_id as agent_external_id,
               hp.display_name as human, hp.external_id as human_external_id,
               r.display_name as resource, r.external_id as resource_external_id,
               max(e.occurred_at) as last_occurred_at
@@ -280,19 +304,19 @@ export async function buildReport(db: Queryable, opts: BuildReportOptions = {}):
         group by ap.kind, ap.display_name, ap.external_id,
                  hp.display_name, hp.external_id, r.display_name, r.external_id
         order by last_occurred_at desc`,
-    ),
-    db.query<{
-      occurred_at: Date;
-      principal_kind: string;
-      principal: string | null;
-      principal_external_id: string;
-      resource: string | null;
-      resource_external_id: string;
-      action: string;
-      deny_reason: string | null;
-      taint_labels: string[];
-    }>(
-      `select e.occurred_at, p.kind as principal_kind, p.display_name as principal,
+      ),
+      db.query<{
+        occurred_at: Date;
+        principal_kind: string;
+        principal: string | null;
+        principal_external_id: string;
+        resource: string | null;
+        resource_external_id: string;
+        action: string;
+        deny_reason: string | null;
+        taint_labels: string[];
+      }>(
+        `select e.occurred_at, p.kind as principal_kind, p.display_name as principal,
               p.external_id as principal_external_id, r.display_name as resource,
               r.external_id as resource_external_id, e.action, e.deny_reason, e.taint_labels
          from event e
@@ -302,9 +326,25 @@ export async function buildReport(db: Queryable, opts: BuildReportOptions = {}):
           and e.occurred_at > now() - ($1::text || ' days')::interval
         order by e.occurred_at desc
         limit $2`,
-      [String(denialWindowDays), denialLimit + 1],
-    ),
-  ]);
+        [String(denialWindowDays), denialLimit + 1],
+      ),
+      db.query<{ source: string; count: number }>(
+        // Grouped counts, never a per-row list: this section exists to
+        // surface the CAVEAT (revoked_at is local bookkeeping only — see
+        // this file's own header and formatRevocations() below), not to
+        // audit which specific grant was revoked when; that's what
+        // grant_edge_run (schema/007, src/grant-run-history.ts) is for.
+        // Every row here is `revoked_at is not null` by construction, so
+        // no separate flag is needed to distinguish "revoked" from "not."
+        `select source, count(*)::int as count
+         from grant_edge
+        where revoked_at is not null
+          and revoked_at > now() - ($1::text || ' days')::interval
+        group by source
+        order by count desc, source asc`,
+        [String(revocationWindowDays)],
+      ),
+    ]);
 
   const unusedGrantsSorted: UnusedGrantRow[] = unusedGrantRows.rows
     .map((r) => ({
@@ -361,6 +401,12 @@ export async function buildReport(db: Queryable, opts: BuildReportOptions = {}):
     taintLabels: r.taint_labels,
   }));
 
+  const revokedBySource: RevokedBySourceRow[] = revocationRows.rows.map((r) => ({
+    source: r.source,
+    count: r.count,
+  }));
+  const revokedTotal = revokedBySource.reduce((sum, r) => sum + r.count, 0);
+
   return {
     generatedAt: new Date(),
     unusedGrantWindowDays: 90,
@@ -372,6 +418,9 @@ export async function buildReport(db: Queryable, opts: BuildReportOptions = {}):
     denialWindowDays,
     denialsTruncated,
     denials,
+    revocationWindowDays,
+    revokedBySource,
+    revokedTotal,
   };
 }
 
@@ -416,6 +465,10 @@ function formatDenial(row: DenialRow): string {
   const reason = row.denyReason ? ` — ${row.denyReason}` : '';
   const tags = row.taintLabels.length > 0 ? ` [${row.taintLabels.join(', ')}]` : '';
   return `  ${formatTimestamp(row.occurredAt)} — "${row.principal}" (${row.principalKind}) blocked on ${row.resource} (${row.action})${reason}${tags}`;
+}
+
+function formatRevokedBySourceRow(row: RevokedBySourceRow): string {
+  return `  - ${row.source}: ${row.count}`;
 }
 
 /** Plain text. No HTML, no tables, no scores — just what a reader needs to decide what to delete. */
@@ -492,6 +545,21 @@ export function formatReport(report: Report): string {
         `  ... more denials exist in the window than shown here (newest ${report.denials.length} only).`,
       );
     }
+  }
+  lines.push('');
+
+  lines.push(RULE);
+  lines.push('REVOCATIONS');
+  lines.push(RULE);
+  lines.push(
+    `Grants marked revoked in the last ${report.revocationWindowDays} days, by source. Read this number honestly: revoking a grant here only ever sets a local flag (grant_edge.revoked_at) — this project never calls back to the source system to confirm the access was actually removed there. If you need that guarantee, verify it independently at the source; see CONTRIBUTING.md's "Pick a revocation model deliberately" for why this project stays observational rather than pushing changes back.`,
+  );
+  lines.push('');
+  if (report.revokedBySource.length === 0) {
+    lines.push('  None revoked in the window.');
+  } else {
+    for (const row of report.revokedBySource) lines.push(formatRevokedBySourceRow(row));
+    lines.push(`  Total: ${report.revokedTotal}`);
   }
 
   return lines.join('\n') + '\n';

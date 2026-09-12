@@ -11,6 +11,9 @@
  * do the same for the other two uncapped-until-now sections (both default
  * 50 rows) — see src/views/report.ts's own defaults and BuildReportOptions'
  * doc comments for why these exist at all.
+ * PRINCIPAL_GRAPH_REPORT_REVOCATION_DAYS overrides the revocations
+ * section's window (default 30 days) — that section is grouped counts
+ * only, never a per-row list, so it has no row-limit env var to match.
  */
 
 import { createPool } from '../src/db.js';
@@ -31,6 +34,7 @@ async function main(): Promise<void> {
       denialLimit: envInt('PRINCIPAL_GRAPH_REPORT_DENIAL_LIMIT'),
       unusedGrantLimit: envInt('PRINCIPAL_GRAPH_REPORT_UNUSED_GRANT_LIMIT'),
       trifectaLimit: envInt('PRINCIPAL_GRAPH_REPORT_TRIFECTA_LIMIT'),
+      revocationWindowDays: envInt('PRINCIPAL_GRAPH_REPORT_REVOCATION_DAYS'),
     });
     process.stdout.write(formatReport(report));
   } finally {

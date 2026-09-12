@@ -602,6 +602,7 @@ void test('formatReport reads as plain text with friendly empty states and no ra
     emptyText.includes('None — no event has ever recorded who a human behind an agent was'),
   );
   assert.ok(emptyText.includes('None in the window'));
+  assert.ok(emptyText.includes('None revoked in the window'));
   // No internal jargon leaking into the prose.
   for (const jargon of ['sinkClass', 'TaintLevel', 'capability model', 'severity']) {
     assert.ok(!emptyText.includes(jargon), `did not expect "${jargon}" in the report`);
@@ -640,8 +641,105 @@ void test('formatReport reads as plain text with friendly empty states and no ra
   assert.ok(text.includes('TRIFECTA EXPOSURE'));
   assert.ok(text.includes('ACTING ON BEHALF OF'));
   assert.ok(text.includes('DENIALS'));
+  assert.ok(text.includes('REVOCATIONS'));
   assert.ok(text.includes('Shell Exec'));
   assert.ok(text.includes('Format Test Agent'));
   assert.ok(text.includes('write_irreversible'));
   assert.ok(text.includes('blocked by policy'));
+});
+
+/** A grant_edge row with a specific source and, optionally, already revoked — the shared grant() helper above always uses source 'manual' and never revokes, so the revocations-section tests below need their own. */
+async function sourcedGrant(
+  principalId: string,
+  resourceId: string,
+  source: string,
+  revokedAt?: Date,
+): Promise<void> {
+  await pool.query(
+    `insert into grant_edge (principal_id, resource_id, relation, source, observed_at, first_observed_at, changed_at, revoked_at)
+     values ($1, $2, 'can_call', $3, now(), now(), now(), $4)`,
+    [principalId, resourceId, source, revokedAt ?? null],
+  );
+}
+
+void test('buildReport groups revocations by source within the window, excludes live and out-of-window rows, and sums an honest total', async () => {
+  const agent = await ensurePrincipal(pool, {
+    kind: 'agent',
+    source: 'manual',
+    externalId: 'revo-agent',
+  });
+
+  const ghResource1 = await ensureResource(pool, {
+    kind: 'repo',
+    source: 'github',
+    externalId: 'gh-1',
+  });
+  const ghResource2 = await ensureResource(pool, {
+    kind: 'repo',
+    source: 'github',
+    externalId: 'gh-2',
+  });
+  const wsResource = await ensureResource(pool, {
+    kind: 'group',
+    source: 'workspace',
+    externalId: 'ws-1',
+  });
+  const liveResource = await ensureResource(pool, {
+    kind: 'repo',
+    source: 'github',
+    externalId: 'gh-live',
+  });
+  const oldResource = await ensureResource(pool, {
+    kind: 'repo',
+    source: 'github',
+    externalId: 'gh-old',
+  });
+
+  await sourcedGrant(agent, ghResource1, 'github', new Date());
+  await sourcedGrant(agent, ghResource2, 'github', new Date());
+  await sourcedGrant(agent, wsResource, 'workspace', new Date());
+  // Still live — must not count.
+  await sourcedGrant(agent, liveResource, 'github');
+  // Revoked, but outside the window — must not count.
+  const outsideWindow = new Date();
+  outsideWindow.setDate(outsideWindow.getDate() - 45);
+  await sourcedGrant(agent, oldResource, 'github', outsideWindow);
+
+  const report = await buildReport(pool, { revocationWindowDays: 30 });
+  assert.deepEqual(report.revokedBySource, [
+    { source: 'github', count: 2 },
+    { source: 'workspace', count: 1 },
+  ]);
+  assert.equal(report.revokedTotal, 3);
+
+  const text = formatReport(report);
+  assert.ok(text.includes('- github: 2'));
+  assert.ok(text.includes('- workspace: 1'));
+  assert.ok(text.includes('Total: 3'));
+  // The caveat that matters most — read as plain prose, not jargon.
+  assert.ok(text.includes('never calls back to the source system'));
+});
+
+void test('buildReport revocations respects an overridden window', async () => {
+  const agent = await ensurePrincipal(pool, {
+    kind: 'agent',
+    source: 'manual',
+    externalId: 'revo-window-agent',
+  });
+  const resource = await ensureResource(pool, {
+    kind: 'repo',
+    source: 'github',
+    externalId: 'gh-window',
+  });
+  const eightDaysAgo = new Date();
+  eightDaysAgo.setDate(eightDaysAgo.getDate() - 8);
+  await sourcedGrant(agent, resource, 'github', eightDaysAgo);
+
+  const narrowReport = await buildReport(pool, { revocationWindowDays: 7 });
+  assert.deepEqual(narrowReport.revokedBySource, []);
+  assert.equal(narrowReport.revokedTotal, 0);
+
+  const wideReport = await buildReport(pool, { revocationWindowDays: 14 });
+  assert.deepEqual(wideReport.revokedBySource, [{ source: 'github', count: 1 }]);
+  assert.equal(wideReport.revocationWindowDays, 14);
 });

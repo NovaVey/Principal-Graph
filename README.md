@@ -1444,7 +1444,7 @@ dependency discipline) before opening a PR.
 
 ## Release notes
 
-**v1.2.0.** The event log, the broker integration that feeds it, capability
+**v1.3.0.** The event log, the broker integration that feeds it, capability
 classification, five grant-source adapters (MCP config, GitHub, AWS,
 Google Workspace, Postgres), a Postgres *usage* adapter (the first on the
 other side of the ledger — see [Usage 14](#14-track-real-postgres-query-activity)),
@@ -1575,6 +1575,30 @@ delegation-depth/over-broad-root-token policy check — both held back
 after review found concrete gaps a first pass at either would have
 missed (a way to bypass a depth cap by re-minting instead of hopping,
 among others).
+
+That round's two held-back follow-ups are resolved now, but not the way
+either was originally scoped. The delegation-depth/over-broad-root-token
+policy check landed ([Usage 10](#10-check-policy-violations)) — the two
+literal bypasses a first design pass would have missed (resetting a depth
+cap by re-minting instead of hopping; a bare self-mint inflating
+"delegated" to match "owned" for free) are closed at the primitive level,
+in `recordDelegationMint()`/`recordDelegationHop()` themselves, not just
+in the policy query. Revocation went a different way: a second
+design-and-adversarial-review pass on real source-system enforcement
+found a new critical bug of its own (an AWS Deny-based mechanism that can
+permanently lock out a future legitimate re-grant, by IAM's own
+explicit-deny-always-wins semantics) on top of a harder question — for
+three of the four full-inventory adapters, "real" enforcement would
+mostly just re-confirm what the source's own fresh read already showed.
+Rather than ship a guarantee this project can't safely back,
+[Usage 7](#7-run-the-report) gets a fifth section instead: how many
+grants were revoked recently, by source, with the one caveat that
+matters most stated plainly — `revoked_at` is local bookkeeping only,
+never confirmed at the source. Also in this round:
+`broker-audit-sink.ts` resolves the acting principal per call now, not
+once per session ([Usage 1](#1-wire-your-broker-to-the-event-log)), and
+this README itself was restructured to lead with [Why](#why) instead of
+four stacked review passes.
 
 ## License
 

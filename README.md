@@ -62,6 +62,7 @@ Two rules that are expensive to undo, and stay true throughout this repo:
   - [20. Erase a principal's identity](#20-erase-a-principals-identity)
   - [21. Check whether a deployment is actually set up correctly](#21-check-whether-a-deployment-is-actually-set-up-correctly)
   - [22. Feed the core from `@adc/graph`](#22-feed-the-core-from-adcgraph)
+  - [23. Record delegation mints and hops as first-class chain events](#23-record-delegation-mints-and-hops-as-first-class-chain-events)
 - [Data model](#data-model)
 - [Project layout](#project-layout)
 - [Development](#development)
@@ -1094,6 +1095,62 @@ into that package's mint server config, in place of whatever reads
 `MINT_GRAPH_EVENTS_PATH` today — there's no visibility into that repo's
 own entrypoint from here to write or verify that plumbing.
 
+### 23. Record delegation mints and hops as first-class chain events
+
+```ts
+import { recordDelegationMint, recordDelegationHop } from "./src/delegation-chain.js";
+import { EventBatcher } from "./src/event-batch.js";
+
+const batcher = new EventBatcher(pool);
+
+// The first time a capability is minted for a resource:
+await recordDelegationMint(pool, batcher, {
+  occurredAt: new Date(),
+  mintedBy: rootPrincipalId,
+  initialHolder: rootPrincipalId,
+  resourceId,
+});
+
+// Every later hand-off on that same resource:
+await recordDelegationHop(pool, batcher, {
+  occurredAt: new Date(),
+  forwardedBy: rootPrincipalId, // must be the resource's current holder
+  toPrincipal: agentPrincipalId,
+  resourceId,
+});
+```
+
+`event.on_behalf_of` is one hop — "this agent, acting for this one
+human" — with no field or table anywhere linking one event's capability
+hand-off back to a prior one, so "who minted this, and who has it
+changed hands through since" was never answerable at all, not just hard
+to query. `schema/013_delegation_chain.sql` adds `delegation_chain_link`,
+a side table keyed 1:1 on `event.id` (the same workaround shape
+[Usage 16](#16-answer-which-run-touched-this-grant)/[Usage 17](#17-stop-treating-deleted-resources-as-live-forever)'s
+own migrations already use for a frozen table) linking a
+`delegation_mint`/`delegation_hop` event to its chain root and immediate
+parent, and recording who the capability was handed to. Two new,
+deliberately namespaced `event.action` values —`delegation_mint`/
+`delegation_hop`, never bare `mint`/`attenuate` — keep this domain from
+colliding with [Usage 22](#22-feed-the-core-from-adcgraph)'s own
+unrelated ADC-block-lifecycle actions in the same shared, flat `action`
+column.
+
+`recordDelegationHop()` enforces, not just documents, that a hand-off can
+only come from the resource's actual current holder — resolved by real
+insertion order (`event.seq`), never a caller-supplied `occurredAt` —
+throwing if the named `forwardedBy` principal never held the capability,
+or if the resource was never minted at all. A strict linear chain (one
+holder at a time) is enforced at the database level: `delegation_chain_link`'s
+`unique(parent_event_id)` constraint means two concurrent hops racing on
+the same resource can't silently fork it — the loser's insert fails
+outright instead.
+
+Neither function upserts identity itself — `ensurePrincipal`/
+`ensureResource` first, same division of labor every adapter already
+follows. Nothing in this repo calls these two functions yet; this is the
+primitive itself, ready for the adapter (or policy check) that needs it.
+
 ## Data model
 
 Five tables (`schema/001_core.sql`):
@@ -1168,7 +1225,12 @@ cluster-wide, `NOLOGIN` Postgres role (`principalgraph_report_reader`)
 carrying read-only grants, for the report server to run under instead of
 a full-access credential — see
 [Usage 9](#9-serve-the-report-over-http) and that migration's own header
-for the two commands that give it a real login credential.
+for the two commands that give it a real login credential. A thirteenth,
+`schema/013_delegation_chain.sql`, adds `delegation_chain_link` — see
+[Usage 23](#23-record-delegation-mints-and-hops-as-first-class-chain-events)
+— also internal bookkeeping, not part of the grant graph itself (though,
+like `009`'s chain checkpoint, it does exist to strengthen what `event`
+alone can express).
 
 `schema_migrations` (bootstrapped by `src/migrate.ts` itself, not a
 numbered file — see [Quick start](#quick-start)) also gained a nullable
@@ -1192,6 +1254,7 @@ schema/            SQL migrations — 001_core.sql is the shared core
                      010_grant_edge_observed_split.sql adds first_observed_at/changed_at
                      011_rba_export_dead_letter.sql adds rba_export_dead_letter
                      012_report_reader_role.sql adds a read-only NOLOGIN role, no tables
+                     013_delegation_chain.sql adds delegation_chain_link
 rba/
   principal-graph.authz  RBA's own namespace schema for this project's grant data
 src/
@@ -1206,6 +1269,7 @@ src/
   run-history.ts      startRun / finishRun / latestRuns / withAdapterLock — adapter_run bookkeeping + overlap prevention
   grant-run-history.ts  links a grant_edge row to the adapter_run that created/revoked it
   resource-liveness.ts  records the last time a resource was confirmed to still exist
+  delegation-chain.ts  recordDelegationMint()/recordDelegationHop() — delegation mints/hops as chain events, with lineage
   capabilities.ts    TOOL_CAPABILITIES (hand-written) + how resources get classified
   policies.ts         POLICIES (hand-written) + evaluatePolicies() — "should never happen" rules
   revocation-guard.ts  checkBlastRadius() — caps full-inventory revocation per run
@@ -1417,6 +1481,20 @@ per block would otherwise spring on every single event) is proven
 against the real `on-behalf-of-escalation` policy rule, not just
 asserted. See [Related projects](#related-projects) for what feeds this
 repo, what it feeds, and what it doesn't do yet.
+
+Delegation mints and hops are now first-class chain events too:
+`recordDelegationMint()`/`recordDelegationHop()`
+([Usage 23](#23-record-delegation-mints-and-hops-as-first-class-chain-events))
+close a real gap `event.on_behalf_of` alone couldn't — one hop, with no
+lineage anywhere — behind a new side table
+(`schema/013_delegation_chain.sql`) rather than a change to any frozen
+file. This round of backlog work also surfaced two related follow-ups
+this project deliberately isn't shipping yet: turning revocation from a
+local `grant_edge` flag into real source-system enforcement, and a
+delegation-depth/over-broad-root-token policy check — both held back
+after review found concrete gaps a first pass at either would have
+missed (a way to bypass a depth cap by re-minting instead of hopping,
+among others).
 
 ## License
 

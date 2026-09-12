@@ -10,123 +10,29 @@ questions that currently need two different tools and a person to join by
 hand — a grant graph plus a tamper-evident event log, for companies too small
 to have a security team.
 
-**v1.2.0.** The event log, the broker integration that feeds it, capability
-classification, five grant-source adapters (MCP config, GitHub, AWS,
-Google Workspace, Postgres), a Postgres *usage* adapter (the first on the
-other side of the ledger — see [Usage 14](#14-track-real-postgres-query-activity)),
-the report (CLI and HTTP, with an optional Slack alert) with three
-default policy checks (no-trifecta, stale-grant, on-behalf-of-escalation)
-plus two opt-in ones (chain-intact, per-adapter freshness), migration
-tracking, adapter run-history, and the export bridge into
-Relationship-Based-Authorization are all implemented and tested.
+## Why
 
-A second structural review closed six more gaps on top of that: the event
-chain's tamper-evidence now survives someone deleting rows from its tail,
-not just editing one in the middle
-([Usage 13](#13-verify-the-event-chain-hasnt-been-tampered-with));
-`grant_edge`'s "last observed" and "last actually changed" timestamps are
-no longer the same column, fixing the RBA exporter's incremental sync and
-`stale-grant`'s "unused for N days" text; two real invocations of the same
-adapter can no longer overlap and interleave their revoke computations
-([Usage 18](#18-prevent-two-runs-of-the-same-adapter-from-overlapping));
-the AWS adapter now fetches and passes each bucket's own policy for IAM
-user principals and surfaces conditional (MFA/IP-gated) allows instead of
-discarding them; the RBA exporter no longer lets one permanently-failing
-tuple pin its sync watermark forever; and a handful of smaller
-correctness fixes (a misconfigured `DATABASE_URL` now warns loudly instead
-of silently connecting to the wrong database, an adapter policy names but
-that has never actually run is now a violation, an edited already-applied
-migration is now detected, `permissions.ask`/scoped `deny` entries are
-read correctly, and a mass-violation Slack alert can no longer exceed
-Slack's own message-size limit and get silently dropped).
+A contractor with a GitHub token and an agent with an MCP config both
+accumulate permissions and both take actions — but today they live in
+different systems, audited by different tools, if they're audited at all.
+Principal-Graph puts them in one table (`principal`) and one grant graph
+(`grant_edge`), so "what can this thing reach, and did it ever actually use
+that access" is a single query regardless of whether "this thing" is a
+person or an agent.
 
-A third pass measured this project's own real ceilings and closed five
-more: broker-sink writes are now batched under one advisory-lock hold
-instead of one per event, the fix for a measured ~1,100 events/sec
-ceiling on the naive per-event path ([Usage 1](#1-wire-your-broker-to-the-event-log));
-`chain-intact` now verifies only what changed since the last checkpoint
-instead of replaying the whole chain on every `policy-check` tick,
-confirmed at 100k rows to have cost 1.2s and 100MB+ RSS the old way
-([Usage 13](#13-verify-the-event-chain-hasnt-been-tampered-with)); a
-caller-supplied future timestamp on a broker event can no longer
-permanently mask a stale grant; the report's unused-grants and
-trifecta-exposure sections are capped the same way denials already were,
-instead of printing thousands of rows unbounded ([Usage 7](#7-run-the-report));
-and the report server now runs under its own read-only Postgres role
-instead of sharing every adapter's full-access credential
-([Usage 9](#9-serve-the-report-over-http)).
+Two rules that are expensive to undo, and stay true throughout this repo:
 
-A fourth pass closed out the rest of that review's smaller findings and
-shipped one packaging milestone: `model.ts`'s frozen `ResourceKind`/`Relation`
-unions had drifted stale against what adapters actually produce (missing
-`'group'`, `owner`/`manager`/`member`) — `src/resource-vocabulary.ts` now
-documents the real, current vocabulary and is cross-checked against
-`rba/principal-graph.authz` directly, since that frozen file can't be
-edited to fix it. And this project is now a real Docker image, not just
-something you clone: a multi-stage `Dockerfile` plus `docker-compose.yml`
-turn Quick Start's own three `docker exec`/`psql -f` lines into
-`docker compose up`, and `npm run sync` collapses eleven separate
-`npm run adapter:*`/`export:rba` entries a scheduler used to have to know
-about individually into one command
-([Usage 19](#19-run-every-configured-adapter-in-one-command)). Four
-testing gaps closed alongside it too: a generalized property test that
-mutating any single hashed column on the event chain always produces a
-break, a real concurrency test proving two different adapters can race
-on identity they genuinely share without corrupting it, and real
-HTTP-path coverage (pagination, auth headers, error handling) for the
-GitHub adapter's and RBA exporter's live API calls, not just their
-injected test fakes.
-
-That same review flagged a real gap this project had no answer for at
-all: a "right to erasure" request against the actual PII it stores (a
-human's email/name in `principal`). `npm run erase-identity` now answers
-it — a reactive, per-request anonymization that's provably safe against
-the hash chain, with its one honest limitation (a source system that
-still lists the person will recreate them on its next sync) stated
-plainly rather than glossed over
-([Usage 20](#20-erase-a-principals-identity)).
-
-`npm run doctor` is new too: a read-only pre-flight over one deployment —
-database reachable, every migration applied, the event chain intact, a
-configured report-only credential actually can't write — that answers
-"is this wired up correctly" without reading logs after something's
-already gone wrong
-([Usage 21](#21-check-whether-a-deployment-is-actually-set-up-correctly)).
-
-That review left two "bigger, worth a documented decision" items open;
-both are closed now. "The environments dimension," flagged as the most
-invasive, turned out to be a real, scoped bug rather than a case for the
-schema change that name implies: the Postgres adapters checked several
-targets in one run against one shared `roleTiers`, but only scoped the
-*resource* identity to the target, not the *principal* — so `app_write`
-on a `prod` cluster and `app_write` on a `staging` cluster, a real and
-common shape, silently merged into one principal. Fixed by scoping the
-principal side the same way the resource side already was
-([Usage 12](#12-populate-grants-from-postgres-role-membership)) — no
-schema change, no frozen file touched, and every other adapter's
-`(source, external_id)` convention turned out to already be
-environment-safe for free (a GitHub login, a Workspace email, an AWS ARN
-are all globally unique identities on their own). "RBA subject sets"
-(multi-hop reachability through nested group membership) turned out to
-be a decision already made, just not written down: `workspace-groups.ts`
-already relies on Google's own API to flatten nested groups before this
-project ever sees them, so there's no group-nesting data to express as
-an RBA subject-set rewrite in the first place — see
-[Usage 8](#8-sync-grants-into-rba-for-real-multi-hop-reachability)'s own
-note on it.
-
-A sixth integration joins the five grant adapters and the broker sink:
-`src/adapters/adc-graph-sink.ts` feeds the core from `@adc/graph`'s own
-capability-lifecycle events, the same way the broker sink feeds it from
-a live tool-call session
-([Usage 22](#22-feed-the-core-from-adcgraph)). Written from a prose
-description of that package's reference adapter, not a verified copy —
-its own header says exactly what that means — but the part that has to
-be right regardless (closing the on-behalf-of trap a one-off resource
-per block would otherwise spring on every single event) is proven
-against the real `on-behalf-of-escalation` policy rule, not just
-asserted. See [Related projects](#related-projects) for what feeds this
-repo, what it feeds, and what it doesn't do yet.
+- **One `principal` table.** Never separate `agent`/`user` tables — the
+  reachability graph this project feeds (directly, and via the RBA exporter
+  below) needs both kinds on one graph, not two graphs a query has to join
+  by hand.
+- **Zero credentials for the agent side.** The MCP-config adapter (Task 3)
+  reads files on disk; nothing here talks to a SaaS API. The product has to
+  be useful before you ever need a second person (the one who owns the
+  Google admin console, say) in the loop. This is specifically about the
+  agent side — the GitHub adapter (below) is a different kind of grant and
+  does need a token, same as any tool that has to ask GitHub who can push
+  where.
 
 ## Contents
 
@@ -160,31 +66,8 @@ repo, what it feeds, and what it doesn't do yet.
 - [Project layout](#project-layout)
 - [Development](#development)
 - [Related projects](#related-projects)
+- [Release notes](#release-notes)
 - [License](#license)
-
-## Why
-
-A contractor with a GitHub token and an agent with an MCP config both
-accumulate permissions and both take actions — but today they live in
-different systems, audited by different tools, if they're audited at all.
-Principal-Graph puts them in one table (`principal`) and one grant graph
-(`grant_edge`), so "what can this thing reach, and did it ever actually use
-that access" is a single query regardless of whether "this thing" is a
-person or an agent.
-
-Two rules that are expensive to undo, and stay true throughout this repo:
-
-- **One `principal` table.** Never separate `agent`/`user` tables — the
-  reachability graph this project feeds (directly, and via the RBA exporter
-  below) needs both kinds on one graph, not two graphs a query has to join
-  by hand.
-- **Zero credentials for the agent side.** The MCP-config adapter (Task 3)
-  reads files on disk; nothing here talks to a SaaS API. The product has to
-  be useful before you ever need a second person (the one who owns the
-  Google admin console, say) in the loop. This is specifically about the
-  agent side — the GitHub adapter (below) is a different kind of grant and
-  does need a token, same as any tool that has to ask GitHub who can push
-  where.
 
 ## Requirements
 
@@ -1414,6 +1297,126 @@ dependency discipline) before opening a PR.
   the exporter (see [Usage](#8-sync-grants-into-rba-for-real-multi-hop-reachability)).
   Principal-Graph deliberately does not reimplement graph-walking
   reachability itself — that engine already exists, proven, over there.
+
+## Release notes
+
+**v1.2.0.** The event log, the broker integration that feeds it, capability
+classification, five grant-source adapters (MCP config, GitHub, AWS,
+Google Workspace, Postgres), a Postgres *usage* adapter (the first on the
+other side of the ledger — see [Usage 14](#14-track-real-postgres-query-activity)),
+the report (CLI and HTTP, with an optional Slack alert) with three
+default policy checks (no-trifecta, stale-grant, on-behalf-of-escalation)
+plus two opt-in ones (chain-intact, per-adapter freshness), migration
+tracking, adapter run-history, and the export bridge into
+Relationship-Based-Authorization are all implemented and tested.
+
+A second structural review closed six more gaps on top of that: the event
+chain's tamper-evidence now survives someone deleting rows from its tail,
+not just editing one in the middle
+([Usage 13](#13-verify-the-event-chain-hasnt-been-tampered-with));
+`grant_edge`'s "last observed" and "last actually changed" timestamps are
+no longer the same column, fixing the RBA exporter's incremental sync and
+`stale-grant`'s "unused for N days" text; two real invocations of the same
+adapter can no longer overlap and interleave their revoke computations
+([Usage 18](#18-prevent-two-runs-of-the-same-adapter-from-overlapping));
+the AWS adapter now fetches and passes each bucket's own policy for IAM
+user principals and surfaces conditional (MFA/IP-gated) allows instead of
+discarding them; the RBA exporter no longer lets one permanently-failing
+tuple pin its sync watermark forever; and a handful of smaller
+correctness fixes (a misconfigured `DATABASE_URL` now warns loudly instead
+of silently connecting to the wrong database, an adapter policy names but
+that has never actually run is now a violation, an edited already-applied
+migration is now detected, `permissions.ask`/scoped `deny` entries are
+read correctly, and a mass-violation Slack alert can no longer exceed
+Slack's own message-size limit and get silently dropped).
+
+A third pass measured this project's own real ceilings and closed five
+more: broker-sink writes are now batched under one advisory-lock hold
+instead of one per event, the fix for a measured ~1,100 events/sec
+ceiling on the naive per-event path ([Usage 1](#1-wire-your-broker-to-the-event-log));
+`chain-intact` now verifies only what changed since the last checkpoint
+instead of replaying the whole chain on every `policy-check` tick,
+confirmed at 100k rows to have cost 1.2s and 100MB+ RSS the old way
+([Usage 13](#13-verify-the-event-chain-hasnt-been-tampered-with)); a
+caller-supplied future timestamp on a broker event can no longer
+permanently mask a stale grant; the report's unused-grants and
+trifecta-exposure sections are capped the same way denials already were,
+instead of printing thousands of rows unbounded ([Usage 7](#7-run-the-report));
+and the report server now runs under its own read-only Postgres role
+instead of sharing every adapter's full-access credential
+([Usage 9](#9-serve-the-report-over-http)).
+
+A fourth pass closed out the rest of that review's smaller findings and
+shipped one packaging milestone: `model.ts`'s frozen `ResourceKind`/`Relation`
+unions had drifted stale against what adapters actually produce (missing
+`'group'`, `owner`/`manager`/`member`) — `src/resource-vocabulary.ts` now
+documents the real, current vocabulary and is cross-checked against
+`rba/principal-graph.authz` directly, since that frozen file can't be
+edited to fix it. And this project is now a real Docker image, not just
+something you clone: a multi-stage `Dockerfile` plus `docker-compose.yml`
+turn Quick Start's own three `docker exec`/`psql -f` lines into
+`docker compose up`, and `npm run sync` collapses eleven separate
+`npm run adapter:*`/`export:rba` entries a scheduler used to have to know
+about individually into one command
+([Usage 19](#19-run-every-configured-adapter-in-one-command)). Four
+testing gaps closed alongside it too: a generalized property test that
+mutating any single hashed column on the event chain always produces a
+break, a real concurrency test proving two different adapters can race
+on identity they genuinely share without corrupting it, and real
+HTTP-path coverage (pagination, auth headers, error handling) for the
+GitHub adapter's and RBA exporter's live API calls, not just their
+injected test fakes.
+
+That same review flagged a real gap this project had no answer for at
+all: a "right to erasure" request against the actual PII it stores (a
+human's email/name in `principal`). `npm run erase-identity` now answers
+it — a reactive, per-request anonymization that's provably safe against
+the hash chain, with its one honest limitation (a source system that
+still lists the person will recreate them on its next sync) stated
+plainly rather than glossed over
+([Usage 20](#20-erase-a-principals-identity)).
+
+`npm run doctor` is new too: a read-only pre-flight over one deployment —
+database reachable, every migration applied, the event chain intact, a
+configured report-only credential actually can't write — that answers
+"is this wired up correctly" without reading logs after something's
+already gone wrong
+([Usage 21](#21-check-whether-a-deployment-is-actually-set-up-correctly)).
+
+That review left two "bigger, worth a documented decision" items open;
+both are closed now. "The environments dimension," flagged as the most
+invasive, turned out to be a real, scoped bug rather than a case for the
+schema change that name implies: the Postgres adapters checked several
+targets in one run against one shared `roleTiers`, but only scoped the
+*resource* identity to the target, not the *principal* — so `app_write`
+on a `prod` cluster and `app_write` on a `staging` cluster, a real and
+common shape, silently merged into one principal. Fixed by scoping the
+principal side the same way the resource side already was
+([Usage 12](#12-populate-grants-from-postgres-role-membership)) — no
+schema change, no frozen file touched, and every other adapter's
+`(source, external_id)` convention turned out to already be
+environment-safe for free (a GitHub login, a Workspace email, an AWS ARN
+are all globally unique identities on their own). "RBA subject sets"
+(multi-hop reachability through nested group membership) turned out to
+be a decision already made, just not written down: `workspace-groups.ts`
+already relies on Google's own API to flatten nested groups before this
+project ever sees them, so there's no group-nesting data to express as
+an RBA subject-set rewrite in the first place — see
+[Usage 8](#8-sync-grants-into-rba-for-real-multi-hop-reachability)'s own
+note on it.
+
+A sixth integration joins the five grant adapters and the broker sink:
+`src/adapters/adc-graph-sink.ts` feeds the core from `@adc/graph`'s own
+capability-lifecycle events, the same way the broker sink feeds it from
+a live tool-call session
+([Usage 22](#22-feed-the-core-from-adcgraph)). Written from a prose
+description of that package's reference adapter, not a verified copy —
+its own header says exactly what that means — but the part that has to
+be right regardless (closing the on-behalf-of trap a one-off resource
+per block would otherwise spring on every single event) is proven
+against the real `on-behalf-of-escalation` policy rule, not just
+asserted. See [Related projects](#related-projects) for what feeds this
+repo, what it feeds, and what it doesn't do yet.
 
 ## License
 

@@ -31,7 +31,9 @@ export type PolicyRule =
   | { kind: 'stale-grant'; relations: readonly Relation[]; maxUnusedDays: number }
   | { kind: 'chain-intact' }
   | { kind: 'on-behalf-of-escalation' }
-  | { kind: 'adapter-freshness'; adapter: AdapterName; maxAgeHours: number };
+  | { kind: 'adapter-freshness'; adapter: AdapterName; maxAgeHours: number }
+  | { kind: 'delegation-depth'; maxDepth: number }
+  | { kind: 'over-broad-root-token'; minOwnedResources: number; minRatio: number };
 
 export interface PolicyViolation {
   rule: PolicyRule;
@@ -94,6 +96,24 @@ export interface PolicyViolation {
  *     `[...POLICIES, { kind: 'chain-intact' }]` explicitly if you want it
  *     folded into one report anyway; it's now cheap enough to run on
  *     every tick, it just isn't the thing that catches old tampering.
+ *   - `delegation-depth` and `over-broad-root-token` are ALSO deliberately
+ *     not in the default set, for the same reason `adapter-freshness` is
+ *     opt-in: `maxDepth` (how many hand-offs is legitimate for THIS
+ *     deployment's own multi-agent orchestration — a single supervisor ->
+ *     worker hop looks very different from a deeper pipeline) and
+ *     `minOwnedResources`/`minRatio` (how broad a root token's standing
+ *     access is expected to be relative to what it's actually delegated)
+ *     are exactly the kind of number this project's adapters already
+ *     refuse to guess. Configure explicit instances once you know your own
+ *     topology — see checkDelegationDepth's/checkOverBroadRootToken's own
+ *     comments for the full reasoning behind each threshold, and for what
+ *     each check can and can't see: both read `delegation_chain_link`
+ *     (schema/013_delegation_chain.sql, src/delegation-chain.ts), which is
+ *     only ever populated by a caller that actually calls
+ *     recordDelegationMint()/recordDelegationHop() — a real hand-off that
+ *     happens some other way is invisible to both, exactly like
+ *     `on-behalf-of-escalation` only ever sees what `event.on_behalf_of`
+ *     was actually set to.
  */
 export const POLICIES: readonly PolicyRule[] = [
   { kind: 'no-trifecta' },
@@ -280,6 +300,176 @@ async function checkOnBehalfOfEscalation(db: Queryable): Promise<PolicyViolation
   });
 }
 
+/**
+ * Flags any delegation chain (rooted at a `delegation_mint` event, per
+ * src/delegation-chain.ts) whose hop count exceeds `rule.maxDepth`.
+ *
+ * `delegation_chain_link`'s own `unique(parent_event_id)` constraint
+ * (schema/013_delegation_chain.sql) guarantees every chain is a strict
+ * linked list, never a branch — every row sharing a `root_event_id`
+ * belongs to exactly one linear path from the mint, so `count(*) - 1`
+ * over that group is exactly the hop count. No recursive CTE needed for
+ * the count itself; only reconstructing the full ordered path (not
+ * needed here) would require one.
+ *
+ * What this can't see, stated plainly rather than glossed over: depth is
+ * tracked per resource-chain. `recordDelegationMint()` refuses a second
+ * mint on the SAME resource (closing the literal bypass an earlier
+ * design pass was found to have — reset the counter by re-minting
+ * instead of hopping), and now requires the minting principal to already
+ * hold a real, independently-granted live grant on whatever resource it
+ * mints — so starting a fresh chain elsewhere is no longer free, it
+ * requires genuine standing access from a real adapter, not a fabricated
+ * bookkeeping entry. It does NOT, and structurally cannot, walk across
+ * chain boundaries: a principal who is both one chain's tip and
+ * genuinely, independently entitled to mint a second, unrelated chain
+ * isn't summed with the first. Closing that fully would mean tracking
+ * transitive depth across every resource a principal has ever touched,
+ * not per resource — a materially bigger design than this check, left
+ * for if a real deployment's data ever shows it's needed.
+ */
+async function checkDelegationDepth(
+  db: Queryable,
+  rule: Extract<PolicyRule, { kind: 'delegation-depth' }>,
+): Promise<PolicyViolation[]> {
+  const { rows } = await db.query<{
+    minted_by: string | null;
+    minted_by_external_id: string;
+    resource: string | null;
+    resource_external_id: string;
+    current_holder: string | null;
+    current_holder_external_id: string;
+    depth: number;
+  }>(
+    `select mp.display_name as minted_by, mp.external_id as minted_by_external_id,
+            r.display_name as resource, r.external_id as resource_external_id,
+            tp.display_name as current_holder, tp.external_id as current_holder_external_id,
+            (cs.node_count - 1)::int as depth
+       from (
+         select dl.root_event_id, count(*) as node_count
+           from delegation_chain_link dl
+          group by dl.root_event_id
+         having count(*) - 1 > $1::int
+       ) cs
+       join event mint_e on mint_e.id = cs.root_event_id
+       join principal mp on mp.id = mint_e.principal_id
+       join resource  r  on r.id = mint_e.resource_id
+       -- Chain tip = the row with the highest event.seq sharing this root
+       -- — true insertion order, matching recordDelegationHop()'s own
+       -- tip-lookup logic (never occurred_at, which is caller-supplied).
+       join lateral (
+         select dl2.to_principal_id
+           from delegation_chain_link dl2
+           join event e2 on e2.id = dl2.event_id
+          where dl2.root_event_id = cs.root_event_id
+          order by e2.seq desc
+          limit 1
+       ) tip on true
+       join principal tp on tp.id = tip.to_principal_id`,
+    [rule.maxDepth],
+  );
+  return rows.map((r) => {
+    const mintedBy = resolveName(r.minted_by, r.minted_by_external_id);
+    const resource = resolveName(r.resource, r.resource_external_id);
+    const holder = resolveName(r.current_holder, r.current_holder_external_id);
+    return {
+      rule,
+      description: `Delegation chain for ${resource}, minted by "${mintedBy}", is ${r.depth} hop(s) deep (currently held by "${holder}") — beyond this policy's ${rule.maxDepth}-hop limit.`,
+    };
+  });
+}
+
+/**
+ * Flags a delegation-chain ROOT (any principal that appears as
+ * `event.principal_id` on at least one `delegation_mint` event) whose own
+ * live `grant_edge` footprint (distinct resources it holds a grant on
+ * right now) is disproportionately larger than the distinct resources it
+ * has ever actually, genuinely delegated onward.
+ *
+ * "Genuinely delegated," not merely minted: a resource only counts toward
+ * `delegated_resource_count` once its chain has actually reached someone
+ * else — `exists (... hop.parent_event_id is not null)`. A bare,
+ * un-hopped mint doesn't count, closing the exact gaming an earlier
+ * design pass was found to have: a root minting once, self-targeted
+ * (`initialHolder === mintedBy`, `recordDelegationMint()`'s own
+ * documented common shape), against every resource it already owns, used
+ * to inflate this count to match `owned_resource_count` for free and
+ * permanently silence this check at a ~1.0x ratio — without ever handing
+ * real access to anyone. `recordDelegationHop()` also now refuses a hop
+ * to yourself, closing the adjacent version of the same trick.
+ *
+ * This is the "invisible blast radius" `on-behalf-of-escalation` can't
+ * see: that check only fires reactively, after a specific on-behalf-of
+ * `allow` event names one specific resource. This one is structural — it
+ * fires on standing grant breadth alone, catching a root token that could
+ * escalate through resources it has never yet delegated through any
+ * observable chain. What it still can't see, stated plainly: nothing
+ * forces a real capability hand-off to go through
+ * recordDelegationMint()/recordDelegationHop() at all, so a root's true
+ * delegation behavior can only ever be undercounted here, never
+ * overcounted — this reads what's recorded, not a write-time gate on
+ * access itself.
+ */
+async function checkOverBroadRootToken(
+  db: Queryable,
+  rule: Extract<PolicyRule, { kind: 'over-broad-root-token' }>,
+): Promise<PolicyViolation[]> {
+  const { rows } = await db.query<{
+    root: string | null;
+    root_external_id: string;
+    owned_resource_count: number;
+    delegated_resource_count: number;
+  }>(
+    `with root_mints as (
+         select e.principal_id, e.resource_id, dl.event_id as mint_event_id
+           from event e
+           join delegation_chain_link dl on dl.event_id = e.id
+          where dl.parent_event_id is null
+       ),
+       actually_delegated as (
+         select rm.principal_id, rm.resource_id
+           from root_mints rm
+          where exists (
+            select 1 from delegation_chain_link hop
+             where hop.root_event_id = rm.mint_event_id
+               and hop.parent_event_id is not null
+          )
+       ),
+       deleg_breadth as (
+         select principal_id, count(distinct resource_id) as delegated_resource_count
+           from actually_delegated
+          group by principal_id
+       ),
+       owned_breadth as (
+         select g.principal_id, count(distinct g.resource_id) as owned_resource_count
+           from grant_edge g
+          where g.revoked_at is null
+          group by g.principal_id
+       )
+       select p.display_name as root, p.external_id as root_external_id,
+              ob.owned_resource_count,
+              coalesce(db2.delegated_resource_count, 0) as delegated_resource_count
+         from owned_breadth ob
+         join principal p on p.id = ob.principal_id
+         left join deleg_breadth db2 on db2.principal_id = ob.principal_id
+        where ob.owned_resource_count >= $1::int
+          and exists (select 1 from root_mints rm2 where rm2.principal_id = ob.principal_id)
+          and ob.owned_resource_count > $2::numeric * coalesce(db2.delegated_resource_count, 0)`,
+    [rule.minOwnedResources, rule.minRatio],
+  );
+  return rows.map((r) => {
+    const root = resolveName(r.root, r.root_external_id);
+    const ratio =
+      r.delegated_resource_count > 0
+        ? (r.owned_resource_count / r.delegated_resource_count).toFixed(1)
+        : '∞';
+    return {
+      rule,
+      description: `"${root}" holds live grants on ${r.owned_resource_count} resource(s) but has genuinely delegated only ${r.delegated_resource_count} of them — its standing access is ${ratio}x broader than what it actually delegates, beyond this policy's ${rule.minRatio}x limit.`,
+    };
+  });
+}
+
 async function checkAdapterFreshness(
   db: Queryable,
   rule: Extract<PolicyRule, { kind: 'adapter-freshness' }>,
@@ -368,6 +558,12 @@ export async function evaluatePolicies(
         break;
       case 'on-behalf-of-escalation':
         violations.push(...(await checkOnBehalfOfEscalation(db)));
+        break;
+      case 'delegation-depth':
+        violations.push(...(await checkDelegationDepth(db, rule)));
+        break;
+      case 'over-broad-root-token':
+        violations.push(...(await checkOverBroadRootToken(db, rule)));
         break;
       case 'adapter-freshness':
         violations.push(...(await checkAdapterFreshness(db, rule)));

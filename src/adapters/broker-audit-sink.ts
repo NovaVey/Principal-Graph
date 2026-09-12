@@ -16,16 +16,23 @@
  * Principals and resources are upserted on first sight (src/upsert.ts). The
  * broker itself has no notion of "who" is calling — `ToolCall` carries only
  * `sessionId`, an opaque per-broker-instance id, never an operator identity —
- * so the calling agent, and optionally the human it's acting for, are
- * supplied once at construction time and reused for every event this sink
- * records. One broker instance is one session (see BrokerOptions.sessionId's
- * own doc comment upstream), so one sink instance per broker instance is the
- * right granularity here too.
+ * so by default the calling agent, and optionally the human it's acting
+ * for, are supplied once at construction time and reused for every event
+ * this sink records. One broker instance is one session (see
+ * BrokerOptions.sessionId's own doc comment upstream), so one sink instance
+ * per broker instance is the right granularity here too.
+ *
+ * That default is a per-SESSION identity, not a per-CALL one — the escape
+ * hatch is `BrokerAuditSinkOptions.resolveActingPrincipal`, consulted once
+ * per event, for an integrator who can tell calls on one shared
+ * broker/session apart more precisely than `sessionId` does (see its own
+ * doc comment). `onBehalfOf` stays fixed per sink instance either way — this
+ * only changes how the primary acting principal is resolved.
  */
 
 import { createHash } from 'node:crypto';
 import type { Pool } from 'pg';
-import type { AuditEvent, AuditSink, PolicyDecision } from 'taint-tracked-tool-broker';
+import type { AuditEvent, AuditSink, PolicyDecision, ToolCall } from 'taint-tracked-tool-broker';
 import { EventBatcher } from '../event-batch.js';
 import { ensurePrincipal, ensureResource } from '../upsert.js';
 import { classifyKnownTool } from '../capabilities.js';
@@ -40,12 +47,49 @@ export interface BrokerPrincipalIdentity {
 
 export interface BrokerAuditSinkOptions {
   pool: Pool;
-  /** The agent principal every call on this broker instance is attributed to. */
+  /**
+   * The default agent principal every call on this broker instance is
+   * attributed to, unless `resolveActingPrincipal` reports a different one
+   * for a specific call.
+   */
   agent: BrokerPrincipalIdentity;
+  /**
+   * Resolves the acting principal for ONE call, when the integrator can tell
+   * calls on this one broker instance apart more precisely than the
+   * broker's own opaque, per-instance `sessionId` (see this file's own
+   * header) — e.g. more than one named sub-agent dispatching through a
+   * single shared broker/session, correlated via `ToolCall.id` against the
+   * caller's own dispatch record.
+   *
+   * Called once per `AuditEvent`, before `agent` is ever consulted.
+   * Returning `undefined` (or omitting this option entirely) falls back to
+   * `agent` for that call — `agent` stays the required, always-available
+   * default this option layers ON TOP OF, never replaces. Each distinct
+   * `(source, externalId)` this returns is upserted via `ensurePrincipal` at
+   * most once per sink instance — the same amortization `agent`/`onBehalfOf`
+   * already get below, generalized from exactly one identity to however
+   * many a resolver reports over this sink's lifetime. The identity
+   * returned should be a stable per-ACTOR key, not a fresh one per call —
+   * a resolver keyed by `call.id` itself would defeat the cache and grow it
+   * without bound on a long-lived sink.
+   *
+   * `taint-tracked-tool-broker`'s own `ToolCall` carries no identity field
+   * of its own — only `id`/`toolName`/`args`/`sessionId` — so this hook
+   * exists specifically to let an integrator supply what the broker itself
+   * cannot. A resolver that throws (or whose returned promise rejects)
+   * propagates like any other failed lookup in `handle()`: the event is
+   * logged and dropped, exactly as today for e.g. a bad DB connection — it
+   * does NOT fall back to `agent`.
+   */
+  resolveActingPrincipal?: (
+    call: ToolCall,
+  ) => BrokerPrincipalIdentity | undefined | Promise<BrokerPrincipalIdentity | undefined>;
   /**
    * The human this agent's session is acting for, when the integrator can
    * attribute it. Left unset when it can't be — the recorded event's
-   * `on_behalf_of` is then null, honestly, rather than guessed.
+   * `on_behalf_of` is then null, honestly, rather than guessed. Unlike the
+   * acting principal above, this stays fixed per sink instance — nothing
+   * here resolves a per-call on-behalf-of human.
    */
   onBehalfOf?: BrokerPrincipalIdentity;
   /**
@@ -161,7 +205,7 @@ export function createPrincipalGraphAuditSink(
 
   // Each identity is upserted at most once per sink instance, not once per
   // event — every AuditEvent this sink ever records shares the same agent
-  // (and, if configured, the same on-behalf-of human).
+  // (and, if configured, the same on-behalf-of human) by default.
   let agentIdPromise: Promise<string> | undefined;
   let onBehalfOfIdPromise: Promise<string | null> | undefined;
 
@@ -176,9 +220,33 @@ export function createPrincipalGraphAuditSink(
     return onBehalfOfIdPromise;
   }
 
+  // Identities `resolveActingPrincipal` reports are cached per distinct
+  // (source, externalId), not per call — the same "upsert on first sight"
+  // discipline agentId()/onBehalfOfId() already apply to the two identities
+  // fixed at construction, generalized here to however many distinct acting
+  // principals a resolver reports over this sink's lifetime.
+  const actingPrincipalCache = new Map<string, Promise<string>>();
+
+  function actingPrincipalId(call: ToolCall): Promise<string> {
+    if (!opts.resolveActingPrincipal) return agentId();
+    return Promise.resolve(opts.resolveActingPrincipal(call)).then((identity) => {
+      if (!identity) return agentId();
+      // JSON-encoded, not a plain-delimited string — source/externalId are
+      // caller-supplied and could otherwise collide across the boundary
+      // (source:"a b", externalId:"c" vs. source:"a", externalId:"b c").
+      const key = JSON.stringify([identity.source, identity.externalId]);
+      let cached = actingPrincipalCache.get(key);
+      if (!cached) {
+        cached = ensurePrincipal(pool, { kind: 'agent', ...identity });
+        actingPrincipalCache.set(key, cached);
+      }
+      return cached;
+    });
+  }
+
   async function handle(event: AuditEvent): Promise<void> {
     const [principalId, onBehalfOf, resourceId] = await Promise.all([
-      agentId(),
+      actingPrincipalId(event.call),
       onBehalfOfId(),
       ensureResource(pool, {
         kind: 'tool',

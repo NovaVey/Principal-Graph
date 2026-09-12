@@ -16,7 +16,10 @@ import {
   type ToolExecutor,
 } from 'taint-tracked-tool-broker';
 
-import { createPrincipalGraphAuditSink } from '../src/adapters/broker-audit-sink.js';
+import {
+  createPrincipalGraphAuditSink,
+  type BrokerPrincipalIdentity,
+} from '../src/adapters/broker-audit-sink.js';
 import { verifyChain } from '../src/log.js';
 import { evaluatePolicies } from '../src/policies.js';
 import { ensurePrincipal, ensureResource } from '../src/upsert.js';
@@ -230,4 +233,122 @@ void test('a future-dated event.at is clamped to now(), not trusted — closes t
     !directViolations.some((v) => v.description.includes('direct-future-tool')),
     "a future-dated allow event masks a 200-day-stale grant — the exact shape event.at's clamp keeps out of the sink",
   );
+});
+
+/**
+ * resolveActingPrincipal — closes the gap named in its own doc comment:
+ * without it, every event on one broker/session shares the single `agent`
+ * identity configured at construction, a per-SESSION attribution rather
+ * than a per-CALL one. Both tests below share one broker `sessionId`
+ * throughout, deliberately — the session label never changes, so any
+ * difference in who a row gets attributed to has to come from the
+ * resolver, not from the broker's own session identity.
+ */
+async function principalExternalIdByTool(toolName: string): Promise<string | null> {
+  const { rows } = await pool.query<{ external_id: string }>(
+    `select p.external_id
+       from event e
+       join resource r on r.id = e.resource_id
+       join principal p on p.id = e.principal_id
+      where r.external_id = $1`,
+    [toolName],
+  );
+  assert.equal(rows.length, 1, `expected exactly one event for tool ${toolName}`);
+  return rows[0]?.external_id ?? null;
+}
+
+void test('resolveActingPrincipal attributes calls on the SAME broker session to different principals, with per-call fallback to agent for an unmapped call', async () => {
+  const byCallId = new Map<string, BrokerPrincipalIdentity>([
+    ['call-a', { source: 'manual', externalId: 'sub-agent-a' }],
+    ['call-b', { source: 'manual', externalId: 'sub-agent-b' }],
+  ]);
+  const sink = createPrincipalGraphAuditSink({
+    pool,
+    agent: { source: 'manual', externalId: 'session-default-agent' },
+    resolveActingPrincipal: (call) => byCallId.get(call.id),
+  });
+
+  // Same sessionId on every event — the session label stays constant
+  // throughout; only call.id differs.
+  sink.record(
+    fakeAuditEvent({
+      call: { id: 'call-a', toolName: 'fetch_url', args: {}, sessionId: 'shared-session' },
+    }),
+  );
+  sink.record(
+    fakeAuditEvent({
+      call: { id: 'call-b', toolName: 'shell_exec', args: {}, sessionId: 'shared-session' },
+    }),
+  );
+  sink.record(
+    fakeAuditEvent({
+      call: { id: 'call-c', toolName: 'unmapped_tool', args: {}, sessionId: 'shared-session' },
+    }),
+  );
+  await sink.flush();
+
+  assert.equal(await principalExternalIdByTool('fetch_url'), 'sub-agent-a');
+  assert.equal(await principalExternalIdByTool('shell_exec'), 'sub-agent-b');
+  assert.equal(
+    await principalExternalIdByTool('unmapped_tool'),
+    'session-default-agent',
+    'a call the resolver has no entry for must fall back to the configured agent, not go unattributed',
+  );
+});
+
+void test('without resolveActingPrincipal, the same two logically-distinct calls collapse onto one principal_id — proves the fix above is testing something real', async () => {
+  // Same two call shapes as the positive test above, but through a sink
+  // constructed WITHOUT resolveActingPrincipal — today's exact default path.
+  const sink = createPrincipalGraphAuditSink({
+    pool,
+    agent: { source: 'manual', externalId: 'session-default-agent' },
+  });
+
+  sink.record(
+    fakeAuditEvent({
+      call: { id: 'call-a', toolName: 'fetch_url', args: {}, sessionId: 'shared-session' },
+    }),
+  );
+  sink.record(
+    fakeAuditEvent({
+      call: { id: 'call-b', toolName: 'shell_exec', args: {}, sessionId: 'shared-session' },
+    }),
+  );
+  await sink.flush();
+
+  const fetchAgent = await principalExternalIdByTool('fetch_url');
+  const shellAgent = await principalExternalIdByTool('shell_exec');
+  assert.equal(fetchAgent, 'session-default-agent');
+  assert.equal(
+    shellAgent,
+    fetchAgent,
+    'without the resolver, two different actual calls really do collapse onto the same principal — the session-label-only behavior the fix above closes',
+  );
+});
+
+void test('resolveActingPrincipal caches a repeatedly-resolved identity, upserting it at most once', async () => {
+  const identity: BrokerPrincipalIdentity = { source: 'manual', externalId: 'repeat-caller' };
+  const sink = createPrincipalGraphAuditSink({
+    pool,
+    agent: { source: 'manual', externalId: 'session-default-agent' },
+    resolveActingPrincipal: () => identity,
+  });
+
+  sink.record(
+    fakeAuditEvent({
+      call: { id: 'call-1', toolName: 'fetch_url', args: {}, sessionId: 'shared-session' },
+    }),
+  );
+  sink.record(
+    fakeAuditEvent({
+      call: { id: 'call-2', toolName: 'shell_exec', args: {}, sessionId: 'shared-session' },
+    }),
+  );
+  await sink.flush();
+
+  const { rows } = await pool.query<{ count: string }>(
+    'select count(*)::int as count from principal where external_id = $1',
+    ['repeat-caller'],
+  );
+  assert.equal(rows[0]?.count, 1, 'the same resolved identity must be upserted at most once');
 });

@@ -155,6 +155,12 @@ const sink = createPrincipalGraphAuditSink({
   // below defaults to 'mcp-config') so a call and its grant land on the
   // same resource row instead of two rows that happen to share a name.
   resourceSource: "mcp-config",
+  // Optional — per-call override for a broker instance shared by more than
+  // one actual actor (one broker session dispatching for several named
+  // sub-agents, say): resolveActingPrincipal(call) => BrokerPrincipalIdentity.
+  // Falls back to `agent` above when omitted, or when it returns undefined
+  // for a given call — see that option's own doc comment in
+  // src/adapters/broker-audit-sink.ts.
 });
 
 const broker = createBroker({ auditSink: sink });

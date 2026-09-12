@@ -113,8 +113,20 @@ already relies on Google's own API to flatten nested groups before this
 project ever sees them, so there's no group-nesting data to express as
 an RBA subject-set rewrite in the first place — see
 [Usage 8](#8-sync-grants-into-rba-for-real-multi-hop-reachability)'s own
-note on it. See [Related projects](#related-projects) for what feeds
-this repo, what it feeds, and what it doesn't do yet.
+note on it.
+
+A sixth integration joins the five grant adapters and the broker sink:
+`src/adapters/adc-graph-sink.ts` feeds the core from `@adc/graph`'s own
+capability-lifecycle events, the same way the broker sink feeds it from
+a live tool-call session
+([Usage 22](#22-feed-the-core-from-adcgraph)). Written from a prose
+description of that package's reference adapter, not a verified copy —
+its own header says exactly what that means — but the part that has to
+be right regardless (closing the on-behalf-of trap a one-off resource
+per block would otherwise spring on every single event) is proven
+against the real `on-behalf-of-escalation` policy rule, not just
+asserted. See [Related projects](#related-projects) for what feeds this
+repo, what it feeds, and what it doesn't do yet.
 
 ## Contents
 
@@ -143,6 +155,7 @@ this repo, what it feeds, and what it doesn't do yet.
   - [19. Run every configured adapter in one command](#19-run-every-configured-adapter-in-one-command)
   - [20. Erase a principal's identity](#20-erase-a-principals-identity)
   - [21. Check whether a deployment is actually set up correctly](#21-check-whether-a-deployment-is-actually-set-up-correctly)
+  - [22. Feed the core from `@adc/graph`](#22-feed-the-core-from-adcgraph)
 - [Data model](#data-model)
 - [Project layout](#project-layout)
 - [Development](#development)
@@ -1127,6 +1140,71 @@ Exits nonzero if any check fails. A step reported as "not configured" is
 informational only, exactly like `sync` itself reporting a step
 "skipped" — a partially configured deployment isn't a doctor failure.
 
+### 22. Feed the core from `@adc/graph`
+
+```ts
+import { createAdcGraphSink } from './src/adapters/adc-graph-sink.js';
+
+const graphSink = createAdcGraphSink({ pool });
+// pass graphSink into @adc/graph's own mint server config in place of
+// its NDJSON file sink — see "What's out of scope here" below.
+```
+
+`@adc/graph` produces correctly-shaped capability-lifecycle events for
+six actions (mint / attenuate / seal / verify-allow / verify-deny /
+revoke, for its own "ADC block" objects) and can hand them off two ways:
+an in-memory sink (tests only) or an NDJSON file/stream sink — a real,
+tailable audit log, but still just text on disk, nothing queryable,
+nothing joined to the rest of this project's graph. `createAdcGraphSink()`
+is the third sink: an actual database row, via the same `ensurePrincipal`/
+`ensureResource`/`EventBatcher` discipline every other adapter here
+follows.
+
+**Read this before trusting the file byte-for-byte**:
+`src/adapters/adc-graph-sink.ts` was written from a prose description of
+`@adc/graph`'s own reference adapter, not copied from that package's real
+source — this repo has no dependency on, or visibility into, `@adc/graph`
+itself. `AdcGraphEvent`'s exact fields and `AdcGraphSink.write()`'s
+name/signature are this file's own best reconstruction, not a verified
+match — confirm both against the real package before relying on this for
+anything that matters, and see that file's own header for exactly what's
+a guess versus what's grounded in this repo's own verified rules.
+
+**What IS grounded, regardless of the exact event shape — the on-behalf-of
+trap, closed and proven, not just asserted**: every ADC block gets its
+own one-off resource row, so without a fix, `checkOnBehalfOfEscalation`
+([Usage 10](#10-check-policy-violations)) would flag every single
+`onBehalfOf`-carrying `allow` event this sink ever writes — that check's
+own query is "does the on-behalf-of human hold ANY live grant on this
+exact resource at all," and a one-off resource means the answer is always
+no unless something writes one. Before writing such an event, this sink
+first upserts a `grant_edge` row (`can_use`, `source: 'adc'`) for the
+on-behalf-of human on that exact block — `test/adc-graph-sink.spec.ts`
+runs the real `on-behalf-of-escalation` policy rule against an event this
+sink actually wrote and asserts zero violations, and separately proves
+the same shape of event written WITHOUT this fix really is flagged, so
+the first assertion is proven to be testing something real rather than a
+check that would pass either way. A `revoke` event then revokes every
+live grant this sink ever wrote on that block, so a revoked block stops
+reading as "someone still has access" the moment it's revoked — this
+sink's own revocation model (CONTRIBUTING.md asks every adapter to state
+one) is exact and event-driven, never a full-inventory or curated-list
+diff: a `revoke` event names exactly one block, and only that block's own
+grants are ever touched.
+
+Registers `adc_block: ['can_use']` in `src/resource-vocabulary.ts` (an
+underscore, not a hyphen — `rba/principal-graph.authz`'s own namespace
+names are plain identifiers, and that file's cross-check test's regex
+never matches a hyphen) and the matching `namespace adc_block` in
+`rba/principal-graph.authz` itself, so a live grant of this relation
+exports to RBA the same as any other adapter's.
+
+**What's out of scope here, and has to happen in `@adc/graph`'s own repo,
+not this one**: actually wiring `graphSink: createAdcGraphSink({ pool })`
+into that package's mint server config, in place of whatever reads
+`MINT_GRAPH_EVENTS_PATH` today — there's no visibility into that repo's
+own entrypoint from here to write or verify that plumbing.
+
 ## Data model
 
 Five tables (`schema/001_core.sql`):
@@ -1255,6 +1333,7 @@ src/
     workspace-groups.ts           feeds grant_edge from a Google Group's resolved membership
     postgres-roles.ts               feeds grant_edge from a target database's own tier-role membership
     postgres-usage.ts                feeds event from pg_stat_activity — a usage adapter, not a grant one
+    adc-graph-sink.ts                 feeds event (and a can_use grant, closing the on-behalf-of trap) from @adc/graph's own capability-lifecycle events
   views/
     report.ts         buildReport()/formatReport() — the four-section report
   exporters/

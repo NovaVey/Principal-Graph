@@ -38,4 +38,12 @@ export const RESOURCE_KIND_RELATIONS: Readonly<Record<string, readonly string[]>
   db: ['read', 'write', 'admin'],
   /** src/adapters/workspace-groups.ts */
   group: ['owner', 'manager', 'member'],
+  /**
+   * src/adapters/adc-graph-sink.ts. Underscore, not the hyphen "ADC
+   * block" might suggest — rba/principal-graph.authz's own namespace
+   * names are plain identifiers (test/resource-vocabulary.spec.ts's own
+   * regex is `\w+`, which never matches a hyphen), so a hyphenated kind
+   * here could never have a matching namespace to cross-check against.
+   */
+  adc_block: ['can_use'],
 };

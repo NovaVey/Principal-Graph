@@ -95,3 +95,14 @@ namespace db {
 
   permission any_access = read | write | admin
 }
+
+// Produced by src/adapters/adc-graph-sink.ts. One `can_use` grant per
+// ADC capability block — written for the on-behalf-of human a block's
+// own mint/attenuate/seal/verify event names, closing the trap that
+// file's own header describes (a one-off resource per block means the
+// on-behalf-of human has no other way to hold a live grant there).
+namespace adc_block {
+  relation can_use: principal
+
+  permission any_access = can_use
+}

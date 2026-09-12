@@ -43,6 +43,28 @@
  * gets a plain Postgres foreign-key violation, not a friendly error —
  * identity resolution is the caller's job, matching the existing division
  * of labor every adapter already follows.
+ *
+ * Three things are enforced, not just documented, because a policy built
+ * on top of this table (src/policies.ts's `delegation-depth` and
+ * `over-broad-root-token`) is only as trustworthy as the data it reads —
+ * see each function's own doc comment for why:
+ *   - recordDelegationMint() requires `mintedBy` to hold a live grant on
+ *     `resourceId` already (a mint records real access, never a
+ *     fabricated bookkeeping entry).
+ *   - recordDelegationMint() refuses to mint a resource that already has
+ *     a chain (closes the "re-mint instead of hop" depth-cap bypass — the
+ *     one hole this table's own precursor design was found to have).
+ *   - recordDelegationHop() refuses a hop to yourself (a self-hop moves
+ *     nothing, and would otherwise let a chain manufacture length, or
+ *     dodge over-broad-root-token's "has this actually reached someone
+ *     else" test, for free).
+ * What neither function can enforce: nothing in this codebase requires a
+ * real capability hand-off to go through these two functions at all — a
+ * caller that mints/hops out-of-band, or never calls this module,
+ * produces access this table simply never learns about. `delegation-depth`/
+ * `over-broad-root-token` are audits over what's recorded here, not a
+ * write-time gate on access itself — stated plainly in their own header
+ * in src/policies.ts, not glossed over.
  */
 
 import type { Pool } from 'pg';
@@ -82,12 +104,55 @@ export interface DelegationMintInput {
  * id). Call this once, the first time a capability is minted — every
  * later hand-off on the same resource goes through recordDelegationHop()
  * instead.
+ *
+ * Two checks are enforced before anything is written, not just
+ * documented as caller responsibilities:
+ *
+ * 1. `mintedBy` must hold a live `grant_edge` row on `resourceId` (any
+ *    relation) right now. A mint records that REAL, standing access is
+ *    being delegated — never a bookkeeping entry with nothing real behind
+ *    it. Without this, a policy reading `delegation_chain_link` (see
+ *    src/policies.ts's `over-broad-root-token`) could be handed a chain
+ *    that never corresponded to any actual grant at all.
+ * 2. `resourceId` must not already have a chain. Minting again on a
+ *    resource that already has one would silently reset that resource's
+ *    observable chain to depth zero while the real, transitive hand-off
+ *    distance from the original mint keeps growing unseen — exactly the
+ *    bypass a delegation-depth policy exists to catch. A capability that
+ *    needs to start over belongs on a new resource id, not a second mint
+ *    on the same one; every later hand-off on an already-minted resource
+ *    must go through recordDelegationHop().
  */
 export async function recordDelegationMint(
   pool: Pool,
   batcher: EventBatcher,
   input: DelegationMintInput,
 ): Promise<StoredEvent> {
+  const preflight = await pool.query<{ has_live_grant: boolean; already_minted: boolean }>(
+    `select
+       exists (
+         select 1 from grant_edge
+          where principal_id = $1 and resource_id = $2 and revoked_at is null
+       ) as has_live_grant,
+       exists (
+         select 1 from delegation_chain_link dl
+          join event e on e.id = dl.event_id
+         where e.resource_id = $2
+       ) as already_minted`,
+    [input.mintedBy, input.resourceId],
+  );
+  const { has_live_grant: hasLiveGrant, already_minted: alreadyMinted } = preflight.rows[0];
+  if (!hasLiveGrant) {
+    throw new Error(
+      `recordDelegationMint: ${input.mintedBy} holds no live grant on resource ${input.resourceId} — a mint must be backed by real, standing access, not a bookkeeping entry with nothing behind it`,
+    );
+  }
+  if (alreadyMinted) {
+    throw new Error(
+      `recordDelegationMint: resource ${input.resourceId} already has a delegation chain — mint it only once; every later hand-off goes through recordDelegationHop()`,
+    );
+  }
+
   const stored = await batcher.append({
     occurredAt: input.occurredAt,
     principalId: input.mintedBy,
@@ -125,7 +190,11 @@ export interface DelegationHopInput {
  * Writes a `delegation_hop` event plus its chain-link row, after
  * confirming `forwardedBy` really is the resource's current holder —
  * this is a real, enforced check, not a caller convention: a principal
- * who never held the capability cannot forward it.
+ * who never held the capability cannot forward it. A hop to yourself is
+ * refused too — it moves nothing, and would otherwise let a principal
+ * manufacture chain length (or dodge an over-broad-root-token comparison
+ * that only counts a resource as genuinely delegated once it's actually
+ * reached someone else) for free.
  *
  * The chain tip is resolved by real insertion order (`event.seq`), never
  * `occurredAt` (caller-supplied, only clamped by convention elsewhere in
@@ -138,6 +207,12 @@ export async function recordDelegationHop(
   batcher: EventBatcher,
   input: DelegationHopInput,
 ): Promise<StoredEvent> {
+  if (input.toPrincipal === input.forwardedBy) {
+    throw new Error(
+      `recordDelegationHop: ${input.forwardedBy} cannot hop the capability on resource ${input.resourceId} to itself`,
+    );
+  }
+
   const tip = await pool.query<{ event_id: string; to_principal_id: string }>(
     `select dl.event_id, dl.to_principal_id
        from delegation_chain_link dl

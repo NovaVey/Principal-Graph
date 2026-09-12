@@ -14,6 +14,8 @@ import { appendEvent } from '../src/log.js';
 import { ensurePrincipal, ensureResource } from '../src/upsert.js';
 import { setResourceCapabilities } from '../src/capabilities.js';
 import { startRun, finishRun } from '../src/run-history.js';
+import { recordDelegationMint, recordDelegationHop } from '../src/delegation-chain.js';
+import { EventBatcher } from '../src/event-batch.js';
 import { pool, resetDatabase } from './helpers.js';
 
 /**
@@ -500,4 +502,344 @@ void test('adapter-freshness: a dry run alone does not count as evidence of fres
   // violation too, same as the test above.
   assert.equal(violations.length, 1);
   assert.ok(violations[0]?.description.includes('mcp-config'));
+});
+
+void test('delegation-depth: no violation on a 1-hop chain within the limit', async () => {
+  const batcher = new EventBatcher(pool);
+  const root = await ensurePrincipal(pool, {
+    kind: 'agent',
+    source: 'manual',
+    externalId: 'dd-root-1',
+  });
+  const agentB = await ensurePrincipal(pool, {
+    kind: 'agent',
+    source: 'manual',
+    externalId: 'dd-agent-b-1',
+  });
+  const resourceId = await ensureResource(pool, {
+    kind: 'tool',
+    source: 'manual',
+    externalId: 'dd-resource-1',
+  });
+  await grant(root, resourceId, 'can_call');
+
+  await recordDelegationMint(pool, batcher, {
+    occurredAt: new Date(),
+    mintedBy: root,
+    initialHolder: root,
+    resourceId,
+  });
+  await recordDelegationHop(pool, batcher, {
+    occurredAt: new Date(),
+    forwardedBy: root,
+    toPrincipal: agentB,
+    resourceId,
+  });
+
+  const violations = await evaluatePolicies(pool, [{ kind: 'delegation-depth', maxDepth: 2 }]);
+  assert.deepEqual(violations, []);
+});
+
+void test('delegation-depth: a violation on a chain deeper than the limit, naming the resource, minter, and current holder', async () => {
+  const batcher = new EventBatcher(pool);
+  const root = await ensurePrincipal(pool, {
+    kind: 'agent',
+    source: 'manual',
+    externalId: 'dd-root-2',
+    displayName: 'DD Root',
+  });
+  const resourceId = await ensureResource(pool, {
+    kind: 'tool',
+    source: 'manual',
+    externalId: 'dd-resource-2',
+    displayName: 'DD Resource',
+  });
+  await grant(root, resourceId, 'can_call');
+
+  let holder = root;
+  await recordDelegationMint(pool, batcher, {
+    occurredAt: new Date(),
+    mintedBy: root,
+    initialHolder: root,
+    resourceId,
+  });
+  let lastHolder: string | null = null;
+  for (const name of ['dd-b', 'dd-c', 'dd-d', 'dd-e']) {
+    const next = await ensurePrincipal(pool, {
+      kind: 'agent',
+      source: 'manual',
+      externalId: name,
+      displayName: name === 'dd-e' ? 'DD Final Holder' : name,
+    });
+    await recordDelegationHop(pool, batcher, {
+      occurredAt: new Date(),
+      forwardedBy: holder,
+      toPrincipal: next,
+      resourceId,
+    });
+    holder = next;
+    lastHolder = next;
+  }
+  assert.ok(lastHolder);
+
+  const violations = await evaluatePolicies(pool, [{ kind: 'delegation-depth', maxDepth: 2 }]);
+  assert.equal(violations.length, 1);
+  assert.equal(violations[0]?.rule.kind, 'delegation-depth');
+  assert.ok(violations[0]?.description.includes('4 hop(s)'));
+  assert.ok(violations[0]?.description.includes('DD Resource'));
+  assert.ok(violations[0]?.description.includes('DD Root'));
+  assert.ok(violations[0]?.description.includes('DD Final Holder'));
+});
+
+void test('delegation-depth: two independent chains (one within the limit, one beyond it) produce exactly one violation, not two', async () => {
+  const batcher = new EventBatcher(pool);
+
+  const shallowRoot = await ensurePrincipal(pool, {
+    kind: 'agent',
+    source: 'manual',
+    externalId: 'dd-shallow-root',
+  });
+  const shallowResource = await ensureResource(pool, {
+    kind: 'tool',
+    source: 'manual',
+    externalId: 'dd-shallow-resource',
+  });
+  await grant(shallowRoot, shallowResource, 'can_call');
+  const shallowB = await ensurePrincipal(pool, {
+    kind: 'agent',
+    source: 'manual',
+    externalId: 'dd-shallow-b',
+  });
+  await recordDelegationMint(pool, batcher, {
+    occurredAt: new Date(),
+    mintedBy: shallowRoot,
+    initialHolder: shallowRoot,
+    resourceId: shallowResource,
+  });
+  await recordDelegationHop(pool, batcher, {
+    occurredAt: new Date(),
+    forwardedBy: shallowRoot,
+    toPrincipal: shallowB,
+    resourceId: shallowResource,
+  });
+
+  const deepRoot = await ensurePrincipal(pool, {
+    kind: 'agent',
+    source: 'manual',
+    externalId: 'dd-deep-root',
+  });
+  const deepResource = await ensureResource(pool, {
+    kind: 'tool',
+    source: 'manual',
+    externalId: 'dd-deep-resource',
+  });
+  await grant(deepRoot, deepResource, 'can_call');
+  let holder = deepRoot;
+  await recordDelegationMint(pool, batcher, {
+    occurredAt: new Date(),
+    mintedBy: deepRoot,
+    initialHolder: deepRoot,
+    resourceId: deepResource,
+  });
+  for (const name of ['dd-deep-b', 'dd-deep-c', 'dd-deep-d']) {
+    const next = await ensurePrincipal(pool, { kind: 'agent', source: 'manual', externalId: name });
+    await recordDelegationHop(pool, batcher, {
+      occurredAt: new Date(),
+      forwardedBy: holder,
+      toPrincipal: next,
+      resourceId: deepResource,
+    });
+    holder = next;
+  }
+
+  const violations = await evaluatePolicies(pool, [{ kind: 'delegation-depth', maxDepth: 2 }]);
+  assert.equal(violations.length, 1, 'the shallow chain must not be conflated with the deep one');
+  assert.ok(violations[0]?.description.includes('dd-deep-resource'));
+});
+
+void test('over-broad-root-token: no violation when owned count is below the floor', async () => {
+  const root = await ensurePrincipal(pool, {
+    kind: 'agent',
+    source: 'manual',
+    externalId: 'obrt-root-1',
+  });
+  const batcher = new EventBatcher(pool);
+  const resourceA = await ensureResource(pool, {
+    kind: 'tool',
+    source: 'manual',
+    externalId: 'obrt-a-1',
+  });
+  const resourceB = await ensureResource(pool, {
+    kind: 'tool',
+    source: 'manual',
+    externalId: 'obrt-b-1',
+  });
+  await grant(root, resourceA, 'can_call');
+  await grant(root, resourceB, 'can_call');
+  const other = await ensurePrincipal(pool, {
+    kind: 'agent',
+    source: 'manual',
+    externalId: 'obrt-other-1',
+  });
+  await recordDelegationMint(pool, batcher, {
+    occurredAt: new Date(),
+    mintedBy: root,
+    initialHolder: root,
+    resourceId: resourceA,
+  });
+  await recordDelegationHop(pool, batcher, {
+    occurredAt: new Date(),
+    forwardedBy: root,
+    toPrincipal: other,
+    resourceId: resourceA,
+  });
+
+  const violations = await evaluatePolicies(pool, [
+    { kind: 'over-broad-root-token', minOwnedResources: 4, minRatio: 3 },
+  ]);
+  assert.deepEqual(violations, [], 'owned=2 is below the floor, regardless of the ratio');
+});
+
+void test('over-broad-root-token: a violation when a root holds far more grants than it genuinely delegates', async () => {
+  const root = await ensurePrincipal(pool, {
+    kind: 'agent',
+    source: 'manual',
+    externalId: 'obrt-root-2',
+    displayName: 'OBRT Root',
+  });
+  const batcher = new EventBatcher(pool);
+  const resources = await Promise.all(
+    ['obrt-2-a', 'obrt-2-b', 'obrt-2-c', 'obrt-2-d', 'obrt-2-e'].map((id) =>
+      ensureResource(pool, { kind: 'tool', source: 'manual', externalId: id }),
+    ),
+  );
+  for (const r of resources) await grant(root, r, 'can_call');
+
+  // Genuinely delegate exactly one of the five (mint + a real hop to someone else).
+  const other = await ensurePrincipal(pool, {
+    kind: 'agent',
+    source: 'manual',
+    externalId: 'obrt-other-2',
+  });
+  await recordDelegationMint(pool, batcher, {
+    occurredAt: new Date(),
+    mintedBy: root,
+    initialHolder: root,
+    resourceId: resources[0],
+  });
+  await recordDelegationHop(pool, batcher, {
+    occurredAt: new Date(),
+    forwardedBy: root,
+    toPrincipal: other,
+    resourceId: resources[0],
+  });
+
+  const violations = await evaluatePolicies(pool, [
+    { kind: 'over-broad-root-token', minOwnedResources: 4, minRatio: 3 },
+  ]);
+  assert.equal(violations.length, 1);
+  assert.ok(violations[0]?.description.includes('OBRT Root'));
+  assert.ok(violations[0]?.description.includes('5 resource(s)'));
+  assert.ok(violations[0]?.description.includes('genuinely delegated only 1'));
+});
+
+void test('over-broad-root-token: no violation when the ratio is under the limit, despite a high owned count', async () => {
+  const root = await ensurePrincipal(pool, {
+    kind: 'agent',
+    source: 'manual',
+    externalId: 'obrt-root-3',
+  });
+  const batcher = new EventBatcher(pool);
+  const resources = await Promise.all(
+    ['obrt-3-a', 'obrt-3-b', 'obrt-3-c', 'obrt-3-d', 'obrt-3-e', 'obrt-3-f'].map((id) =>
+      ensureResource(pool, { kind: 'tool', source: 'manual', externalId: id }),
+    ),
+  );
+  for (const r of resources) await grant(root, r, 'can_call');
+
+  // Genuinely delegate 3 of the 6.
+  for (let i = 0; i < 3; i++) {
+    const other = await ensurePrincipal(pool, {
+      kind: 'agent',
+      source: 'manual',
+      externalId: `obrt-other-3-${i}`,
+    });
+    await recordDelegationMint(pool, batcher, {
+      occurredAt: new Date(),
+      mintedBy: root,
+      initialHolder: root,
+      resourceId: resources[i],
+    });
+    await recordDelegationHop(pool, batcher, {
+      occurredAt: new Date(),
+      forwardedBy: root,
+      toPrincipal: other,
+      resourceId: resources[i],
+    });
+  }
+
+  const violations = await evaluatePolicies(pool, [
+    { kind: 'over-broad-root-token', minOwnedResources: 4, minRatio: 3 },
+  ]);
+  assert.deepEqual(violations, [], 'owned(6) clears the floor but 6 is not > 3*3=9');
+});
+
+void test('over-broad-root-token: a bare self-mint with no hop does not count as delegated — closes the self-mint gaming a design review found', async () => {
+  const root = await ensurePrincipal(pool, {
+    kind: 'agent',
+    source: 'manual',
+    externalId: 'obrt-root-4',
+    displayName: 'OBRT Gaming Root',
+  });
+  const batcher = new EventBatcher(pool);
+  const resources = await Promise.all(
+    ['obrt-4-a', 'obrt-4-b', 'obrt-4-c', 'obrt-4-d', 'obrt-4-e'].map((id) =>
+      ensureResource(pool, { kind: 'tool', source: 'manual', externalId: id }),
+    ),
+  );
+  for (const r of resources) await grant(root, r, 'can_call');
+
+  // Mint, self-targeted, on every resource this root owns — real access,
+  // but never actually handed to anyone. Against the earlier design, this
+  // exact shape inflated delegated_resource_count to match
+  // owned_resource_count and permanently silenced this check at a ~1.0x
+  // ratio. It must not do that here.
+  for (const r of resources) {
+    await recordDelegationMint(pool, batcher, {
+      occurredAt: new Date(),
+      mintedBy: root,
+      initialHolder: root,
+      resourceId: r,
+    });
+  }
+
+  const violations = await evaluatePolicies(pool, [
+    { kind: 'over-broad-root-token', minOwnedResources: 4, minRatio: 3 },
+  ]);
+  assert.equal(violations.length, 1, 'a bare self-mint must not silence this check');
+  assert.ok(violations[0]?.description.includes('OBRT Gaming Root'));
+  assert.ok(violations[0]?.description.includes('genuinely delegated only 0'));
+});
+
+void test('over-broad-root-token: a principal who holds many grants but never minted anything is never returned', async () => {
+  const neverMinted = await ensurePrincipal(pool, {
+    kind: 'agent',
+    source: 'manual',
+    externalId: 'obrt-never-minted',
+  });
+  const resources = await Promise.all(
+    ['obrt-nm-a', 'obrt-nm-b', 'obrt-nm-c', 'obrt-nm-d', 'obrt-nm-e'].map((id) =>
+      ensureResource(pool, { kind: 'tool', source: 'manual', externalId: id }),
+    ),
+  );
+  for (const r of resources) await grant(neverMinted, r, 'can_call');
+
+  const violations = await evaluatePolicies(pool, [
+    { kind: 'over-broad-root-token', minOwnedResources: 4, minRatio: 3 },
+  ]);
+  assert.deepEqual(
+    violations,
+    [],
+    'this rule only ever evaluates actual chain roots, not every heavily-provisioned principal',
+  );
 });

@@ -528,8 +528,8 @@ Three rules ship by default:
   BEHALF OF" report section for the same relationship, described rather
   than judged.
 
-Two more exist but are deliberately *not* in the default set, for two
-different reasons:
+Four more exist but are deliberately *not* in the default set, for
+several different reasons:
 
 - **`adapter-freshness`** (`{ adapter, maxAgeHours }`) needs a specific
   adapter name and a maximum age in hours, and guessing either (which
@@ -561,6 +561,40 @@ different reasons:
   `[...POLICIES, { kind: 'chain-intact' }]` yourself if you want it
   folded into one report anyway; it's cheap enough now to run on every
   tick.
+- **`delegation-depth`** (`{ maxDepth }`) flags a delegation chain
+  ([Usage 23](#23-record-delegation-mints-and-hops-as-first-class-chain-events))
+  more than `maxDepth` hops deep from its mint. Opt-in for the same reason
+  as `adapter-freshness`: how many hops are legitimate depends entirely on
+  this deployment's own multi-agent orchestration shape, not something to
+  guess a default for.
+- **`over-broad-root-token`** (`{ minOwnedResources, minRatio }`) flags a
+  delegation-chain root — a principal that's ever minted one — whose live
+  `grant_edge` footprint is more than `minRatio`× broader than what it's
+  genuinely delegated onward (a bare, un-hopped mint doesn't count — see
+  below). This is the "invisible blast radius"
+  `on-behalf-of-escalation` can't see: that check only fires reactively,
+  after a specific on-behalf-of `allow` event names one resource; this one
+  is structural, firing on standing grant breadth alone. `minOwnedResources`
+  is a floor below which the ratio is noise (a root owning two resources
+  and having delegated one already looks "2x," which means nothing).
+
+  Both read `delegation_chain_link`
+  ([Usage 23](#23-record-delegation-mints-and-hops-as-first-class-chain-events))
+  — a real hand-off that happens without ever calling
+  `recordDelegationMint()`/`recordDelegationHop()` is invisible to either,
+  the same way `on-behalf-of-escalation` only ever sees what
+  `event.on_behalf_of` was actually set to. `recordDelegationMint()`
+  itself now enforces two things an earlier design pass found missing: it
+  refuses to mint without the minting principal already holding a real,
+  live grant on that resource (a mint records genuine access, never a
+  fabricated bookkeeping entry), and it refuses a second mint on a
+  resource that already has a chain — closing the exact bypass that
+  design pass found (resetting `delegation-depth`'s counter by re-minting
+  instead of hopping). `recordDelegationHop()` refuses a hop to yourself,
+  closing the matching trick against `over-broad-root-token` (a bare
+  self-mint used to inflate "delegated" to match "owned" for free — a
+  resource only counts as genuinely delegated once its chain has actually
+  reached someone else).
 
 Same shape as `TOOL_CAPABILITIES` — a plain, hand-written TypeScript
 array, not a parsed text format. `Relationship-Based-Authorization`
@@ -1146,10 +1180,31 @@ holder at a time) is enforced at the database level: `delegation_chain_link`'s
 the same resource can't silently fork it — the loser's insert fails
 outright instead.
 
+Three more checks close gaps a first design pass at the
+[policy checks built on top of this](#10-check-policy-violations) was
+found to have — enforced, not just documented:
+
+- **`recordDelegationMint()` requires `mintedBy` to already hold a live
+  grant on `resourceId`.** A mint records that real, standing access is
+  being delegated — never a bookkeeping entry with nothing behind it.
+- **`recordDelegationMint()` refuses to mint a resource that already has
+  a chain.** Minting again would silently reset that resource's
+  observable chain to depth zero while the real, transitive hand-off
+  distance kept growing unseen — the exact bypass `delegation-depth`
+  ([Usage 10](#10-check-policy-violations)) exists to catch. Every later
+  hand-off on an already-minted resource goes through
+  `recordDelegationHop()`.
+- **`recordDelegationHop()` refuses a hop to yourself.** A self-hop moves
+  nothing, and would otherwise let a chain manufacture length, or dodge
+  `over-broad-root-token`'s "has this actually reached someone else"
+  test, for free.
+
 Neither function upserts identity itself — `ensurePrincipal`/
 `ensureResource` first, same division of labor every adapter already
-follows. Nothing in this repo calls these two functions yet; this is the
-primitive itself, ready for the adapter (or policy check) that needs it.
+follows. Nothing in this repo calls these two functions from an adapter
+yet; [Usage 10](#10-check-policy-violations)'s `delegation-depth`/
+`over-broad-root-token` policy checks are the first real consumers of the
+table they write to.
 
 ## Data model
 

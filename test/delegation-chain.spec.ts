@@ -3,8 +3,11 @@
  * recordDelegationMint()/recordDelegationHop() write the event row and a
  * matching delegation_chain_link row that ties a delegation hand-off back
  * to its mint/prior hop — see that module's own header for why this
- * exists (event.on_behalf_of is one hop, with no lineage anywhere) and
- * for the non-atomicity/concurrency tradeoffs it accepts.
+ * exists (event.on_behalf_of is one hop, with no lineage anywhere), for
+ * the non-atomicity/concurrency tradeoffs it accepts, and for the three
+ * checks it enforces rather than merely documents (a mint requires real,
+ * standing access; a resource can only be minted once; a hop can't go to
+ * yourself) — each with its own test below.
  */
 
 import { before, beforeEach, after, test } from 'node:test';
@@ -34,6 +37,19 @@ async function resource(externalId: string): Promise<string> {
   return ensureResource(pool, { kind: 'tool', source: 'manual', externalId });
 }
 
+/** A live grant_edge row — recordDelegationMint() now requires one for mintedBy on resourceId before it will write anything. */
+async function grant(
+  principalId: string,
+  resourceId: string,
+  relation = 'can_call',
+): Promise<void> {
+  await pool.query(
+    `insert into grant_edge (principal_id, resource_id, relation, source, observed_at, first_observed_at, changed_at)
+     values ($1, $2, $3, 'manual', now(), now(), now())`,
+    [principalId, resourceId, relation],
+  );
+}
+
 async function chainLink(eventId: string): Promise<{
   parent_event_id: string | null;
   root_event_id: string;
@@ -54,6 +70,7 @@ void test('recordDelegationMint writes a delegation_mint event and its own root 
   const batcher = new EventBatcher(pool);
   const root = await principal('root');
   const resourceId = await resource('block-1');
+  await grant(root, resourceId);
 
   const stored = await recordDelegationMint(pool, batcher, {
     occurredAt: new Date(),
@@ -74,10 +91,80 @@ void test('recordDelegationMint writes a delegation_mint event and its own root 
   assert.equal(link?.to_principal_id, root);
 });
 
+void test('recordDelegationMint throws when mintedBy holds no live grant on the resource — a mint must be backed by real access', async () => {
+  const batcher = new EventBatcher(pool);
+  const noAccess = await principal('no-access');
+  const resourceId = await resource('block-no-access');
+
+  await assert.rejects(
+    () =>
+      recordDelegationMint(pool, batcher, {
+        occurredAt: new Date(),
+        mintedBy: noAccess,
+        initialHolder: noAccess,
+        resourceId,
+      }),
+    /holds no live grant on resource/,
+  );
+
+  const { rows } = await pool.query<{ count: string }>('select count(*)::text as count from event');
+  assert.equal(rows[0]?.count, '0', 'a rejected mint must never write an event row');
+});
+
+void test("recordDelegationMint throws when mintedBy's grant on the resource has been revoked", async () => {
+  const batcher = new EventBatcher(pool);
+  const revoked = await principal('revoked-grant');
+  const resourceId = await resource('block-revoked-grant');
+  await grant(revoked, resourceId);
+  await pool.query('update grant_edge set revoked_at = now() where principal_id = $1', [revoked]);
+
+  await assert.rejects(
+    () =>
+      recordDelegationMint(pool, batcher, {
+        occurredAt: new Date(),
+        mintedBy: revoked,
+        initialHolder: revoked,
+        resourceId,
+      }),
+    /holds no live grant on resource/,
+  );
+});
+
+void test('recordDelegationMint refuses to mint a resource that already has a chain — closes the re-mint depth-cap bypass', async () => {
+  const batcher = new EventBatcher(pool);
+  const root = await principal('remint-root');
+  const resourceId = await resource('block-remint');
+  await grant(root, resourceId);
+
+  await recordDelegationMint(pool, batcher, {
+    occurredAt: new Date(),
+    mintedBy: root,
+    initialHolder: root,
+    resourceId,
+  });
+
+  // Minting again on the SAME resource — even by the same, genuinely
+  // access-holding principal — must be refused: without this, a
+  // principal at a depth-cap policy's limit could reset the observable
+  // chain to depth zero by re-minting instead of hopping, while the real
+  // transitive hand-off distance kept growing unseen.
+  await assert.rejects(
+    () =>
+      recordDelegationMint(pool, batcher, {
+        occurredAt: new Date(),
+        mintedBy: root,
+        initialHolder: root,
+        resourceId,
+      }),
+    /already has a delegation chain/,
+  );
+});
+
 void test('a 4-hop chain keeps one root_event_id throughout, and parent_event_id walks it back in exact reverse order', async () => {
   const batcher = new EventBatcher(pool);
   const resourceId = await resource('block-chain');
   const [a, b, c, d, e] = await Promise.all(['a', 'b', 'c', 'd', 'e'].map((id) => principal(id)));
+  await grant(a, resourceId);
 
   const mint = await recordDelegationMint(pool, batcher, {
     occurredAt: new Date(),
@@ -134,6 +221,7 @@ void test('recordDelegationHop throws when forwardedBy is not the resource curre
   const resourceId = await resource('block-wrong-holder');
   const root = await principal('root-2');
   const impostor = await principal('impostor');
+  await grant(root, resourceId);
 
   await recordDelegationMint(pool, batcher, {
     occurredAt: new Date(),
@@ -172,12 +260,38 @@ void test('recordDelegationHop throws when the resource was never minted at all'
   );
 });
 
+void test('recordDelegationHop throws on a hop to yourself — moves nothing, and would otherwise let a chain manufacture length for free', async () => {
+  const batcher = new EventBatcher(pool);
+  const resourceId = await resource('block-self-hop');
+  const root = await principal('self-hop-root');
+  await grant(root, resourceId);
+
+  await recordDelegationMint(pool, batcher, {
+    occurredAt: new Date(),
+    mintedBy: root,
+    initialHolder: root,
+    resourceId,
+  });
+
+  await assert.rejects(
+    () =>
+      recordDelegationHop(pool, batcher, {
+        occurredAt: new Date(),
+        forwardedBy: root,
+        toPrincipal: root,
+        resourceId,
+      }),
+    /cannot hop the capability .* to itself/,
+  );
+});
+
 void test('two concurrent hops on the same resource: exactly one succeeds, the other rejects on the chain race guard', async () => {
   const batcher = new EventBatcher(pool);
   const resourceId = await resource('block-race');
   const root = await principal('race-root');
   const winner = await principal('race-winner');
   const loser = await principal('race-loser');
+  await grant(root, resourceId);
 
   await recordDelegationMint(pool, batcher, {
     occurredAt: new Date(),
@@ -212,6 +326,7 @@ void test('a chain built through recordDelegationMint/Hop keeps the hash chain i
   const resourceId = await resource('block-chain-intact');
   const root = await principal('chain-intact-root');
   const b = await principal('chain-intact-b');
+  await grant(root, resourceId);
 
   await recordDelegationMint(pool, batcher, {
     occurredAt: new Date(),

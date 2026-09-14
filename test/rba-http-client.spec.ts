@@ -10,7 +10,7 @@
  * commits this repo to).
  */
 
-import { before, after, test } from 'node:test';
+import { beforeAll, afterAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 
 import { createHttpRbaClient } from '../src/exporters/rba.js';
@@ -30,8 +30,8 @@ function urlOf(input: string | URL | Request): string {
   return input instanceof URL ? input.href : input.url;
 }
 
-before(() => {});
-after(() => {
+beforeAll(() => {});
+afterAll(() => {
   globalThis.fetch = REAL_FETCH;
 });
 

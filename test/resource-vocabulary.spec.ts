@@ -14,7 +14,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { test } from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
 
 import { RESOURCE_KIND_RELATIONS } from '../src/resource-vocabulary.js';

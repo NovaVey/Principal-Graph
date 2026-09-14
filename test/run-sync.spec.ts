@@ -8,7 +8,7 @@
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { test } from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
 
 import { SYNC_STEPS, isConfigured, missingEnv } from '../scripts/run-sync.js';

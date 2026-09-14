@@ -4,16 +4,16 @@
  * network call, same principle as the GitHub adapter's fake fetcher.
  */
 
-import { before, beforeEach, after, test } from 'node:test';
+import { beforeAll, beforeEach, afterAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 
 import { runRbaExport, type RbaClient, type RbaTuple } from '../src/exporters/rba.js';
 import { ensurePrincipal, ensureResource } from '../src/upsert.js';
 import { pool, resetDatabase } from './helpers.js';
 
-before(resetDatabase);
+beforeAll(resetDatabase);
 beforeEach(resetDatabase);
-after(async () => {
+afterAll(async () => {
   await pool.end();
 });
 

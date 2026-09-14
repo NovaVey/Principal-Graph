@@ -85,16 +85,17 @@ non-ok error path — uncovered. Close that gap by stubbing
 `test/rba-http-client.spec.ts`) rather than adding an HTTP-mocking
 dependency — the adapters already use bare `fetch`, so this is the same
 shape of test double, not a new one. Save and restore the real
-`globalThis.fetch` in `before`/`after`.
+`globalThis.fetch` in `beforeAll`/`afterAll`.
 
-Run `npm run test:coverage` for a coverage report (Node's own
-`--experimental-test-coverage`, no new dependency) when you want to see
-what a new test actually exercises.
+Run `npm run test:coverage` for a coverage report (vitest's own
+`@vitest/coverage-v8`) when you want to see what a new test actually
+exercises.
 
 ## Opening a PR
 
-CI (`.github/workflows/ci.yml`) runs the same `verify` sequence across
-Node 20/22/24 against a real `postgres:16` service container, plus lint,
+CI (`.github/workflows/ci.yml`) runs the same `verify` sequence — via
+[NovaVey/.github's shared `node-verify.yml`](https://github.com/NovaVey/.github/blob/main/.github/workflows/node-verify.yml)
+— across Node 24/26 against a real `postgres:16` container, plus lint,
 a secret scan, and a real Docker build + smoke test of the shipped
 `Dockerfile`/`docker-compose.yml`. All of it needs to be green — see
 README's [Development](README.md#development) section for exactly what

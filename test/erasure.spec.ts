@@ -8,7 +8,7 @@
  * clean as before the erasure.
  */
 
-import { before, beforeEach, after, test } from 'node:test';
+import { beforeAll, beforeEach, afterAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 
 import { erasePrincipalIdentity, findPrincipalId, PrincipalNotFoundError } from '../src/erasure.js';
@@ -16,9 +16,9 @@ import { appendEvent, verifyChain } from '../src/log.js';
 import { ensurePrincipal, ensureResource } from '../src/upsert.js';
 import { pool, resetDatabase } from './helpers.js';
 
-before(resetDatabase);
+beforeAll(resetDatabase);
 beforeEach(resetDatabase);
-after(async () => {
+afterAll(async () => {
   await pool.end();
 });
 

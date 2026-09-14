@@ -6,67 +6,51 @@ on:
   pull_request:
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: devpass
-          POSTGRES_DB: principalgraph
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-    strategy:
-      fail-fast: false
-      matrix:
-        # Lower bound (package.json engines.node), the previous LTS, and
-        # current — catches a regression against the floor we actually
-        # advertise, not just whatever happens to be newest.
-        node-version: [20, 22, 24]
-    env:
-      DATABASE_URL: postgresql://postgres:devpass@localhost:5432/principalgraph
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: ${{ matrix.node-version }}
-          cache: npm
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm run build
-      # Also exercises scripts/run-migrations.ts itself against a genuinely
-      # fresh database on every run — real coverage of the bootstrap path,
-      # not just a convenience over the three `psql -f` calls this replaced.
-      - name: Load schema
-        run: npm run migrate
-      - run: npm test
-
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npm run lint
-      - run: npm run format:check
+  # Replaces the former separate test/lint jobs — both folded into the
+  # shared NovaVey/.github reusable workflow's own single `npm run verify`
+  # (typecheck && build && test && lint && format:check), which this repo
+  # already had as one script. Matches Relationship-Based-Authorization's
+  # own adoption of this workflow (its ci.yml's D-189 comment) and
+  # Taint-Tracked-Tool-Broker's own most recent migration to it.
+  #
+  # `node-versions` left at the reusable workflow's own default (["24",
+  # "26"]) rather than pinned — this is the CI matrix change that would
+  # otherwise have meant bumping actions/checkout and actions/setup-node
+  # ourselves: those pins now live inside node-verify.yml (currently @v5),
+  # not here, so this repo's own already-newer @v7 pins on the jobs below
+  # are left alone rather than force-downgraded to match.
+  #
+  # `pre-verify` stands up the same real `postgres:16` this job's own
+  # `services:` block used to (npm test needs a live DATABASE_URL — see
+  # CONTRIBUTING.md's "don't mock pg in a new test") — node-verify.yml's
+  # own job has no `services:` hook to add one to, so this starts the
+  # container by hand, waits for it, and loads the schema (`npm run
+  # migrate`, itself runnable via tsx straight off source — no build
+  # required first), the same sequence the jobs this replaces ran as
+  # separate steps. `DATABASE_URL` is written to $GITHUB_ENV so it's also
+  # set for the later `Verify` step in this same job, not just this one.
+  verify:
+    uses: NovaVey/.github/.github/workflows/node-verify.yml@main
+    with:
+      pre-verify: |
+        docker run -d --name pg-ci -p 5432:5432 \
+          -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=devpass -e POSTGRES_DB=principalgraph \
+          postgres:16
+        for i in $(seq 1 30); do
+          docker exec pg-ci pg_isready -U postgres && break
+          sleep 1
+        done
+        echo "DATABASE_URL=postgresql://postgres:devpass@localhost:5432/principalgraph" >> "$GITHUB_ENV"
+        DATABASE_URL="postgresql://postgres:devpass@localhost:5432/principalgraph" npm run migrate
 
   docker:
     # Builds the real Dockerfile/docker-compose.yml this repo ships (see
     # README's Quick Start) and smoke-tests the actual compiled image —
-    # not just that `npm run build` succeeds (the `test` job above
+    # not just that `npm run build` succeeds (the `verify` job above
     # already proves that), but that the image built FROM that output
     # actually serves the report and runs `npm run sync`'s own
     # equivalent. Runner-provided Docker (unlike some sandboxed dev
-    # environments) has ordinary internet access to pull node:20-alpine
+    # environments) has ordinary internet access to pull node:24-alpine
     # and postgres:16, so this is real, not simulated.
     runs-on: ubuntu-latest
     env:

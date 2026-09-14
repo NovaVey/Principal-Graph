@@ -6,7 +6,7 @@
  * status/content-type, not re-proving the report's own logic.
  */
 
-import { before, beforeEach, after, test } from 'node:test';
+import { beforeAll, beforeEach, afterAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
@@ -18,7 +18,7 @@ const API_KEY = 'test-api-key';
 let server: Server;
 let baseUrl: string;
 
-before(async () => {
+beforeAll(async () => {
   await resetDatabase();
   server = createServer({ pool, apiKey: API_KEY });
   await new Promise<void>((resolve) => server.listen(0, resolve));
@@ -26,7 +26,7 @@ before(async () => {
   baseUrl = `http://127.0.0.1:${port}`;
 });
 beforeEach(resetDatabase);
-after(async () => {
+afterAll(async () => {
   await new Promise<void>((resolve) => server.close(() => resolve()));
   await pool.end();
 });

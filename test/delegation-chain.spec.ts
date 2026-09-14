@@ -10,7 +10,7 @@
  * yourself) — each with its own test below.
  */
 
-import { before, beforeEach, after, test } from 'node:test';
+import { beforeAll, beforeEach, afterAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 
 import {
@@ -23,9 +23,9 @@ import { verifyChain } from '../src/log.js';
 import { ensurePrincipal, ensureResource } from '../src/upsert.js';
 import { pool, resetDatabase } from './helpers.js';
 
-before(resetDatabase);
+beforeAll(resetDatabase);
 beforeEach(resetDatabase);
-after(async () => {
+afterAll(async () => {
   await pool.end();
 });
 

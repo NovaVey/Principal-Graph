@@ -1,0 +1,29 @@
+{
+  // A second build pass, run after tsconfig.build.json's own — that one
+  // (rootDir: src) gives package.json's "main" a flat dist/index.js, but
+  // Dockerfile/docker-compose.yml need scripts/*.ts compiled too (the
+  // image's own CMD and every `docker compose run --rm <tool>` command is
+  // `node dist/scripts/run-*.js`, and this repo — unlike its siblings —
+  // keeps its CLI entry points in a top-level scripts/, not inside src/).
+  //
+  // Deliberately no rootDir override here: scripts/*.ts imports src/*.ts
+  // by relative path (`../src/db.js`), and TypeScript preserves that
+  // import specifier verbatim in the compiled output — so
+  // dist/scripts/*.js's own `../src/db.js` import only resolves at
+  // runtime if a dist/src/*.js genuinely exists at that path. Letting tsc
+  // infer the common root across src/**/*.ts + scripts/**/*.ts (the repo
+  // root, since they're siblings) reproduces exactly that dist/src/ +
+  // dist/scripts/ layout — the same structure this project's build
+  // produced before tsconfig.build.json's rootDir fix existed, kept here
+  // on purpose because Dockerfile's COPY steps and docker-compose.yml's
+  // `command:`s already depend on it. This does re-compile src/ a second
+  // time (once flat via tsconfig.build.json, once nested here) — a little
+  // redundant build work, never a correctness issue, since both passes
+  // compile the identical source.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "dist"
+  },
+  "include": ["src/**/*.ts", "scripts/**/*.ts"],
+  "exclude": ["dist", "node_modules", "test"]
+}

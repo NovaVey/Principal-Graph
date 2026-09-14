@@ -1,0 +1,22 @@
+{
+  // Separate from tsconfig.json (used for `typecheck`, and deliberately
+  // covers test/**/*.ts and scripts/**/*.ts too so they get full
+  // type-checking) — this one is for `build` specifically, and only ever
+  // emits src/. Without an explicit rootDir, tsc infers the common root
+  // across every *included* file; once test/**/*.ts and scripts/**/*.ts
+  // are in the mix that common root becomes the repo root itself, so
+  // output lands at dist/src/... instead of dist/... — and package.json's
+  // own "main": "dist/index.js" points at nothing. Same fix
+  // Relationship-Based-Authorization's own tsconfig.build.json already
+  // applies for the identical reason (see that file's own comment).
+  // scripts/**/*.ts is compiled separately, by tsconfig.scripts.json (see
+  // its own comment) — Dockerfile/docker-compose.yml need it too, nested
+  // under dist/scripts/ the way it already was before this file existed.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["dist", "node_modules", "test", "scripts"]
+}

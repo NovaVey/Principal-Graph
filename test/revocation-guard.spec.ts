@@ -5,7 +5,7 @@
  * Postgres in each of their own spec files instead.
  */
 
-import { test } from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
 
 import { checkBlastRadius, BlastRadiusExceededError } from '../src/revocation-guard.js';

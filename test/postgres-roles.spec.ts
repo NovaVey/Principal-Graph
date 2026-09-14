@@ -9,7 +9,7 @@
  * (which only truncates tables, not role state).
  */
 
-import { before, beforeEach, after, test } from 'node:test';
+import { beforeAll, beforeEach, afterAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 
 import {
@@ -320,17 +320,18 @@ async function dropTestRoles(): Promise<void> {
   }
 }
 
-// A single before/beforeEach/after for the whole file, registered here
-// (after dropTestRoles is defined, since before() needs it) rather than
-// split across two before/after pairs — node:test runs same-kind hooks in
-// registration order, so an earlier `after(() => pool.end())` would close
-// the pool before a later `after(dropTestRoles)` ever got to use it.
-before(async () => {
+// A single beforeAll/beforeEach/afterAll for the whole file, registered
+// here (after dropTestRoles is defined, since beforeAll() needs it) rather
+// than split across two beforeAll/afterAll pairs — vitest runs same-kind
+// hooks in registration order, so an earlier `afterAll(() => pool.end())`
+// would close the pool before a later `afterAll(dropTestRoles)` ever got
+// to use it.
+beforeAll(async () => {
   await resetDatabase();
   await dropTestRoles();
 });
 beforeEach(resetDatabase);
-after(async () => {
+afterAll(async () => {
   await dropTestRoles();
   await pool.end();
 });

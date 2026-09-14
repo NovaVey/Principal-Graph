@@ -14,23 +14,27 @@
 # docker-compose.yml (this directory) already does for its own
 # `migrate`/`sync` services.
 
-FROM node:20-alpine AS build
+FROM node:24-alpine AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
-COPY tsconfig.json ./
+COPY tsconfig.json tsconfig.build.json tsconfig.scripts.json ./
 COPY src ./src
 COPY scripts ./scripts
 RUN npm run build
 
-FROM node:20-alpine
+FROM node:24-alpine
 WORKDIR /app
 ENV NODE_ENV=production
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
-# Only src/ and scripts/ own compiled output — `tsc` also compiles
-# test/*.ts (tsconfig.json's own `include`), which a runtime image has
-# no use for.
+# Only the nested dist/src + dist/scripts output tsconfig.scripts.json
+# produces — everything this image's CMD and docker-compose.yml's own
+# `command:`s import (`../src/...` relative to dist/scripts/) lives there.
+# The flat dist/index.js etc. tsconfig.build.json also produces (so
+# package.json's own "main" resolves for an external npm consumer of this
+# package) is a different, non-overlapping part of dist/ that a runtime
+# image never imports — not copied here, nothing in it is reachable.
 COPY --from=build /app/dist/src ./dist/src
 COPY --from=build /app/dist/scripts ./dist/scripts
 # schema/*.sql is read directly at runtime by src/migrate.ts (via

@@ -11,10 +11,11 @@ export default tseslint.config(
     languageOptions: {
       parserOptions: {
         // Auto-discovers the right tsconfig per file (tsconfig.json covers
-        // src/test) and gracefully skips type-aware rules for anything
-        // outside that project (this file itself) rather than erroring.
+        // src/test/scripts) and gracefully skips type-aware rules for
+        // anything outside that project (this file, vitest.config.ts)
+        // rather than erroring.
         projectService: {
-          allowDefaultProject: ['eslint.config.js'],
+          allowDefaultProject: ['eslint.config.js', 'vitest.config.ts'],
         },
         tsconfigRootDir: import.meta.dirname,
       },
@@ -35,10 +36,10 @@ export default tseslint.config(
   {
     files: ['test/**/*.ts'],
     rules: {
-      // node:test's before/after/beforeEach hooks are typed as returning
+      // vitest's beforeAll/afterAll/beforeEach hooks are typed as returning
       // (possibly) a Promise, so a hook with no actual await inside — e.g.
-      // `after(async () => { await pool.end(); })` is fine, but a plain
-      // `before(resetDatabase)` handing a function straight through — is
+      // `afterAll(async () => { await pool.end(); })` is fine, but a plain
+      // `beforeAll(resetDatabase)` handing a function straight through — is
       // conformance to the callback's own shape, not a mistake to flag.
       '@typescript-eslint/require-await': 'off',
     },

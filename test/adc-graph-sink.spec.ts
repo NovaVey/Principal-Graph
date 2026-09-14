@@ -8,7 +8,7 @@
  * `on-behalf-of-escalation` rule enabled, must never be flagged.
  */
 
-import { before, beforeEach, after, test } from 'node:test';
+import { beforeAll, beforeEach, afterAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 
 import { createAdcGraphSink, type AdcGraphEvent } from '../src/adapters/adc-graph-sink.js';
@@ -16,9 +16,9 @@ import { evaluatePolicies } from '../src/policies.js';
 import { verifyChain } from '../src/log.js';
 import { pool, resetDatabase } from './helpers.js';
 
-before(resetDatabase);
+beforeAll(resetDatabase);
 beforeEach(resetDatabase);
-after(async () => {
+afterAll(async () => {
   await pool.end();
 });
 

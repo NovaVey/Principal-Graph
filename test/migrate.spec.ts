@@ -15,7 +15,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { before, beforeEach, after, test } from 'node:test';
+import { beforeAll, beforeEach, afterAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 
@@ -36,7 +36,7 @@ async function cleanup(): Promise<void> {
   await pool.query(`delete from schema_migrations where version in ($1, $2)`, [V1, V2]);
 }
 
-before(async () => {
+beforeAll(async () => {
   // Bootstrap schema_migrations via the function under test itself, off
   // an empty directory (a real, if incidental, exercise of the
   // no-migration-files case) — CI now loads schema/001-003 via this same
@@ -55,7 +55,7 @@ before(async () => {
 // would make the next test's own "simulate a pre-existing table" setup
 // collide with it instead of proving anything.
 beforeEach(cleanup);
-after(async () => {
+afterAll(async () => {
   await cleanup();
   await pool.end();
 });

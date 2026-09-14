@@ -5,7 +5,7 @@
  * adapter_run table.
  */
 
-import { before, beforeEach, after, test } from 'node:test';
+import { beforeAll, beforeEach, afterAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 
 import { startRun, finishRun, latestRuns } from '../src/run-history.js';
@@ -17,9 +17,9 @@ async function resetAdapterRuns(): Promise<void> {
   await pool.query(`truncate table adapter_run cascade`);
 }
 
-before(resetAdapterRuns);
+beforeAll(resetAdapterRuns);
 beforeEach(resetAdapterRuns);
-after(async () => {
+afterAll(async () => {
   await resetAdapterRuns();
   await pool.end();
 });

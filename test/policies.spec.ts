@@ -6,7 +6,7 @@
  * all matter here).
  */
 
-import { before, beforeEach, after, test } from 'node:test';
+import { beforeAll, beforeEach, afterAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 
 import { evaluatePolicies, POLICIES, type PolicyRule } from '../src/policies.js';
@@ -32,9 +32,9 @@ async function resetForPoliciesTests(): Promise<void> {
   await pool.query('truncate table adapter_run cascade');
 }
 
-before(resetForPoliciesTests);
+beforeAll(resetForPoliciesTests);
 beforeEach(resetForPoliciesTests);
-after(async () => {
+afterAll(async () => {
   await pool.query('truncate table adapter_run cascade');
   await pool.end();
 });

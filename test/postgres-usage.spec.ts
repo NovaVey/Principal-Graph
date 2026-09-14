@@ -7,7 +7,7 @@
  * Same reasoning as test/postgres-roles.spec.ts's own split.
  */
 
-import { before, beforeEach, after, test } from 'node:test';
+import { beforeAll, beforeEach, afterAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 import { Client } from 'pg';
 
@@ -203,18 +203,18 @@ async function dropTestRoles(): Promise<void> {
   }
 }
 
-// A single before/beforeEach/after for the whole file (rather than a
-// second before/after pair for the role-based tests) — node:test runs
-// same-kind hooks in registration order, so an earlier `after(() =>
-// pool.end())` would close the pool before a later `after(dropTestRoles)`
+// A single beforeAll/beforeEach/afterAll for the whole file (rather than a
+// second beforeAll/afterAll pair for the role-based tests) — vitest runs
+// same-kind hooks in registration order, so an earlier `afterAll(() =>
+// pool.end())` would close the pool before a later `afterAll(dropTestRoles)`
 // ever got to use it. Same fix as test/postgres-roles.spec.ts's own file
 // header explains.
-before(async () => {
+beforeAll(async () => {
   await resetDatabase();
   await dropTestRoles();
 });
 beforeEach(resetDatabase);
-after(async () => {
+afterAll(async () => {
   await dropTestRoles();
   await pool.end();
 });

@@ -6,7 +6,7 @@
  * after every single step.
  */
 
-import { before, beforeEach, after, test } from 'node:test';
+import { beforeAll, beforeEach, afterAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 
 import { appendEvent } from '../src/log.js';
@@ -22,7 +22,7 @@ import { pool, resetDatabase } from './helpers.js';
 let principalId: string;
 let resourceId: string;
 
-before(async () => {
+beforeAll(async () => {
   await resetDatabase();
   principalId = await ensurePrincipal(pool, { kind: 'agent', source: 'manual', externalId: 'a1' });
   resourceId = await ensureResource(pool, { kind: 'tool', source: 'manual', externalId: 't1' });
@@ -32,7 +32,7 @@ beforeEach(async () => {
   await pool.query('truncate table event, chain_checkpoint restart identity cascade');
 });
 
-after(async () => {
+afterAll(async () => {
   await pool.end();
 });
 

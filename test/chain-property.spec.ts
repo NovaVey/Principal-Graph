@@ -16,7 +16,7 @@
  * rather than "every column happens to matter."
  */
 
-import { before, beforeEach, after, test } from 'node:test';
+import { beforeAll, beforeEach, afterAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 
@@ -29,7 +29,7 @@ let principalB: string;
 let resourceA: string;
 let resourceB: string;
 
-before(async () => {
+beforeAll(async () => {
   await resetDatabase();
   principalA = await ensurePrincipal(pool, {
     kind: 'agent',
@@ -63,7 +63,7 @@ beforeEach(async () => {
   }
 });
 
-after(async () => {
+afterAll(async () => {
   await pool.end();
 });
 

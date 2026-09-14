@@ -8,15 +8,15 @@
  * ever uses these as first-sighting setup scaffolding.
  */
 
-import { before, beforeEach, after, test } from 'node:test';
+import { beforeAll, beforeEach, afterAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 
 import { ensurePrincipal, ensureResource } from '../src/upsert.js';
 import { pool, resetDatabase } from './helpers.js';
 
-before(resetDatabase);
+beforeAll(resetDatabase);
 beforeEach(resetDatabase);
-after(async () => {
+afterAll(async () => {
   await pool.end();
 });
 

@@ -10,7 +10,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { before, beforeEach, after, test } from 'node:test';
+import { beforeAll, beforeEach, afterAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 import { createBroker, type ToolExecutor } from 'taint-tracked-tool-broker';
 
@@ -24,9 +24,9 @@ import { createPrincipalGraphAuditSink } from '../src/adapters/broker-audit-sink
 import { BlastRadiusExceededError } from '../src/revocation-guard.js';
 import { pool, resetDatabase } from './helpers.js';
 
-before(resetDatabase);
+beforeAll(resetDatabase);
 beforeEach(resetDatabase);
-after(async () => {
+afterAll(async () => {
   await pool.end();
 });
 

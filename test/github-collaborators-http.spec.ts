@@ -16,7 +16,7 @@
  * `fetchCollaborators`, so it falls back to the real default.
  */
 
-import { before, beforeEach, after, test } from 'node:test';
+import { beforeAll, beforeEach, afterAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 
 import { runGithubAdapter } from '../src/adapters/github-collaborators.js';
@@ -24,9 +24,9 @@ import { pool, resetDatabase } from './helpers.js';
 
 const REAL_FETCH = globalThis.fetch;
 
-before(resetDatabase);
+beforeAll(resetDatabase);
 beforeEach(resetDatabase);
-after(async () => {
+afterAll(async () => {
   globalThis.fetch = REAL_FETCH;
   await pool.end();
 });

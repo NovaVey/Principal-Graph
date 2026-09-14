@@ -6,7 +6,7 @@
  * instead of duplicated here.
  */
 
-import { before, beforeEach, after, test } from 'node:test';
+import { beforeAll, beforeEach, afterAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 
 import { recordResourceSeen, getResourceLastSeen } from '../src/resource-liveness.js';
@@ -19,9 +19,9 @@ async function resetForThisFile(): Promise<void> {
   await pool.query('truncate table adapter_run cascade');
 }
 
-before(resetForThisFile);
+beforeAll(resetForThisFile);
 beforeEach(resetForThisFile);
-after(async () => {
+afterAll(async () => {
   await pool.query('truncate table adapter_run cascade');
   await pool.end();
 });

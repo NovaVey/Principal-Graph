@@ -11,7 +11,7 @@
  * against `pg_roles` metadata alone.
  */
 
-import { before, after, test } from 'node:test';
+import { beforeAll, afterAll, test } from 'vitest';
 import { Client } from 'pg';
 import assert from 'node:assert/strict';
 
@@ -22,7 +22,7 @@ const PROBE_TABLE = 'principal_graph_report_reader_spec_probe';
 
 let asReader: Client;
 
-before(async () => {
+beforeAll(async () => {
   await resetDatabase();
   await pool.query(`create role ${TEST_LOGIN_ROLE} login password 'spec-password'`);
   await pool.query(`grant principalgraph_report_reader to ${TEST_LOGIN_ROLE}`);
@@ -34,7 +34,7 @@ before(async () => {
   await asReader.connect();
 });
 
-after(async () => {
+afterAll(async () => {
   await asReader.end();
   await pool.query(`drop table if exists ${PROBE_TABLE}`);
   await pool.query(`drop role if exists ${TEST_LOGIN_ROLE}`);

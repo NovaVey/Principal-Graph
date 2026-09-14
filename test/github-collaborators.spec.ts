@@ -6,7 +6,7 @@
  * session.
  */
 
-import { before, beforeEach, after, test } from 'node:test';
+import { beforeAll, beforeEach, afterAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 
 import {
@@ -20,9 +20,9 @@ import { BlastRadiusExceededError } from '../src/revocation-guard.js';
 import { getResourceLastSeen } from '../src/resource-liveness.js';
 import { pool, resetDatabase } from './helpers.js';
 
-before(resetDatabase);
+beforeAll(resetDatabase);
 beforeEach(resetDatabase);
-after(async () => {
+afterAll(async () => {
   await pool.end();
 });
 

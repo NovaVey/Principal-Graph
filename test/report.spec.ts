@@ -4,7 +4,7 @@
  * trifecta_exposure/event, the same views and log Tasks 1-3 already proved.
  */
 
-import { before, beforeEach, after, test } from 'node:test';
+import { beforeAll, beforeEach, afterAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 
 import { buildReport, formatReport } from '../src/views/report.js';
@@ -14,9 +14,9 @@ import { setResourceCapabilities } from '../src/capabilities.js';
 import type { Capability } from '../src/model.js';
 import { pool, resetDatabase } from './helpers.js';
 
-before(resetDatabase);
+beforeAll(resetDatabase);
 beforeEach(resetDatabase);
-after(async () => {
+afterAll(async () => {
   await pool.end();
 });
 

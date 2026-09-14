@@ -7,7 +7,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { before, beforeEach, after, test } from 'node:test';
+import { beforeAll, beforeEach, afterAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 
 import {
@@ -25,9 +25,9 @@ async function resetForThisFile(): Promise<void> {
   await pool.query('truncate table adapter_run cascade');
 }
 
-before(resetForThisFile);
+beforeAll(resetForThisFile);
 beforeEach(resetForThisFile);
-after(async () => {
+afterAll(async () => {
   await pool.query('truncate table adapter_run cascade');
   await pool.end();
 });

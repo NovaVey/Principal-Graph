@@ -72,7 +72,7 @@ Two rules that are expensive to undo, and stay true throughout this repo:
 
 ## Requirements
 
-- Node.js ≥ 20 (tested on 20, 22, 24)
+- Node.js ≥ 24 (tested on 24, 26)
 - PostgreSQL (16 recommended; any recent version with the `pgcrypto`
   extension works)
 
@@ -1338,6 +1338,7 @@ schema/            SQL migrations — 001_core.sql is the shared core
 rba/
   principal-graph.authz  RBA's own namespace schema for this project's grant data
 src/
+  index.ts           public re-export surface — package.json's own "main"
   model.ts          shared types every adapter/view imports from
   resource-vocabulary.ts  the real, current resource.kind/relation list — model.ts's own unions are frozen and already stale
   log.ts             hash-chained append + chain verifier
@@ -1414,11 +1415,12 @@ npm run lint
 npm run format:check
 ```
 
-`npm run test:coverage` runs the same suite under Node's own
-`--experimental-test-coverage` (no new dependency) for a coverage report.
+`npm run test:coverage` runs the same suite under vitest's own
+`@vitest/coverage-v8` for a coverage report.
 
-CI (`.github/workflows/ci.yml`) runs the `verify` sequence on every push/PR,
-across Node 20/22/24, against a `postgres:16` service container, plus a
+CI (`.github/workflows/ci.yml`) runs the `verify` sequence on every push/PR
+via [NovaVey/.github's shared `node-verify.yml`](https://github.com/NovaVey/.github/blob/main/.github/workflows/node-verify.yml),
+across Node 24/26, against a real `postgres:16` container, plus a
 `gitleaks` secret-scan job and a `docker` job that builds the real
 Dockerfile/docker-compose.yml this repo ships and smoke-tests the
 compiled image (migrate, serve, `npm run sync`/`npm run doctor`'s own

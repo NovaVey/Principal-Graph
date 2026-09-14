@@ -6,7 +6,7 @@
  * can actually write when it's supposed to be read-only.
  */
 
-import { before, beforeEach, after, test } from 'node:test';
+import { beforeAll, beforeEach, afterAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -25,12 +25,12 @@ import { pool, resetDatabase } from './helpers.js';
 
 const SCHEMA_DIR = join(process.cwd(), 'schema');
 
-before(resetDatabase);
+beforeAll(resetDatabase);
 beforeEach(async () => {
   await resetDatabase();
   await pool.query('truncate table chain_checkpoint restart identity cascade');
 });
-after(async () => {
+afterAll(async () => {
   await pool.end();
 });
 

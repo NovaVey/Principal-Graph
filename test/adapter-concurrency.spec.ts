@@ -21,7 +21,7 @@
  * queries at once, not just two sequential calls in one test.
  */
 
-import { before, beforeEach, after, test } from 'node:test';
+import { beforeAll, beforeEach, afterAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 
 import {
@@ -40,9 +40,9 @@ const TARGET = { label: 'shared-target-db', connectionString: 'unused-with-a-fak
 // overlap this test exists to race.
 const SHARED_ROLES = ['alice', 'bob', 'carol', 'dave', 'erin'];
 
-before(resetDatabase);
+beforeAll(resetDatabase);
 beforeEach(resetDatabase);
-after(async () => {
+afterAll(async () => {
   await pool.end();
 });
 

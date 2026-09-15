@@ -57,7 +57,7 @@
     "taint-tracked-tool-broker": "git+https://github.com/NovaVey/Taint-Tracked-Tool-Broker.git#ca46d562a66f9eb759d29e6e9641b4562f18e0f4"
   },
   "devDependencies": {
-    "@types/node": "^24.13.4",
+    "@types/node": "^26.5.1",
     "@types/pg": "^8.23.1",
     "@vitest/coverage-v8": "^5.0.0",
     "eslint": "^10.10.0",

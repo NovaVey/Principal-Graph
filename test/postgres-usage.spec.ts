@@ -204,11 +204,11 @@ async function dropTestRoles(): Promise<void> {
 }
 
 // A single beforeAll/beforeEach/afterAll for the whole file (rather than a
-// second beforeAll/afterAll pair for the role-based tests) — vitest runs
-// same-kind hooks in registration order, so an earlier `afterAll(() =>
-// pool.end())` would close the pool before a later `afterAll(dropTestRoles)`
-// ever got to use it. Same fix as test/postgres-roles.spec.ts's own file
-// header explains.
+// second beforeAll/afterAll pair for the role-based tests) — both operations
+// belong in one callback regardless of hook-ordering semantics, since
+// dropTestRoles must run before pool.end() every time. Same reasoning as
+// test/postgres-roles.spec.ts's own file header explains (including that
+// file's correction of vitest's real afterAll/afterEach ordering default).
 beforeAll(async () => {
   await resetDatabase();
   await dropTestRoles();

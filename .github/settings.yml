@@ -16,7 +16,7 @@
 #   {
 #     "required_status_checks": {
 #       "strict": true,
-#       "contexts": ["lint", "test (20)", "test (22)", "test (24)"]
+#       "contexts": ["verify / verify (24)", "verify / verify (26)"]
 #     },
 #     "enforce_admins": true,
 #     "required_pull_request_reviews": null,
@@ -41,13 +41,20 @@ branches:
       # before it can merge, and must be up to date with main when it
       # does (strict: true) — no merging a green PR whose branch predates
       # a base-branch change CI never actually ran against.
+      #
+      # Contexts renamed here to match ci.yml's "verify" job (a `uses:`
+      # call to NovaVey/.github's node-verify.yml, matrixed on Node 24/26)
+      # — the former separate "lint"/"test (20/22/24)" jobs it replaced
+      # will never report again, so their old names can never be
+      # satisfied by any future push. If this file is out of sync with
+      # ci.yml's actual job/matrix names again, every PR will sit
+      # permanently "Expected — Waiting for status to be reported" with
+      # no way to merge, enforce_admins included.
       required_status_checks:
         strict: true
         contexts:
-          - lint
-          - test (20)
-          - test (22)
-          - test (24)
+          - verify / verify (24)
+          - verify / verify (26)
       # No admin bypass: protection that the repo owner can just skip
       # isn't protection.
       enforce_admins: true

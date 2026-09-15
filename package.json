@@ -11,7 +11,7 @@
     "node": ">=24"
   },
   "scripts": {
-    "prepare": "test ! -e node_modules/.bin/tsc || npm run build",
+    "prepare": "test ! -e node_modules/.bin/tsc || test ! -e tsconfig.build.json || npm run build",
     "build": "tsc -p tsconfig.build.json && tsc -p tsconfig.scripts.json",
     "test": "vitest run",
     "test:watch": "vitest",

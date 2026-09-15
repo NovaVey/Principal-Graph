@@ -322,10 +322,13 @@ async function dropTestRoles(): Promise<void> {
 
 // A single beforeAll/beforeEach/afterAll for the whole file, registered
 // here (after dropTestRoles is defined, since beforeAll() needs it) rather
-// than split across two beforeAll/afterAll pairs — vitest runs same-kind
-// hooks in registration order, so an earlier `afterAll(() => pool.end())`
-// would close the pool before a later `afterAll(dropTestRoles)` ever got
-// to use it.
+// than split across two beforeAll/afterAll pairs — both operations belong
+// in one callback regardless of hook-ordering semantics, since dropTestRoles
+// must run before pool.end() every time, not just on this file's first
+// pass. (Vitest's own default actually runs afterAll/afterEach hooks in
+// REVERSE registration order — the opposite of beforeAll/beforeEach — so a
+// two-pair split here would need to rely on that reversal correctly, not
+// registration order, to get the sequencing right.)
 beforeAll(async () => {
   await resetDatabase();
   await dropTestRoles();

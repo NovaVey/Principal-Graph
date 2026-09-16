@@ -1,30 +1,49 @@
 /**
- * Feeds the core from `@adc/graph` — a package that produces correctly
- * shaped capability-lifecycle events (mint / attenuate / seal / verify /
- * revoke, for its own "ADC block" capability objects) and can hand them
- * off two ways today: an in-memory sink (tests only) and an NDJSON
- * file/stream sink (a real, tailable audit log — but still just text on
- * disk, nothing queryable, nothing joined to the rest of this project's
- * graph). This file is the third sink: an actual database row.
+ * Feeds the core from `@adc/graph` — a package (Attenuated-Delegation-Chain,
+ * `packages/adc-graph`) that produces capability-lifecycle events (mint /
+ * attenuate / seal / verify / revoke, for its own "ADC block" capability
+ * objects) and can hand them off two ways today: an in-memory sink (tests
+ * only) and an NDJSON file/stream sink (a real, tailable audit log — but
+ * still just text on disk, nothing queryable, nothing joined to the rest of
+ * this project's graph). This file is the third sink: an actual database row.
  *
- * **Provenance, read before trusting this file byte-for-byte**: this was
- * written from a prose description of `@adc/graph`'s own "worked
- * reference adapter" (its README's own section on integrating with
- * Principal-Graph), not copied from that reference implementation
- * itself — this repo has no dependency on, or visibility into,
- * `@adc/graph`'s actual source. Treat `AdcGraphEvent`/`AdcGraphAction`
- * below as this file's own best-effort reconstruction of that package's
- * real event shape (six actions, an agent, an optional on-behalf-of
- * human, a per-block identity, an outcome only `verify` carries) and
- * `AdcGraphSink.write()`'s name/signature as a guess at what a
- * `graphSink` option on that package's mint server actually expects —
- * confirm both against the real package before wiring this in for real,
- * and adjust the mapping in `handle()` below rather than the identity/
- * grant logic around it, which IS grounded in this repo's own verified
- * rules (see the two comments below marked "verified against" for what
- * that means concretely).
+ * **Verified against the real package source**, not a guess — an earlier
+ * version of this file was written from a prose description alone, before
+ * this repo had read access to Attenuated-Delegation-Chain. It didn't match:
+ * that draft's `AdcGraphEvent` used `blockId`/`agent`/`outcome`/`digest` and
+ * a `write()` method, none of which are what the real package emits. This
+ * version is checked directly against `attenuated-delegation-chain`
+ * (commit `6b4dfda`) — `packages/adc-graph/src/{event,identity,hash,
+ * builders}.ts`, its `sinks/{memory,ndjson}.ts`, `services/mint/src/
+ * graph-sink.ts`, and its own README's "A worked reference adapter" section,
+ * which is this exact file's real upstream template.
  *
- * What's real regardless of the exact event shape:
+ * The real `GraphEvent` (`packages/adc-graph/src/event.ts`) mirrors this
+ * repo's own `EventInput` (`src/model.ts`) field-for-field, with exactly one
+ * structural difference: `principal`/`onBehalfOf`/`resource` carry identity
+ * DESCRIPTORS there, not the resolved uuids `EventInput` expects — that
+ * package has no Postgres access and no import path into this repo, so it
+ * can't produce those uuids itself (see its own README's "Why this package
+ * emits data, not writes rows"). Every other field passes straight through
+ * to `EventBatcher.append()` unchanged.
+ *
+ * One deliberate exception to "straight through unchanged": `resource.kind`.
+ * The real package hardcodes it to the literal `'adc-block'` (a hyphen —
+ * `ADC_BLOCK_RESOURCE_KIND` in its own `identity.ts`, baked into every
+ * `blockResource()`/`undecodableResource()`/`buildRevokeEvent()` call) and
+ * its own README even suggests registering `'adc-block'` verbatim in this
+ * repo's `src/resource-vocabulary.ts`. That suggestion doesn't actually
+ * work here: `rba/principal-graph.authz`'s namespace names are plain
+ * identifiers, and `test/resource-vocabulary.spec.ts`'s own cross-check
+ * regex (`\w+`) can never match a hyphen — so a resource written with
+ * `kind: 'adc-block'` could never have a matching RBA namespace, and this
+ * repo already has `adc_block` (underscore) registered instead. This sink
+ * substitutes its own fixed `resourceKind`/`resourceSource` for whatever
+ * `event.resource` says, rather than trusting those two fields — every
+ * OTHER field on `event.resource` (`externalId`, `displayName`) still
+ * passes through.
+ *
+ * What's real regardless of any of the above:
  *
  * - **Identity discipline.** Every principal/resource is upserted via
  *   `ensurePrincipal`/`ensureResource` (`src/upsert.ts`), never a raw
@@ -42,14 +61,10 @@
  *   curated check-list — this is event-driven and exact. A `revoke`
  *   event names exactly one block; only that block's own `can_use`
  *   grant(s) are revoked, never a snapshot diff against anything else.
- *   There is no "blast radius" risk of the postgres-roles.ts kind here,
- *   because nothing here ever infers absence from a response that came
- *   back empty or truncated — only an explicit `revoke` action revokes
- *   anything.
  * - **The on-behalf-of trap, closed.** Every ADC block gets its own
  *   one-off resource row (one block, one `ensureResource()` call, a
- *   fresh row the first time this sink ever sees that block's id) — so
- *   without this fix, `checkOnBehalfOfEscalation` (`src/policies.ts`)
+ *   fresh row the first time this sink ever sees that block's identity)
+ *   — so without this fix, `checkOnBehalfOfEscalation` (`src/policies.ts`)
  *   would flag EVERY SINGLE `onBehalfOf`-carrying `allow` event this
  *   sink ever writes: that check's own query is "does the on-behalf-of
  *   human hold ANY live grant on this exact resource_id at all", and a
@@ -64,6 +79,16 @@
  *   is looking for. A `revoke` event then revokes every live grant this
  *   sink ever wrote on that block's resource, so a revoked block stops
  *   reading as "someone still has access" the moment it's revoked.
+ * - **The write-conflict path is `do nothing`, not `do update`.** The
+ *   same (onBehalfOf, resourceId) pair really can be granted more than
+ *   once in a real lifecycle — `seal` and a later successful `verify`
+ *   both reference "the terminal block," so both write the identical
+ *   grant tuple — but a `resource` here is one-off and permanent, so
+ *   there is no legitimate scenario where a grant this sink already
+ *   revoked should come back to life on a later conflict. `@adc/core`'s
+ *   own `verify()` denies against a revoked block, so a later `allow`
+ *   referencing that exact resource is not a real path this sink needs
+ *   to plan for — matching the real package's own reference adapter.
  */
 
 import type { Pool } from 'pg';
@@ -71,69 +96,87 @@ import { EventBatcher } from '../event-batch.js';
 import { ensurePrincipal, ensureResource } from '../upsert.js';
 import type { Decision } from '../model.js';
 
-/** The six actions `@adc/graph` produces events for — mint and attenuate and seal a block, verify it at use time (allow or deny), revoke it. */
-export type AdcGraphAction = 'mint' | 'attenuate' | 'seal' | 'verify' | 'revoke';
+/** Mirrors `@adc/graph`'s own `GraphPrincipalKind` (`identity.ts`), which itself mirrors this repo's closed 3-value `principal_kind` enum. */
+export type AdcPrincipalKind = 'human' | 'agent' | 'service';
 
-export interface AdcIdentity {
-  /** Which system this identity comes from — e.g. 'adc', 'manual'. Never guessed; supplied by whatever calls this sink. */
+/** Mirrors `@adc/graph`'s own `GraphPrincipalIdentity` (`identity.ts`) exactly — passed straight to `ensurePrincipal()` with zero translation. */
+export interface AdcPrincipalIdentity {
+  kind: AdcPrincipalKind;
+  /** Which system reported this principal — e.g. 'adc-mint', 'adc-broker'. */
   source: string;
   externalId: string;
   displayName?: string | null;
 }
 
 /**
- * One `@adc/graph` event, as this file's own best reconstruction of that
- * package's real shape — see this file's own header for what that means
- * and what to check before trusting it. Field names deliberately mirror
- * `taint-tracked-tool-broker`'s own `AuditEvent` shape
- * (`src/adapters/broker-audit-sink.ts`) where the two concepts line up
- * (`at`, an agent identity, an optional on-behalf-of identity), since
- * that's the one real, verified precedent in this repo for "a live
- * package's own event, turned into a Principal-Graph row."
+ * Mirrors `@adc/graph`'s own `GraphResourceIdentity` (`identity.ts`) —
+ * `kind` is open text there (unlike `principal.kind`), and in practice
+ * always the literal `'adc-block'` constant; see this file's own header
+ * for why `handle()` below substitutes its own `resourceKind` rather than
+ * trusting this field.
+ */
+export interface AdcResourceIdentity {
+  kind: string;
+  source: string;
+  externalId: string;
+  displayName?: string | null;
+}
+
+/**
+ * Mirrors `@adc/graph`'s own `GraphEvent` (`packages/adc-graph/src/event.ts`
+ * in Attenuated-Delegation-Chain) field-for-field — see this file's header
+ * for the verification provenance. Every field is a required key, matching
+ * that type's own discipline: a nullable-*valued* field (`onBehalfOf`,
+ * `denyReason`, `reversible`, `requestDigest`) must still be present as
+ * `null`, never omitted.
+ *
+ * `action` is left as plain `string` (not a literal union) because the
+ * real type is: `@adc/graph`'s builders only ever produce 'mint' |
+ * 'attenuate' | 'seal' | 'verify' | 'revoke' today, but nothing here
+ * should reject a sixth kind that package might add later — the only
+ * action value this sink actually branches on is the literal `'revoke'`.
  */
 export interface AdcGraphEvent {
-  action: AdcGraphAction;
-  /** The capability block this event is about. Every block gets its own resource row, keyed by this id — see this file's header on why that's exactly the condition that makes the on-behalf-of fix necessary. */
-  blockId: string;
-  /** Epoch millis, same convention as `AuditEvent.at` — caller-supplied, so clamped to now() below rather than trusted; see clampOccurredAt()'s own comment. */
-  at: number;
-  /** The agent principal performing this action. */
-  agent: AdcIdentity;
-  /** The human this agent is acting for, when `@adc/graph` can attribute it. Left unset when it can't be — this sink then honestly records a null `on_behalf_of` rather than guessing. */
-  onBehalfOf?: AdcIdentity;
-  /** Only meaningful for a `verify` event — did this block pass verification. */
-  outcome?: 'allow' | 'deny';
-  /** Why a `verify` event denied, or why a block was revoked. Never set for mint/attenuate/seal. */
-  reason?: string | null;
-  /** sha256 (or similar) of whatever payload this action concerned — never the payload itself, same discipline as `EventInput.requestDigest`. */
-  digest?: string | null;
+  occurredAt: Date;
+  principal: AdcPrincipalIdentity;
+  /** null when the human this credential traces back to isn't known/attributable — never guessed. */
+  onBehalfOf: AdcPrincipalIdentity | null;
+  resource: AdcResourceIdentity;
+  action: string;
+  /** `@adc/graph`'s own `decision` is already the binary allow/deny this repo's schema expects — 'mint'/'attenuate'/'seal'/'revoke' are always 'allow' (lifecycle actions succeeding, never gated); only 'verify' varies. */
+  decision: Decision;
+  denyReason: string | null;
+  /** Free-form, human-legible provenance tags — this repo's own `taint_labels` column, whatever the emitting package chose (caveat kinds, chain depth, a verify denial's reason code, a revoke's free-text reason). Passed straight through, never re-derived here. */
+  taintLabels: readonly string[];
+  reversible: boolean | null;
+  requestDigest: string | null;
 }
 
 export interface AdcGraphSinkOptions {
   pool: Pool;
-  /** `resource.source` for every ADC block this sink upserts, and the `grant_edge.source` it writes alongside them. Defaults to 'adc'. */
+  /** `resource.source` for every ADC block this sink upserts, and the `grant_edge.source` it writes alongside them. Defaults to 'adc', matching `@adc/graph`'s own `ADC_RESOURCE_SOURCE` constant. */
   resourceSource?: string;
-  /** `resource.kind` for every ADC block. Defaults to 'adc_block' — see src/resource-vocabulary.ts's own entry for why an underscore, not the hyphen a literal "ADC block" name might suggest: this repo's RBA namespace names (rba/principal-graph.authz) are plain identifiers, and a hyphenated resource kind can't have a matching namespace. */
+  /** `resource.kind` for every ADC block. Defaults to 'adc_block' — see this file's own header for why an underscore, not the hyphen `@adc/graph`'s own `ADC_BLOCK_RESOURCE_KIND` constant actually uses. */
   resourceKind?: string;
   /** The relation this sink grants an on-behalf-of human on their own block, closing the trap described in this file's header. Defaults to 'can_use'. */
   relation?: string;
 }
 
-/** What every sink this file builds exposes — same "let a caller wait for real writes to land" seam as `PrincipalGraphAuditSink.flush()`. */
+/**
+ * Mirrors `@adc/graph`'s own `GraphSink` (`event.ts`) exactly: `record()`,
+ * not `write()` — this is the seam a real `@adc/graph`-emitting process
+ * (e.g. `services/mint`) plugs a sink instance from this function straight
+ * into, structurally, with no adapter-of-an-adapter needed.
+ */
 export interface AdcGraphSink {
-  /**
-   * `@adc/graph`'s own documented call, per this file's header — fire
-   * and forget, matching `AuditSink.record()`'s synchronous contract: a
-   * capability-lifecycle event is never something the caller should
-   * block on writing.
-   */
-  write(event: AdcGraphEvent): void;
-  /** Resolves once every write() call made so far has finished (or had its failure logged). */
+  /** Fire-and-forget, matching `GraphSink.record()`'s synchronous, never-throws-back-to-the-caller contract. */
+  record(event: AdcGraphEvent): void;
+  /** Resolves once every record() call made so far has finished (or had its failure logged). */
   flush(): Promise<void>;
 }
 
 /**
- * `event.at` is caller-supplied, same as `taint-tracked-tool-broker`'s
+ * `event.occurredAt` is caller-supplied, same as `taint-tracked-tool-broker`'s
  * own `AuditEvent.at` — clamped to `now()`, never trusted outright, for
  * the exact reason `broker-audit-sink.ts`'s own `clampOccurredAt()`
  * exists: `checkStaleGrant` (`src/policies.ts`) and `unused_grant_by_relation`
@@ -141,26 +184,9 @@ export interface AdcGraphSink {
  * single miscalculated or malicious timestamp could exploit to
  * permanently suppress either check for one (principal, resource) pair.
  */
-function clampOccurredAt(atMillis: number): Date {
-  return new Date(Math.min(atMillis, Date.now()));
-}
-
-/**
- * `mint`/`attenuate`/`seal`/`revoke` are lifecycle actions on the block
- * itself, not a gated call with its own verdict — there's no "denied
- * mint" in the six actions this file knows about, so every one of them
- * is an `allow`. Only `verify` carries a real outcome.
- */
-function decisionOf(event: AdcGraphEvent): Decision {
-  if (event.action === 'verify') return event.outcome === 'deny' ? 'deny' : 'allow';
-  return 'allow';
-}
-
-/** Grep-able provenance, same spirit as broker-audit-sink.ts's own taintLabelsOf() — the field that makes incident replay possible without a join. */
-function taintLabelsOf(event: AdcGraphEvent, decision: Decision): string[] {
-  const labels = [`action:${event.action}`];
-  if (event.action === 'verify') labels.push(`outcome:${decision}`);
-  return labels;
+function clampOccurredAt(occurredAt: Date): Date {
+  const now = Date.now();
+  return occurredAt.getTime() > now ? new Date(now) : occurredAt;
 }
 
 export function createAdcGraphSink(opts: AdcGraphSinkOptions): AdcGraphSink {
@@ -173,19 +199,16 @@ export function createAdcGraphSink(opts: AdcGraphSinkOptions): AdcGraphSink {
 
   /**
    * Ensures `onBehalfOfId` has a live `relation` grant on `resourceId` —
-   * the on-behalf-of fix this file's header describes. Idempotent
-   * (`on conflict ... do update`, same shape as postgres-roles.ts's own
-   * grant upsert) so calling it on every qualifying event, not just the
-   * first, is cheap and never double-writes.
+   * the on-behalf-of fix this file's header describes. `on conflict ...
+   * do nothing`, not `do update` — see this file's own header on why a
+   * revoked grant on this one-off resource should never come back via a
+   * later conflict.
    */
   async function ensureCanUseGrant(onBehalfOfId: string, resourceId: string): Promise<void> {
     await pool.query(
       `insert into grant_edge (principal_id, resource_id, relation, source)
        values ($1, $2, $3, $4)
-       on conflict (principal_id, resource_id, relation, source) do update
-         set observed_at = now(),
-             revoked_at = null,
-             changed_at = case when grant_edge.revoked_at is not null then now() else grant_edge.changed_at end`,
+       on conflict (principal_id, resource_id, relation, source) do nothing`,
       [onBehalfOfId, resourceId, relation, resourceSource],
     );
   }
@@ -204,45 +227,39 @@ export function createAdcGraphSink(opts: AdcGraphSinkOptions): AdcGraphSink {
 
   async function handle(event: AdcGraphEvent): Promise<void> {
     const [principalId, onBehalfOfId, resourceId] = await Promise.all([
-      ensurePrincipal(pool, { kind: 'agent', ...event.agent }),
-      event.onBehalfOf ? ensurePrincipal(pool, { kind: 'human', ...event.onBehalfOf }) : null,
+      ensurePrincipal(pool, event.principal),
+      event.onBehalfOf ? ensurePrincipal(pool, event.onBehalfOf) : Promise.resolve(null),
+      // kind/source deliberately NOT taken from event.resource — see this
+      // file's own header on the 'adc-block'-vs-'adc_block' mismatch.
       ensureResource(pool, {
         kind: resourceKind,
         source: resourceSource,
-        externalId: event.blockId,
+        externalId: event.resource.externalId,
+        displayName: event.resource.displayName,
       }),
     ]);
 
-    const decision = decisionOf(event);
-
     // Closes the on-behalf-of trap BEFORE the event itself is written —
-    // see this file's header. Only for an `allow` event: `verify`'s own
-    // `deny` outcome is never flagged by checkOnBehalfOfEscalation in
-    // the first place (it filters on `e.decision = 'allow'`), so
-    // granting access off the back of a DENIED verification would be
-    // actively wrong, not just unnecessary.
-    if (onBehalfOfId && decision === 'allow') {
+    // see this file's header. Only for an `allow` event: a denied
+    // verification is never flagged by checkOnBehalfOfEscalation in the
+    // first place (it filters on `e.decision = 'allow'`), so granting
+    // access off the back of a DENIED verification would be actively
+    // wrong, not just unnecessary.
+    if (onBehalfOfId && event.decision === 'allow') {
       await ensureCanUseGrant(onBehalfOfId, resourceId);
     }
 
     await batcher.append({
-      occurredAt: clampOccurredAt(event.at),
+      occurredAt: clampOccurredAt(event.occurredAt),
       principalId,
       onBehalfOf: onBehalfOfId,
       resourceId,
       action: event.action,
-      decision,
-      denyReason: decision === 'deny' ? (event.reason ?? null) : null,
-      taintLabels: taintLabelsOf(event, decision),
-      // Neither "reversible" nor "irreversible" describes a capability-
-      // lifecycle action the way it describes a tool call's side effect
-      // (what broker-audit-sink.ts's own reversibleOf() is answering) —
-      // honestly unknown, same choice postgres-usage.ts makes for the
-      // same reason, rather than a guessed classification this project's
-      // own conventions (src/capabilities.ts's header) already argue
-      // against.
-      reversible: null,
-      requestDigest: event.digest ?? null,
+      decision: event.decision,
+      denyReason: event.denyReason,
+      taintLabels: [...event.taintLabels],
+      reversible: event.reversible,
+      requestDigest: event.requestDigest,
     });
 
     // A revoked block stops being live access for anyone — after the
@@ -254,7 +271,7 @@ export function createAdcGraphSink(opts: AdcGraphSinkOptions): AdcGraphSink {
   }
 
   return {
-    write(event: AdcGraphEvent): void {
+    record(event: AdcGraphEvent): void {
       const task = handle(event).catch((err: unknown) => {
         console.error('principal-graph: failed to record adc-graph event', err);
       });

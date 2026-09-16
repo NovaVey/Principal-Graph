@@ -1109,15 +1109,17 @@ is the third sink: an actual database row, via the same `ensurePrincipal`/
 `ensureResource`/`EventBatcher` discipline every other adapter here
 follows.
 
-**Read this before trusting the file byte-for-byte**:
-`src/adapters/adc-graph-sink.ts` was written from a prose description of
-`@adc/graph`'s own reference adapter, not copied from that package's real
-source — this repo has no dependency on, or visibility into, `@adc/graph`
-itself. `AdcGraphEvent`'s exact fields and `AdcGraphSink.write()`'s
-name/signature are this file's own best reconstruction, not a verified
-match — confirm both against the real package before relying on this for
-anything that matters, and see that file's own header for exactly what's
-a guess versus what's grounded in this repo's own verified rules.
+**Verified against the real package source**, not a guess: an earlier
+version of `src/adapters/adc-graph-sink.ts` was written from a prose
+description of `@adc/graph`'s own reference adapter, and got the event
+shape wrong (`blockId`/`agent`/`outcome`/`digest`, a `write()` method —
+none of which the real package emits). This version's `AdcGraphEvent`/
+`AdcGraphSink.record()` were checked directly against Attenuated-
+Delegation-Chain's real `packages/adc-graph` source (its `event.ts`,
+`identity.ts`, `hash.ts`, `builders.ts`, and its own README's "A worked
+reference adapter" section) and match `@adc/graph`'s own `GraphEvent`/
+`GraphSink` field-for-field, with one deliberate exception — see that
+file's own header for exactly what's translated and why.
 
 **What IS grounded, regardless of the exact event shape — the on-behalf-of
 trap, closed and proven, not just asserted**: every ADC block gets its
@@ -1142,11 +1144,15 @@ diff: a `revoke` event names exactly one block, and only that block's own
 grants are ever touched.
 
 Registers `adc_block: ['can_use']` in `src/resource-vocabulary.ts` (an
-underscore, not a hyphen — `rba/principal-graph.authz`'s own namespace
+underscore, not the hyphen `@adc/graph`'s own `ADC_BLOCK_RESOURCE_KIND`
+constant actually uses — `rba/principal-graph.authz`'s own namespace
 names are plain identifiers, and that file's cross-check test's regex
 never matches a hyphen) and the matching `namespace adc_block` in
 `rba/principal-graph.authz` itself, so a live grant of this relation
-exports to RBA the same as any other adapter's.
+exports to RBA the same as any other adapter's. The adapter substitutes
+its own fixed `resourceKind`/`resourceSource` for whatever `event.resource`
+says rather than trusting those two fields, precisely because the real
+package always sends the hyphenated form — see the adapter's own header.
 
 **What's out of scope here, and has to happen in `@adc/graph`'s own repo,
 not this one**: actually wiring `graphSink: createAdcGraphSink({ pool })`

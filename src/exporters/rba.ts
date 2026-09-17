@@ -25,7 +25,13 @@
  *     — same spirit as running schema/001_core.sql by hand — never
  *     something this exporter does on a routine sync.
  *   - objectId   = `${resource.source}:${resource.external_id}` — reuses
- *     this project's own (source, external_id) uniqueness key.
+ *     this project's own (source, external_id) uniqueness key, encoded via
+ *     `@novavey/contracts`'s `encodeIdentityRef` (decoded back with
+ *     `decodeIdentityRef` in `grantStillLive`, below) — this encode/decode
+ *     pair, and the id grammar RBA validates it against, used to be defined
+ *     independently in this file; both now live in `@novavey/contracts`,
+ *     imported from there instead, with relationship-based-authorization's
+ *     own `src/store/tuples.ts` as the grammar's authoritative source.
  *   - relation   = grant_edge.relation, unchanged.
  *   - subjectNs  = a fixed 'principal' — RBA only needs to know "can this
  *     identity reach this," not Principal-Graph's own human/agent/service
@@ -64,6 +70,7 @@
  * already gone through.
  */
 
+import { encodeIdentityRef, decodeIdentityRef } from '@novavey/contracts';
 import type { Queryable } from '../upsert.js';
 
 export interface RbaTuple {
@@ -126,10 +133,6 @@ export function createHttpRbaClient(opts: RbaClientOptions): RbaClient {
 /** RBA only needs to know an identity is reachable, not what kind of principal it is — see this file's header. */
 const SUBJECT_NAMESPACE = 'principal';
 
-function identityRef(source: string, externalId: string): string {
-  return `${source}:${externalId}`;
-}
-
 interface GrantTupleRow {
   object_kind: string;
   object_source: string;
@@ -142,10 +145,13 @@ interface GrantTupleRow {
 function tupleFromRow(row: GrantTupleRow): RbaTuple {
   return {
     objectNs: row.object_kind,
-    objectId: identityRef(row.object_source, row.object_external_id),
+    objectId: encodeIdentityRef({ source: row.object_source, externalId: row.object_external_id }),
     relation: row.relation,
     subjectNs: SUBJECT_NAMESPACE,
-    subjectId: identityRef(row.subject_source, row.subject_external_id),
+    subjectId: encodeIdentityRef({
+      source: row.subject_source,
+      externalId: row.subject_external_id,
+    }),
   };
 }
 
@@ -206,14 +212,6 @@ export interface RbaExportResult {
 const DEFAULT_REQUESTS_PER_MINUTE = 15;
 const DEFAULT_DEAD_LETTER_THRESHOLD = 5;
 
-/** `object_id`/`subject_id` are always `${source}:${externalId}` (tupleFromRow()) — split on the FIRST colon, since an external_id (e.g. a GitHub "owner/repo") is never guaranteed colon-free itself, but a source name (a short, fixed string this project's own adapters define) always is. */
-function splitIdentityRef(ref: string): { source: string; externalId: string } {
-  const i = ref.indexOf(':');
-  return i === -1
-    ? { source: ref, externalId: '' }
-    : { source: ref.slice(0, i), externalId: ref.slice(i + 1) };
-}
-
 interface DeadLetterRow {
   object_ns: string;
   object_id: string;
@@ -257,8 +255,8 @@ function tupleFromDeadLetterRow(row: DeadLetterRow): RbaTuple {
  * synced.
  */
 async function grantStillLive(db: Queryable, row: DeadLetterRow): Promise<boolean> {
-  const object = splitIdentityRef(row.object_id);
-  const subject = splitIdentityRef(row.subject_id);
+  const object = decodeIdentityRef(row.object_id);
+  const subject = decodeIdentityRef(row.subject_id);
   const { rows } = await db.query(
     `select 1
        from grant_edge g

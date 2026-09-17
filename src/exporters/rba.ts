@@ -39,16 +39,26 @@
  *   - subjectId  = `${principal.source}:${principal.external_id}`.
  *
  * The rate limit that shapes everything else here: RBA's `/tuples` write
- * endpoint is limited to 20 requests/minute, and there is no batch-write
- * endpoint (only `/check/batch`, a read). A full resync of every live
- * grant on every run does not scale past a trivial grant count — so this
- * is incremental: `rba_export_state` (schema/002_rba_export_state.sql)
- * tracks a watermark, and each run only pushes what changed since the
- * last one. A run that fails partway leaves that watermark untouched —
- * every RBA write/delete is idempotent (its own API reports `created:
- * false` / `deleted: false` on a repeat rather than erroring), so
- * re-attempting the same window next run is always safe; silently
- * advancing past a failure would mean that change never gets retried.
+ * endpoint (and `/tuples/batch`, below) are both limited to 20
+ * requests/minute — but `/tuples/batch` folds up to `batchSize`
+ * (`RunRbaExportOptions.batchSize`, default `DEFAULT_BATCH_SIZE` — 50,
+ * matching RBA's own `TUPLE_BATCH_MAX_SIZE`) individual writes into
+ * one request, so this exporter's real write throughput is bounded by
+ * that per-minute REQUEST budget, not a per-tuple one — up to 50×
+ * more tuple-writes/minute than calling `POST /tuples` once per tuple
+ * ever allowed. Every WRITE this exporter sends now goes through
+ * `/tuples/batch` (chunked to that size), never the single-tuple
+ * `POST /tuples` route; deletes still go through single-tuple
+ * `DELETE /tuples`, since RBA has no batch-delete endpoint. A full resync
+ * of every live grant on every run does not scale past a trivial grant
+ * count even with batching — so this is still incremental:
+ * `rba_export_state` (schema/002_rba_export_state.sql) tracks a
+ * watermark, and each run only pushes what changed since the last one. A
+ * run that fails partway leaves that watermark untouched — every RBA
+ * write/delete is idempotent (its own API reports `created: false` /
+ * `deleted: false` on a repeat rather than erroring), so re-attempting
+ * the same window next run is always safe; silently advancing past a
+ * failure would mean that change never gets retried.
  *
  * That last point has its own sharp edge, closed by
  * `rba_export_dead_letter` (schema/011_rba_export_dead_letter.sql): "leave
@@ -81,8 +91,32 @@ export interface RbaTuple {
   subjectId: string;
 }
 
+/**
+ * One `/tuples/batch` item's real outcome — `ok: false` is a genuine,
+ * per-tuple validation failure (RBA's own `writeTuple`, e.g. an undeclared
+ * relation), never a transport-level problem; a transport-level failure
+ * (network error, non-200 response) throws out of `writeTuples` entirely
+ * instead, exactly like `deleteTuple` already does for its own single
+ * call. Order-matched to the `tuples` array passed to `writeTuples` — RBA's
+ * own `/tuples/batch` response preserves input order (`runTupleBatch`,
+ * relationship-based-authorization's own `src/api/server.ts`).
+ */
+export interface RbaTupleWriteOutcome {
+  tuple: RbaTuple;
+  ok: boolean;
+  /** Present only when `ok` is `false` — RBA's own per-item `error.message`. */
+  error?: string;
+}
+
 export interface RbaClient {
-  writeTuple(tuple: RbaTuple): Promise<void>;
+  /**
+   * Sends exactly the tuples it's given in one `/tuples/batch` call — RBA's
+   * own `TUPLE_BATCH_MAX_SIZE` (50) caps how many that can safely be;
+   * chunking a longer list to stay under it is `runRbaExport`'s own job
+   * (`RunRbaExportOptions.batchSize`), not this method's, which also owns
+   * the rate-limit delay between chunks.
+   */
+  writeTuples(tuples: readonly RbaTuple[]): Promise<RbaTupleWriteOutcome[]>;
   deleteTuple(tuple: RbaTuple): Promise<void>;
 }
 
@@ -103,31 +137,59 @@ export interface RbaClientOptions {
   apiKey: string;
 }
 
+/** One `/tuples/batch` response item — the tuple-identifying fields RBA echoes back, plus either a successful write's `token`/`created` or a failed one's `error`. Only the two fields this client actually needs to distinguish are typed here; the rest of the echoed tuple is unused (order, not content, is what maps a result back to its input tuple — see `RbaTupleWriteOutcome`'s own doc comment). */
+interface RbaBatchResponseItem {
+  error?: { message: string };
+}
+
 /** The real client: RBA's public HTTP API, never its database directly — same interface-boundary discipline as everything else in this repo. */
 export function createHttpRbaClient(opts: RbaClientOptions): RbaClient {
   const base = opts.apiUrl.replace(/\/+$/, '');
+  const headers = {
+    Authorization: `Bearer ${opts.apiKey}`,
+    'Content-Type': 'application/json',
+  };
 
-  async function call(method: 'POST' | 'DELETE', tuple: RbaTuple): Promise<void> {
+  async function writeTuples(tuples: readonly RbaTuple[]): Promise<RbaTupleWriteOutcome[]> {
+    const res = await fetch(`${base}/tuples/batch`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ tuples }),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(
+        `RBA exporter: POST /tuples/batch failed: ${res.status} ${res.statusText}${body ? ` — ${body}` : ''}`,
+      );
+    }
+    const parsed = (await res.json()) as { results: RbaBatchResponseItem[] };
+    // `/tuples/batch` always answers 200 at the batch level and reports
+    // each item's real outcome in `results`, order-matched to the request
+    // (RBA's own `tupleBatchResponse` doc comment) — never a thrown error
+    // for a per-item validation failure, only for the transport-level
+    // problem the `!res.ok` branch above already handles.
+    return parsed.results.map((item, i) => ({
+      tuple: tuples[i],
+      ok: item.error === undefined,
+      ...(item.error !== undefined ? { error: item.error.message } : {}),
+    }));
+  }
+
+  async function deleteTuple(tuple: RbaTuple): Promise<void> {
     const res = await fetch(`${base}/tuples`, {
-      method,
-      headers: {
-        Authorization: `Bearer ${opts.apiKey}`,
-        'Content-Type': 'application/json',
-      },
+      method: 'DELETE',
+      headers,
       body: JSON.stringify(tuple),
     });
     if (!res.ok) {
       const body = await res.text().catch(() => '');
       throw new Error(
-        `RBA exporter: ${method} /tuples failed: ${res.status} ${res.statusText}${body ? ` — ${body}` : ''}`,
+        `RBA exporter: DELETE /tuples failed: ${res.status} ${res.statusText}${body ? ` — ${body}` : ''}`,
       );
     }
   }
 
-  return {
-    writeTuple: (tuple) => call('POST', tuple),
-    deleteTuple: (tuple) => call('DELETE', tuple),
-  };
+  return { writeTuples, deleteTuple };
 }
 
 /** RBA only needs to know an identity is reachable, not what kind of principal it is — see this file's header. */
@@ -166,12 +228,23 @@ export interface RunRbaExportOptions {
   /** Overridable for testing; defaults to a real HTTP client built from apiUrl/apiKey. */
   client?: RbaClient;
   /**
-   * A safety margin under RBA's documented 20 requests/minute tuple-write
-   * limit — spaced between calls, not batched, since no batch-write
-   * endpoint exists. Default 15. Tests pass a very large value so the
-   * suite doesn't sit through real delays.
+   * A safety margin under RBA's documented 20 requests/minute limit on both
+   * `/tuples/batch` and `DELETE /tuples` — spaced between HTTP calls, which
+   * since batching is now one WRITE call per (up to) `batchSize` tuples,
+   * not one per tuple; a delete is still always one call per tuple, RBA
+   * having no batch-delete endpoint. Default 15. Tests pass a very large
+   * value so the suite doesn't sit through real delays.
    */
   requestsPerMinute?: number;
+  /**
+   * How many tuples one `/tuples/batch` call carries at most. Default 50,
+   * matching RBA's own `TUPLE_BATCH_MAX_SIZE` (relationship-based-
+   * authorization's own `src/api/server.ts`) — raising this above what RBA
+   * itself accepts would just turn every oversized chunk into a whole-
+   * request `invalid_request` failure. Tests lower it to exercise the
+   * multi-chunk path without constructing dozens of grants.
+   */
+  batchSize?: number;
   /**
    * Consecutive failures a single tuple tolerates before it stops blocking
    * the watermark and graduates to being retried every run from
@@ -211,6 +284,8 @@ export interface RbaExportResult {
 
 const DEFAULT_REQUESTS_PER_MINUTE = 15;
 const DEFAULT_DEAD_LETTER_THRESHOLD = 5;
+/** Matches RBA's own `TUPLE_BATCH_MAX_SIZE` — see `RunRbaExportOptions.batchSize`'s own doc comment. */
+const DEFAULT_BATCH_SIZE = 50;
 
 interface DeadLetterRow {
   object_ns: string;
@@ -410,52 +485,108 @@ export async function runRbaExport(
   let written = 0;
   let deleted = 0;
 
-  for (let i = 0; i < ops.length; i++) {
-    const { op, tuple } = ops[i];
-    try {
-      if (op === 'write') {
-        await client.writeTuple(tuple);
-        written += 1;
-      } else {
-        await client.deleteTuple(tuple);
-        deleted += 1;
-      }
-      // Success clears any tracking — whether this was a fresh op or a
-      // retry from the dead letter, it's resolved now.
+  // Shared success/failure bookkeeping for one (op, tuple) outcome —
+  // identical whether it came back as one item inside a `/tuples/batch`
+  // response or from a single `DELETE /tuples` call. Success clears any
+  // dead-letter tracking (whether this was a fresh op or a retry from the
+  // dead letter, it's resolved now); failure upserts the tracking row and
+  // graduates it to `deadLettered` once `consecutive_failures` crosses
+  // `deadLetterThreshold`.
+  async function recordOutcome(
+    op: 'write' | 'delete',
+    tuple: RbaTuple,
+    outcome: { ok: true } | { ok: false; error: string },
+  ): Promise<void> {
+    if (outcome.ok) {
+      if (op === 'write') written += 1;
+      else deleted += 1;
       await db.query(
         `delete from rba_export_dead_letter
           where object_ns = $1 and object_id = $2 and relation = $3 and subject_ns = $4 and subject_id = $5 and op = $6`,
         [tuple.objectNs, tuple.objectId, tuple.relation, tuple.subjectNs, tuple.subjectId, op],
       );
-    } catch (cause) {
-      const error = cause instanceof Error ? cause.message : String(cause);
-      const failure: RbaExportFailure = { op, tuple, error };
-      failures.push(failure);
-
-      const { rows: upserted } = await db.query<{ consecutive_failures: number }>(
-        `insert into rba_export_dead_letter
-           (object_ns, object_id, relation, subject_ns, subject_id, op, consecutive_failures, last_error, last_attempted_at)
-         values ($1, $2, $3, $4, $5, $6, 1, $7, now())
-         on conflict (object_ns, object_id, relation, subject_ns, subject_id, op) do update
-           set consecutive_failures = rba_export_dead_letter.consecutive_failures + 1,
-               last_error = excluded.last_error,
-               last_attempted_at = now()
-         returning consecutive_failures`,
-        [
-          tuple.objectNs,
-          tuple.objectId,
-          tuple.relation,
-          tuple.subjectNs,
-          tuple.subjectId,
-          op,
-          error,
-        ],
-      );
-      if ((upserted[0]?.consecutive_failures ?? 1) >= deadLetterThreshold) {
-        deadLettered.push(failure);
-      }
+      return;
     }
-    const isLast = i === ops.length - 1;
+    const failure: RbaExportFailure = { op, tuple, error: outcome.error };
+    failures.push(failure);
+    const { rows: upserted } = await db.query<{ consecutive_failures: number }>(
+      `insert into rba_export_dead_letter
+         (object_ns, object_id, relation, subject_ns, subject_id, op, consecutive_failures, last_error, last_attempted_at)
+       values ($1, $2, $3, $4, $5, $6, 1, $7, now())
+       on conflict (object_ns, object_id, relation, subject_ns, subject_id, op) do update
+         set consecutive_failures = rba_export_dead_letter.consecutive_failures + 1,
+             last_error = excluded.last_error,
+             last_attempted_at = now()
+       returning consecutive_failures`,
+      [
+        tuple.objectNs,
+        tuple.objectId,
+        tuple.relation,
+        tuple.subjectNs,
+        tuple.subjectId,
+        op,
+        outcome.error,
+      ],
+    );
+    if ((upserted[0]?.consecutive_failures ?? 1) >= deadLetterThreshold) {
+      deadLettered.push(failure);
+    }
+  }
+
+  // Writes go through `/tuples/batch` now, chunked to `batchSize` — one
+  // HTTP call (one rate-limited unit) per chunk instead of one per tuple.
+  // Deletes have no batch endpoint, so they stay one call each. Relative
+  // order (retries before window ops, writes before deletes — see
+  // `windowOps`'s own comment above) is preserved: `ops` is already built
+  // in that order, so a plain filter keeps it.
+  const writeTuples = ops.filter((o) => o.op === 'write').map((o) => o.tuple);
+  const deleteOps = ops.filter((o) => o.op === 'delete');
+  const batchSize = opts.batchSize ?? DEFAULT_BATCH_SIZE;
+  const writeChunks: RbaTuple[][] = [];
+  for (let i = 0; i < writeTuples.length; i += batchSize) {
+    writeChunks.push(writeTuples.slice(i, i + batchSize));
+  }
+
+  // One "call" per unit of rate-limited work: a write chunk (however many
+  // tuples it carries) or a single delete — mirrors the old one-op-per-call
+  // loop's own sleep-between-every-call, isLast-skips-the-trailing-sleep
+  // shape, just over a now-heterogeneous list of calls.
+  const calls: (() => Promise<void>)[] = [
+    ...writeChunks.map((chunk) => async () => {
+      try {
+        const outcomes = await client.writeTuples(chunk);
+        for (const outcome of outcomes) {
+          await recordOutcome(
+            'write',
+            outcome.tuple,
+            outcome.ok ? { ok: true } : { ok: false, error: outcome.error ?? 'unknown error' },
+          );
+        }
+      } catch (cause) {
+        // The whole chunk's own HTTP call failed (network error, non-200) —
+        // every tuple in it gets the same treatment a single failed write
+        // always has: no partial credit, since RBA never got to answer for
+        // any of them.
+        const error = cause instanceof Error ? cause.message : String(cause);
+        for (const tuple of chunk) {
+          await recordOutcome('write', tuple, { ok: false, error });
+        }
+      }
+    }),
+    ...deleteOps.map(({ tuple }) => async () => {
+      try {
+        await client.deleteTuple(tuple);
+        await recordOutcome('delete', tuple, { ok: true });
+      } catch (cause) {
+        const error = cause instanceof Error ? cause.message : String(cause);
+        await recordOutcome('delete', tuple, { ok: false, error });
+      }
+    }),
+  ];
+
+  for (let i = 0; i < calls.length; i++) {
+    await calls[i]();
+    const isLast = i === calls.length - 1;
     if (!isLast && delayMs > 0) await sleep(delayMs);
   }
 

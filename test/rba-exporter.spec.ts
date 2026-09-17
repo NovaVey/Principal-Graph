@@ -34,9 +34,18 @@ function recordingClient(failOn?: (tuple: RbaTuple) => boolean): RecordingClient
   return {
     written,
     deleted,
-    async writeTuple(tuple) {
-      if (failOn?.(tuple)) throw new Error('simulated failure');
-      written.push(tuple);
+    // Mirrors real RBA's own /tuples/batch contract: a per-tuple failure
+    // never throws — it comes back as `ok: false` in this tuple's own
+    // outcome, alongside every other tuple in the same batch succeeding or
+    // failing independently. Only a transport-level problem throws, which
+    // this fake has no need to simulate (createHttpRbaClient's own tests,
+    // test/rba-http-client.spec.ts, cover that).
+    async writeTuples(tuples) {
+      return tuples.map((tuple) => {
+        if (failOn?.(tuple)) return { tuple, ok: false, error: 'simulated failure' };
+        written.push(tuple);
+        return { tuple, ok: true };
+      });
     },
     async deleteTuple(tuple) {
       if (failOn?.(tuple)) throw new Error('simulated failure');

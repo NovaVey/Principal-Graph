@@ -144,8 +144,9 @@ export interface PostgresTarget {
  * exactly the shape that turns `trifecta_exposure`/`checkNoTrifecta`
  * (src/policies.ts) into false positives stitched together from two
  * unrelated environments, and propagates the same false unification
- * into the RBA export (`identityRef()`, src/exporters/rba.ts, builds a
- * subject id from this exact `external_id`).
+ * into the RBA export (`encodeIdentityRef()` from `@novavey/contracts`,
+ * called by src/exporters/rba.ts, builds a subject id from this exact
+ * `external_id`).
  *
  * The resource side of this adapter already scopes by target (`target.label`
  * as the resource's own `external_id`, above) — this closes the same gap

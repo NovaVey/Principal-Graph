@@ -53,9 +53,8 @@
   "dependencies": {
     "@aws-sdk/client-iam": "^3.1131.0",
     "@aws-sdk/client-s3": "^3.1131.0",
-    "@novavey/contracts": "git+https://github.com/NovaVey/Stack-Contracts.git#9ea9e7d2a57351e43a4def22e09c176bbcff6655",
-    "pg": "^8.23.0",
-    "taint-tracked-tool-broker": "git+https://github.com/NovaVey/Taint-Tracked-Tool-Broker.git#ca46d562a66f9eb759d29e6e9641b4562f18e0f4"
+    "@novavey/contracts": "git+https://github.com/NovaVey/Stack-Contracts.git#a06b12e45d730373ffe9b559af3f405556e6d35e",
+    "pg": "^8.23.0"
   },
   "devDependencies": {
     "@types/node": "^24.13.4",
@@ -64,6 +63,7 @@
     "eslint": "^10.10.0",
     "eslint-config-prettier": "^10.1.8",
     "prettier": "^3.9.6",
+    "taint-tracked-tool-broker": "git+https://github.com/NovaVey/Taint-Tracked-Tool-Broker.git#ca46d562a66f9eb759d29e6e9641b4562f18e0f4",
     "tsx": "^4.23.13",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.70.0",

@@ -32,11 +32,28 @@
 
 import { createHash } from 'node:crypto';
 import type { Pool } from 'pg';
-import type { AuditEvent, AuditSink, PolicyDecision, ToolCall } from 'taint-tracked-tool-broker';
+import type { AuditEvent, AuditSink } from 'taint-tracked-tool-broker';
+import type { MinimalAuditEvent } from '@novavey/contracts';
 import { EventBatcher } from '../event-batch.js';
 import { ensurePrincipal, ensureResource } from '../upsert.js';
 import { classifyKnownTool } from '../capabilities.js';
 import type { Decision } from '../model.js';
+
+/**
+ * `@novavey/contracts`'s `MinimalAuditEvent` floor, not TTTB's own richer
+ * `ToolCall`/`PolicyDecision` — every field this file actually reads
+ * (`taintLabelsOf`/`reversibleOf`/`verdictReason`/`handle`, below) is
+ * already part of that floor, so nothing here depends on TTTB's fuller
+ * internal shape. See PROTOCOL.md §2 there for why: an audit-sink
+ * implementation should only ever depend on the fields it actually needs,
+ * so TTTB is free to grow its own richer internal shape without that being
+ * a breaking change on this side of the seam. `record()`'s own outward
+ * signature, below, is the one place this file still names TTTB's real
+ * `AuditEvent`/`AuditSink` directly — unavoidably: that's the actual
+ * contract a real broker instance calls against.
+ */
+type MinimalCall = MinimalAuditEvent['call'];
+type MinimalVerdict = MinimalAuditEvent['verdict'];
 
 export interface BrokerPrincipalIdentity {
   /** Which adapter/system this identity comes from, e.g. 'mcp-config', 'manual'. */
@@ -82,7 +99,7 @@ export interface BrokerAuditSinkOptions {
    * does NOT fall back to `agent`.
    */
   resolveActingPrincipal?: (
-    call: ToolCall,
+    call: MinimalCall,
   ) => BrokerPrincipalIdentity | undefined | Promise<BrokerPrincipalIdentity | undefined>;
   /**
    * The human this agent's session is acting for, when the integrator can
@@ -116,8 +133,8 @@ export interface PrincipalGraphAuditSink extends AuditSink {
   flush(): Promise<void>;
 }
 
-function verdictReason(verdict: PolicyDecision): string | null {
-  return 'reason' in verdict ? verdict.reason : null;
+function verdictReason(verdict: MinimalVerdict): string | null {
+  return verdict.reason ?? null;
 }
 
 /**
@@ -127,7 +144,7 @@ function verdictReason(verdict: PolicyDecision): string | null {
  * keep these human-legible rather than encoding anything that needs a join
  * to explain.
  */
-function taintLabelsOf(event: AuditEvent): string[] {
+function taintLabelsOf(event: MinimalAuditEvent): string[] {
   const labels = [
     `scope:${event.taint.scopeLevel}`,
     `sink:${event.taint.sinkClass}`,
@@ -142,7 +159,7 @@ function taintLabelsOf(event: AuditEvent): string[] {
  * send) is never something this library can promise is undoable. Only a
  * NONE-sinkClass call — a read, a source fetch, nothing privileged — is.
  */
-function reversibleOf(event: AuditEvent): boolean {
+function reversibleOf(event: MinimalAuditEvent): boolean {
   return event.taint.sinkClass === 'NONE';
 }
 
@@ -227,7 +244,7 @@ export function createPrincipalGraphAuditSink(
   // principals a resolver reports over this sink's lifetime.
   const actingPrincipalCache = new Map<string, Promise<string>>();
 
-  function actingPrincipalId(call: ToolCall): Promise<string> {
+  function actingPrincipalId(call: MinimalCall): Promise<string> {
     if (!opts.resolveActingPrincipal) return agentId();
     return Promise.resolve(opts.resolveActingPrincipal(call)).then((identity) => {
       if (!identity) return agentId();
@@ -244,7 +261,7 @@ export function createPrincipalGraphAuditSink(
     });
   }
 
-  async function handle(event: AuditEvent): Promise<void> {
+  async function handle(event: MinimalAuditEvent): Promise<void> {
     const [principalId, onBehalfOf, resourceId] = await Promise.all([
       actingPrincipalId(event.call),
       onBehalfOfId(),

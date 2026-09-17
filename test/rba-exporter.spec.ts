@@ -7,6 +7,7 @@
 import { beforeAll, beforeEach, afterAll, test } from 'vitest';
 import assert from 'node:assert/strict';
 
+import { invalidDataPlaneIdReason } from '@novavey/contracts';
 import { runRbaExport, type RbaClient, type RbaTuple } from '../src/exporters/rba.js';
 import { ensurePrincipal, ensureResource } from '../src/upsert.js';
 import { pool, resetDatabase } from './helpers.js';
@@ -84,6 +85,48 @@ void test("runRbaExport maps a grant to RBA's tuple shape correctly", async () =
       subjectId: 'mcp-config:my-agent',
     },
   ]);
+});
+
+// The confirmed bug this closes: the Workspace adapter's principals are
+// keyed by email (src/adapters/workspace-groups.ts), and encodeIdentityRef
+// used to concatenate source/externalId with no escaping — an unescaped '@'
+// produced an objectId/subjectId that RBA's own real tuple-write validation
+// (invalidDataPlaneIdReason, ported verbatim from RBA in @novavey/contracts)
+// rejects outright. Every Workspace grant this exporter ever sent was
+// silently dead-lettered by that, forever — confirmed end to end against a
+// real RBA server before this fix. This test doesn't stand up a real RBA
+// server; it instead asserts the produced tuple ids satisfy
+// invalidDataPlaneIdReason directly — the same check RBA's own write
+// endpoint runs, and the one this bug tripped every time.
+void test("runRbaExport percent-encodes an email-shaped externalId so RBA's own grammar accepts it (Workspace adapter)", async () => {
+  const member = await ensurePrincipal(pool, {
+    kind: 'human',
+    source: 'workspace',
+    externalId: 'alice@acme.example',
+  });
+  const group = await ensureResource(pool, {
+    kind: 'group',
+    source: 'workspace',
+    externalId: 'eng@acme.example',
+  });
+  await grant(member, group, 'member');
+
+  const client = recordingClient();
+  const result = await runRbaExport(pool, { client, ...NO_THROTTLE });
+
+  assert.equal(result.synced, true);
+  assert.equal(result.written, 1);
+  const tuple = client.written[0];
+  assert.ok(tuple, 'expected one written tuple');
+  assert.equal(tuple.objectNs, 'group');
+  assert.equal(tuple.objectId, 'workspace:eng%40acme.example');
+  assert.equal(tuple.subjectNs, 'principal');
+  assert.equal(tuple.subjectId, 'workspace:alice%40acme.example');
+  // The actual regression: before the fix, both ids below contained a
+  // literal '@' and invalidDataPlaneIdReason (RBA's own grammar) rejected
+  // them outright.
+  assert.equal(invalidDataPlaneIdReason(tuple.objectId), null);
+  assert.equal(invalidDataPlaneIdReason(tuple.subjectId), null);
 });
 
 void test('first sync writes every live grant but skips deletes for pre-existing revocations', async () => {

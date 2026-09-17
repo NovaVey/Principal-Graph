@@ -53,7 +53,7 @@
   "dependencies": {
     "@aws-sdk/client-iam": "^3.1131.0",
     "@aws-sdk/client-s3": "^3.1131.0",
-    "@novavey/contracts": "git+https://github.com/NovaVey/Stack-Contracts.git#0fed74338c7108ff225ba48e137f75377f596718",
+    "@novavey/contracts": "git+https://github.com/NovaVey/Stack-Contracts.git#9ea9e7d2a57351e43a4def22e09c176bbcff6655",
     "pg": "^8.23.0",
     "taint-tracked-tool-broker": "git+https://github.com/NovaVey/Taint-Tracked-Tool-Broker.git#ca46d562a66f9eb759d29e6e9641b4562f18e0f4"
   },

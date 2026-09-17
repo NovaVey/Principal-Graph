@@ -1,0 +1,15 @@
+name: Composition check
+
+on:
+  pull_request:
+
+concurrency:
+  group: composition-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  range:
+    uses: NovaVey/Control-Coverage-Range/.github/workflows/range.yml@main
+    with:
+      repo: principal-graph
+      ref: ${{ github.event.pull_request.head.sha }}

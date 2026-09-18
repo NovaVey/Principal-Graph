@@ -432,7 +432,9 @@ RBA_API_KEY=...                        \
 Projects each live `grant_edge` row into an RBA relationship tuple
 (`resource.kind` → RBA namespace, `relation` passed straight through,
 `(source, external_id)` → the tuple's object/subject id) via RBA's public
-`POST`/`DELETE /tuples` API — never RBA's own database directly. Requires
+`POST /tuples/batch` (writes, chunked to RBA's own 50-tuple cap) and
+`DELETE /tuples` (deletes — RBA has no batch-delete endpoint) — never
+RBA's own database directly. Requires
 `schema/002_rba_export_state.sql` (above) and, on the RBA side, this
 project's own namespace schema (`rba/principal-graph.authz`) published
 once against your deployment — this exporter only ever writes tuples,

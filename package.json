@@ -52,7 +52,7 @@
   "homepage": "https://github.com/NovaVey/Principal-Graph#readme",
   "dependencies": {
     "@aws-sdk/client-iam": "^3.1131.0",
-    "@aws-sdk/client-s3": "^3.1131.0",
+    "@aws-sdk/client-s3": "^3.1136.0",
     "@novavey/contracts": "git+https://github.com/NovaVey/Stack-Contracts.git#a06b12e45d730373ffe9b559af3f405556e6d35e",
     "pg": "^8.23.0"
   },

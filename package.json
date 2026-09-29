@@ -64,7 +64,7 @@
     "eslint-config-prettier": "^10.1.8",
     "prettier": "^3.9.6",
     "taint-tracked-tool-broker": "git+https://github.com/NovaVey/Taint-Tracked-Tool-Broker.git#ca46d562a66f9eb759d29e6e9641b4562f18e0f4",
-    "tsx": "^4.23.13",
+    "tsx": "^4.23.15",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.70.0",
     "vitest": "^5.0.0"

@@ -60,7 +60,7 @@
     "@types/node": "^24.13.4",
     "@types/pg": "^8.23.1",
     "@vitest/coverage-v8": "^5.0.0",
-    "eslint": "^10.10.0",
+    "eslint": "^10.12.0",
     "eslint-config-prettier": "^10.1.8",
     "prettier": "^3.9.6",
     "taint-tracked-tool-broker": "git+https://github.com/NovaVey/Taint-Tracked-Tool-Broker.git#ca46d562a66f9eb759d29e6e9641b4562f18e0f4",
